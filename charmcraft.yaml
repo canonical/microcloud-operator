@@ -1,16 +1,297 @@
+# Copyright 2024 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+# TODO: Get rid of ca_file config for LXD metrics scrape completely then re-check if metrics end up on prometheus.
+
+name: microcloud
 type: charm
-bases:
-  - name: ubuntu
-    channel: "22.04"
+subordinate: false
+
+summary: Deploy and operate a MicroCloud cluster, optionally connected to observability.
+
+description: |
+  The MicroCloud charm deploys and operates a MicroCloud cluster (LXD,
+  MicroCeph, MicroOVN) across a set of machines, and can optionally connect
+  that cluster to the Canonical Observability Stack (COS).
+
+  Deployment mode (auto-detected)
+  -------------------------------
+  On each machine the charm detects whether MicroCloud is already
+  initialized:
+
+    - If MicroCloud is NOT yet initialized, the charm installs the required
+      snaps (microcloud, lxd, and optionally microceph and microovn) at the
+      configured channels and forms the cluster non-interactively using
+      "microcloud preseed". The leader unit acts as the initiator; all other
+      units join. A shared session passphrase is generated automatically and
+      distributed to peers via a Juju secret.
+
+    - If MicroCloud IS already initialized (a cluster deployed out-of-band),
+      the charm does not install snaps or bootstrap. It instead validates
+      that every MicroCloud member has a corresponding Juju unit (matched on
+      hostname) and blocks if any member is missing.
+
+  Observability (optional)
+  ------------------------
+  Metrics integration is only configured when a related
+  opentelemetry-collector subordinate is attached via the cos-agent relation.
+  When related, the charm ensures Prometheus-compatible endpoints exist for
+  LXD, MicroCeph, and MicroOVN and advertises them. When the relation is
+  removed, the metrics setup is torn down. A base MicroCloud deployment
+  performs no metrics setup.
+
+links:
+  source: https://github.com/canonical/microcloud
+  issues: https://github.com/canonical/microcloud/issues
+
+assumes:
+  - juju >= 3.6
+
+platforms:
+  ubuntu@22.04:amd64:
+  ubuntu@22.04:arm64:
+  ubuntu@24.04:amd64:
+  ubuntu@24.04:arm64:
 
 parts:
   charm:
+    source: .
+    plugin: uv
     build-packages:
-      - ca-certificates
-      - cargo
       - git
-      - libffi-dev
-      - libssl-dev
-      - pkg-config
-      - python3-dev
-      - rustc
+      - python3
+    build-snaps:
+      - astral-uv
+    override-build: |
+      # Fetch upstream dashboards before the uv plugin stages the charm files.
+      python3 tools/fetch-dashboards.py
+      craftctl default
+
+peers:
+  cluster:
+    interface: microcloud-peer
+
+provides:
+  cos-agent:
+    interface: cos_agent
+
+storage:
+  local:
+    type: block
+    description: >
+      Local (single-node ZFS) storage disk for this MicroCloud system.
+      Juju attaches a raw physical block device (e.g. a MAAS-provisioned
+      NVMe disk) directly; the charm passes its device path straight
+      through to "microcloud preseed" as
+      "systems[*].storage.local.path" - no LXD resource-filter matching
+      is involved, so the exact disk is whatever Juju/MAAS resolved this
+      storage directive to (e.g.
+      "juju deploy microcloud --storage local=maas,1,100G"). Optional:
+      leave unattached (0 instances) to skip local storage on this
+      system.
+    minimum-size: 1G
+    multiple:
+      range: 0-1
+
+  ceph:
+    type: block
+    description: >
+      Disks to contribute to Ceph OSDs on this system. Each attached disk
+      is passed through to "microcloud preseed" by device path as
+      "systems[*].storage.ceph[*].path" (e.g.
+      "juju deploy microcloud --storage ceph=maas,3,100G" for three
+      OSDs per system). Optional: leave unattached (0 instances) to skip
+      Ceph storage on this system, or attach as many disks as this
+      system should contribute as OSDs.
+    minimum-size: 1G
+    multiple:
+      range: 0-
+
+extra-bindings:
+  # Bind these to Juju spaces to set network parameters during cluster
+  # bootstrap, e.g.:
+  #   juju deploy microcloud --bind \
+  #     "ceph-public=<space> ceph-internal=<space> ovn-underlay=<space>"
+  # Left unbound, the corresponding value is omitted from the preseed
+  # (ceph-public/ceph-internal), or automatic underlay selection is used
+  # (ovn-underlay). ceph-public/ceph-internal are only ever read when at
+  # least one unit has a "ceph" Juju storage volume attached, since
+  # "microcloud preseed" rejects a Ceph public/internal network without
+  # Ceph storage disks.
+  #
+  # "ovn-uplink" is intentionally never read via "network-get": the OVN
+  # uplink NIC is normally a bare, L2-only interface with no IP, so Juju
+  # spaces (which only track addressed interfaces) can never resolve a
+  # usable interface name from it - use the "ovn-uplink-interface" config
+  # option for that instead. This binding still has a purpose though: on a
+  # MAAS-backed model, binding it (e.g. "--bind ovn-uplink=<space>")
+  # constrains machine placement to machines that actually have a NIC on
+  # the right fabric/VLAN for the uplink, independent of IP addressing.
+  # Purely optional; leave unbound if not using MAAS placement constraints.
+  ceph-public:
+  ceph-internal:
+  ovn-underlay:
+  ovn-uplink:
+
+config:
+  options:
+    # ------------------------------------------------------------------
+    # Snap channels (deployment mode only)
+    # ------------------------------------------------------------------
+    snap-channel-microcloud:
+      type: string
+      default: "3/stable"
+      description: >
+        Snap channel for the microcloud snap. Only used when the charm
+        deploys the cluster (i.e. MicroCloud is not already initialized).
+
+    snap-channel-lxd:
+      type: string
+      default: "6/stable"
+      description: >
+        Snap channel for the lxd snap. LXD is always required by MicroCloud.
+
+    snap-channel-microceph:
+      type: string
+      default: "squid/stable"
+      description: >
+        Snap channel for the microceph snap. Leave empty to deploy a
+        MicroCloud without MicroCeph; the ceph preseed section is then
+        omitted.
+
+    snap-channel-microovn:
+      type: string
+      default: "24.03/stable"
+      description: >
+        Snap channel for the microovn snap. Leave empty to deploy a
+        MicroCloud without MicroOVN; the ovn preseed section is then omitted.
+
+    # ------------------------------------------------------------------
+    # Cluster bootstrap / session (deployment mode only)
+    # ------------------------------------------------------------------
+    session-timeout:
+      type: int
+      default: 300
+      description: >
+        Seconds the initiator keeps the trust-establishment session open
+        while waiting for joiners. Bumped from the MicroCloud CLI default
+        (60 min) down to 5 min, but raised well above the MicroCloud CLI's
+        own lookup-timeout default (60s), so the initiator reliably
+        outlasts joiners whose own hooks may run on a delayed Juju
+        schedule.
+
+    # ------------------------------------------------------------------
+    # Ceph preseed options
+    # ------------------------------------------------------------------
+    ceph-cephfs:
+      type: boolean
+      default: true
+      description: Enable CephFS during cluster bootstrap.
+
+    # ------------------------------------------------------------------
+    # Storage options (apply to the "local"/"ceph" Juju storage volumes
+    # declared under the top-level "storage:" key)
+    # ------------------------------------------------------------------
+    storage-wipe:
+      type: boolean
+      default: false
+      description: Wipe disks attached via Juju storage before use.
+
+    storage-encrypt:
+      type: boolean
+      default: false
+      description: Encrypt disks attached via Juju storage.
+
+    # ------------------------------------------------------------------
+    # OVN uplink preseed options
+    # ------------------------------------------------------------------
+    ovn-uplink-interface:
+      type: string
+      default: ""
+      description: >
+        OVN uplink interface name. Either a single interface name applied
+        to every unit (e.g. "eth1"), or a YAML/JSON mapping of hostname to
+        interface name for heterogeneous hardware, e.g.:
+          node1: eth1
+          node2: enp5s0
+          node3: eno1
+        When set to a mapping, every deployed unit must have an entry
+        (matched on its MicroCloud hostname); a unit whose hostname is
+        missing blocks rather than bootstrapping with an unresolved
+        interface. Left empty, the OVN uplink is omitted from the preseed.
+
+    ovn-ipv4-gateway:
+      type: string
+      default: ""
+      description: OVN uplink IPv4 gateway in CIDR notation. Optional.
+
+    ovn-ipv4-range:
+      type: string
+      default: ""
+      description: >
+        OVN uplink IPv4 range, e.g. "192.0.2.100-192.0.2.254". Optional.
+
+    ovn-ipv6-gateway:
+      type: string
+      default: ""
+      description: OVN uplink IPv6 gateway in CIDR notation. Optional.
+
+    ovn-dns-servers:
+      type: string
+      default: ""
+      description: Comma-separated OVN uplink DNS servers. Optional.
+
+    # ------------------------------------------------------------------
+    # Observability options (used only when cos-agent is related)
+    # ------------------------------------------------------------------
+    scrape-interval:
+      type: string
+      default: "30s"
+      description: >
+        Prometheus-style scrape interval forwarded to the collector for all
+        scrape jobs (e.g. "30s", "1m").
+
+    ceph-mgr-prometheus-port:
+      type: int
+      default: 9283
+      description: >
+        Port on which the Ceph mgr Prometheus module listens on loopback.
+
+    ceph-rbd-stats-pools:
+      type: string
+      default: ""
+      description: >
+        Comma-separated list of RBD pools to collect per-image IO statistics
+        for (mgr/prometheus/rbd_stats_pools). Empty (default) disables
+        per-image RBD stats, required by the bundled rbd-details and
+        rbd-overview dashboards.
+
+    ceph-enable-perf-metrics:
+      type: boolean
+      default: false
+      description: >
+        Include Ceph performance counters in the Prometheus mgr module
+        output (mgr/prometheus/exclude_perf_counters, inverted).
+
+    ovn-exporter-channel:
+      type: string
+      default: "latest/edge"
+      description: >
+        Snap Store channel for the ovn-exporter snap (observability only).
+
+    ovn-exporter-listen-port:
+      type: int
+      default: 9310
+      description: >
+        Port on which the ovn-exporter snap listens on loopback.
+
+actions:
+  status:
+    description: >
+      Print the detected charm mode and the current MicroCloud cluster
+      membership as seen by this unit.
+
+  dump-metrics-config:
+    description: >
+      Print the cos-agent scrape configs this unit is advertising. Useful for
+      debugging observability integration.
