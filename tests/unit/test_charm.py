@@ -71,6 +71,33 @@ class TestLxcConfigSet:
 
 
 # ---------------------------------------------------------------------------
+# _log_slots
+# ---------------------------------------------------------------------------
+
+
+class TestLogSlots:
+    def _make_charm_stub(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        return stub
+
+    def test_includes_microceph_slot_when_installed(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        with patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"):
+            assert MicroCloudCharm._log_slots(stub) == ["microceph:ceph-logs"]
+
+    def test_omits_microceph_slot_when_not_installed(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        with patch("charm.snap.is_installed", return_value=False):
+            assert MicroCloudCharm._log_slots(stub) == []
+
+
+# ---------------------------------------------------------------------------
 # _ensure_lxd_metrics_config
 # ---------------------------------------------------------------------------
 
