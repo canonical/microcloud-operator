@@ -92,6 +92,7 @@ class MicroCloudCharm(ops.CharmBase):
             scrape_configs=self._build_scrape_configs,
             dashboard_dirs=_DASHBOARD_DIRS,
             metrics_rules_dir=_ALERT_RULES_DIR,
+            log_slots=self._log_slots(),
             refresh_events=[
                 self.on.config_changed,
                 self.on.update_status,
@@ -143,6 +144,18 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _cos_related(self) -> bool:
         return bool(self.model.relations.get("cos-agent"))
+
+    def _log_slots(self) -> list[str]:
+        """Snap log slots to advertise over cos-agent.
+
+        The microceph snap exposes its logs via a "ceph-logs" content-interface
+        slot, so we can forward them without any custom log-shipping logic.
+        LXD and microovn do not (yet) expose an equivalent slot.
+        """
+        slots: list[str] = []
+        if snap.is_installed("microceph"):
+            slots.append("microceph:ceph-logs")
+        return slots
 
     # ------------------------------------------------------------------
     # Core hook handlers
