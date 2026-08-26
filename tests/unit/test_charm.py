@@ -1080,6 +1080,68 @@ peers:
             harness.cleanup()
 
 
+class TestAnyPeerAcked:
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+peers:
+  cluster:
+    interface: microcloud-peer
+""",
+        )
+        harness.begin()
+        return harness
+
+    def test_single_node_has_no_peers_to_ack(self):
+        """A lone leader has no joiners at all, so it must not wait forever."""
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            harness.add_relation("cluster", "test-charm")
+
+            assert coordinator.any_peer_acked() is True
+        finally:
+            harness.cleanup()
+
+    def test_multi_node_waits_until_a_peer_acks(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            harness.add_relation_unit(rel_id, "test-charm/1")
+
+            assert coordinator.any_peer_acked() is False
+
+            harness.update_relation_data(
+                rel_id,
+                "test-charm/1",
+                {"microcloud-initiator-ack": "true"},
+            )
+
+            assert coordinator.any_peer_acked() is True
+        finally:
+            harness.cleanup()
+
+    def test_no_relation_returns_false(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+
+            assert coordinator.any_peer_acked() is False
+        finally:
+            harness.cleanup()
+
+
 # ---------------------------------------------------------------------------
 # _space_bind_address (Juju space binding -> per-unit address, e.g. OVN underlay)
 # ---------------------------------------------------------------------------

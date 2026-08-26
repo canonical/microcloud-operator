@@ -268,10 +268,17 @@ class ClusterCoordinator:
         own hook) that it has seen the initiator address and is about to
         try joining - otherwise the leader's session could open and time
         out before any joiner even knew to dial in.
+
+        On a single-node deployment there are no peers at all, so there is
+        no one who could ever ack: waiting on this condition would block
+        forever. In that case, return True immediately so the lone leader
+        proceeds straight to opening its own session.
         """
         relation = self.relation
         if relation is None:
             return False
+        if not relation.units:
+            return True
         return any(relation.data.get(unit, {}).get(_KEY_ACK) == "true" for unit in relation.units)
 
     # ------------------------------------------------------------------
