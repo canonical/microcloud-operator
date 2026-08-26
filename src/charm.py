@@ -34,10 +34,20 @@ Observability (both modes, optional)
 ------------------------------------
 cos-agent-relation-joined / changed
     • Ensure metrics endpoints exist (LXD metrics config, Ceph mgr module,
-      ovn-exporter snap) and publish scrape jobs + dashboards.
+      ovn-exporter snap) and publish scrape jobs + dashboards. MicroCeph's
+      own logs are forwarded over this same relation via its "ceph-logs"
+      snap slot.
 
 cos-agent-relation-broken
     • Tear the metrics setup back down.
+
+logging-relation-joined / changed
+    • Point LXD's native Loki client (loki.api.url) at the related
+      Loki-compatible endpoint (e.g. opentelemetry-collector's
+      receive-loki-logs) so LXD streams its own logs there directly.
+
+logging-relation-broken
+    • Disable LXD's Loki streaming again.
 """
 
 import json
@@ -50,6 +60,7 @@ from typing import Any
 import ops
 import yaml
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
+from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import microcloud
 import snap
@@ -99,6 +110,8 @@ class MicroCloudCharm(ops.CharmBase):
             ],
         )
 
+        self._loki_consumer = LokiPushApiConsumer(self, relation_name="logging")
+
         self.framework.observe(self.on.install, self._on_install)
         self.framework.observe(self.on.upgrade_charm, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
@@ -118,6 +131,19 @@ class MicroCloudCharm(ops.CharmBase):
         )
         self.framework.observe(
             self.on.cos_agent_relation_broken, self._on_cos_agent_relation_broken
+        )
+
+        self.framework.observe(
+            self.on.logging_relation_joined, self._on_loki_push_api_endpoint_joined
+        )
+        self.framework.observe(
+            self.on.logging_relation_changed, self._on_loki_push_api_endpoint_joined
+        )
+        self.framework.observe(
+            self.on.logging_relation_departed, self._on_loki_push_api_endpoint_departed
+        )
+        self.framework.observe(
+            self.on.logging_relation_broken, self._on_loki_push_api_endpoint_departed
         )
 
         # Actions
@@ -193,6 +219,16 @@ class MicroCloudCharm(ops.CharmBase):
     def _on_cos_agent_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
         self._teardown_observability(full_cleanup=True)
         self._reconcile()
+
+    # ------------------------------------------------------------------
+    # logging (Loki) handlers
+    # ------------------------------------------------------------------
+
+    def _on_loki_push_api_endpoint_joined(self, event: ops.EventBase) -> None:
+        self._ensure_lxd_loki_config()
+
+    def _on_loki_push_api_endpoint_departed(self, event: ops.RelationEvent) -> None:
+        self._teardown_lxd_loki_config()
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -527,6 +563,45 @@ class MicroCloudCharm(ops.CharmBase):
         _lxc_config_set("core.metrics_address", _LXD_METRICS_ADDRESS)
         _lxc_config_set("core.metrics_authentication", "false")
 
+    def _ensure_lxd_loki_config(self) -> None:
+        """Point LXD's native Loki client at the related Loki push endpoint."""
+        endpoints = self._loki_consumer.loki_endpoints
+        if not endpoints:
+            logger.debug("logging relation joined but no Loki endpoint published yet")
+            return
+
+        url = endpoints[0].get("url", "")
+        if not url:
+            logger.warning("Loki endpoint data is missing a url")
+            return
+
+        # LXD expects only the base API URL (protocol + host + optional port),
+        # not the full push path.
+        if url.endswith("/loki/api/v1/push"):
+            url = url[: -len("/loki/api/v1/push")]
+
+        if not _lxd_has_api_extension("loki"):
+            logger.error("LXD is missing the loki API extension; cannot stream logs to %s", url)
+            return
+
+        try:
+            _lxc_config_set("loki.api.url", url)
+        except LXDConfigError as exc:
+            logger.warning("Cannot set LXD loki.api.url: %s", exc)
+            return
+
+        logger.info("LXD is now streaming logs to Loki at %s", url)
+
+    def _teardown_lxd_loki_config(self) -> None:
+        """Stop LXD from streaming logs to Loki."""
+        try:
+            _lxc_config_set("loki.api.url", "")
+        except LXDConfigError as exc:
+            logger.warning("Cannot reset LXD loki.api.url during teardown: %s", exc)
+            return
+
+        logger.info("LXD is no longer streaming logs to Loki")
+
     # ------------------------------------------------------------------
     # Status
     # ------------------------------------------------------------------
@@ -809,6 +884,24 @@ def _lxc_config_set(key: str, value: str) -> None:
         raise LXDConfigError(
             f"Cannot set LXD config {key}={value!r} (rc={exc.returncode}): {exc.stderr.strip()}"
         ) from exc
+
+
+def _lxd_has_api_extension(name: str) -> bool:
+    """Return True if the running LXD advertises the given API extension."""
+    try:
+        result = subprocess.run(
+            ["lxc", "query", "/1.0"],
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=5,
+        )
+        info = json.loads(result.stdout)
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
+        logger.warning("Cannot query LXD API extensions: %s", exc)
+        return False
+
+    return name in info.get("api_extensions", [])
 
 
 if __name__ == "__main__":

@@ -32,6 +32,21 @@ sys.modules.setdefault("charms.grafana_agent", ModuleType("charms.grafana_agent"
 sys.modules.setdefault("charms.grafana_agent.v0", ModuleType("charms.grafana_agent.v0"))
 sys.modules["charms.grafana_agent.v0.cos_agent"] = _cos_agent_stub
 
+# Stub out the loki_push_api library for the same reason.
+_loki_push_api_stub = ModuleType("charms.loki_k8s.v1.loki_push_api")
+
+
+class _FakeLokiPushApiConsumer:
+    def __init__(self, charm, **kwargs):
+        self._charm = charm
+        self.loki_endpoints = []
+
+
+_loki_push_api_stub.LokiPushApiConsumer = _FakeLokiPushApiConsumer
+sys.modules.setdefault("charms.loki_k8s", ModuleType("charms.loki_k8s"))
+sys.modules.setdefault("charms.loki_k8s.v1", ModuleType("charms.loki_k8s.v1"))
+sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
+
 # Now import the modules under test.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
@@ -127,6 +142,158 @@ class TestEnsureLxdMetricsConfig:
         with patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")):
             with pytest.raises(LXDConfigError, match="lxd not running"):
                 MicroCloudCharm._ensure_lxd_metrics_config(stub)
+
+
+# ---------------------------------------------------------------------------
+# _ensure_lxd_loki_config / _teardown_lxd_loki_config
+# ---------------------------------------------------------------------------
+
+
+class TestLxdLokiConfig:
+    def _make_charm_stub(self, loki_endpoints=None):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._loki_consumer = MagicMock()
+        stub._loki_consumer.loki_endpoints = loki_endpoints or []
+        return stub
+
+    def test_does_nothing_when_no_endpoints_published_yet(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub(loki_endpoints=[])
+        with patch("charm._lxc_config_set") as mock_set:
+            MicroCloudCharm._ensure_lxd_loki_config(stub)
+            mock_set.assert_not_called()
+
+    def test_sets_loki_api_url_stripping_push_suffix(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub(
+            loki_endpoints=[{"url": "http://otelcol:3500/loki/api/v1/push"}]
+        )
+        with (
+            patch("charm._lxd_has_api_extension", return_value=True),
+            patch("charm._lxc_config_set") as mock_set,
+        ):
+            MicroCloudCharm._ensure_lxd_loki_config(stub)
+            mock_set.assert_called_once_with("loki.api.url", "http://otelcol:3500")
+
+    def test_skips_when_loki_api_extension_missing(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub(
+            loki_endpoints=[{"url": "http://otelcol:3500/loki/api/v1/push"}]
+        )
+        with (
+            patch("charm._lxd_has_api_extension", return_value=False),
+            patch("charm._lxc_config_set") as mock_set,
+        ):
+            MicroCloudCharm._ensure_lxd_loki_config(stub)
+            mock_set.assert_not_called()
+
+    def test_swallows_lxd_config_error(self):
+        from charm import LXDConfigError, MicroCloudCharm
+
+        stub = self._make_charm_stub(loki_endpoints=[{"url": "http://otelcol:3500"}])
+        with (
+            patch("charm._lxd_has_api_extension", return_value=True),
+            patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")),
+        ):
+            # Should not raise.
+            MicroCloudCharm._ensure_lxd_loki_config(stub)
+
+    def test_ignores_endpoint_missing_url(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub(loki_endpoints=[{}])
+        with (
+            patch("charm._lxd_has_api_extension", return_value=True),
+            patch("charm._lxc_config_set") as mock_set,
+        ):
+            MicroCloudCharm._ensure_lxd_loki_config(stub)
+            mock_set.assert_not_called()
+
+    def test_teardown_clears_loki_api_url(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        with patch("charm._lxc_config_set") as mock_set:
+            MicroCloudCharm._teardown_lxd_loki_config(stub)
+            mock_set.assert_called_once_with("loki.api.url", "")
+
+    def test_teardown_swallows_lxd_config_error(self):
+        from charm import LXDConfigError, MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        with patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")):
+            # Should not raise.
+            MicroCloudCharm._teardown_lxd_loki_config(stub)
+
+
+# ---------------------------------------------------------------------------
+# logging (Loki) relation handlers
+# ---------------------------------------------------------------------------
+
+
+class TestLokiRelationHandlers:
+    def _make_charm_stub(self):
+        from charm import MicroCloudCharm
+
+        return MagicMock(spec=MicroCloudCharm)
+
+    def test_joined_calls_ensure_lxd_loki_config(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        MicroCloudCharm._on_loki_push_api_endpoint_joined(stub, MagicMock())
+        stub._ensure_lxd_loki_config.assert_called_once()
+
+    def test_departed_calls_teardown_lxd_loki_config(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        MicroCloudCharm._on_loki_push_api_endpoint_departed(stub, MagicMock())
+        stub._teardown_lxd_loki_config.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _lxd_has_api_extension
+# ---------------------------------------------------------------------------
+
+
+class TestLxdHasApiExtension:
+    def test_true_when_extension_present(self):
+        from charm import _lxd_has_api_extension
+
+        result = MagicMock(stdout=json.dumps({"api_extensions": ["loki", "other"]}))
+        with patch("charm.subprocess.run", return_value=result):
+            assert _lxd_has_api_extension("loki") is True
+
+    def test_false_when_extension_absent(self):
+        from charm import _lxd_has_api_extension
+
+        result = MagicMock(stdout=json.dumps({"api_extensions": ["other"]}))
+        with patch("charm.subprocess.run", return_value=result):
+            assert _lxd_has_api_extension("loki") is False
+
+    def test_false_on_subprocess_error(self):
+        import subprocess
+
+        from charm import _lxd_has_api_extension
+
+        with patch(
+            "charm.subprocess.run",
+            side_effect=subprocess.CalledProcessError(1, "lxc"),
+        ):
+            assert _lxd_has_api_extension("loki") is False
+
+    def test_false_on_invalid_json(self):
+        from charm import _lxd_has_api_extension
+
+        result = MagicMock(stdout="not json")
+        with patch("charm.subprocess.run", return_value=result):
+            assert _lxd_has_api_extension("loki") is False
 
 
 # ---------------------------------------------------------------------------

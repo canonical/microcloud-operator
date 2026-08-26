@@ -36,9 +36,17 @@ description: |
   Metrics integration is only configured when a related
   opentelemetry-collector subordinate is attached via the cos-agent relation.
   When related, the charm ensures Prometheus-compatible endpoints exist for
-  LXD, MicroCeph, and MicroOVN and advertises them. When the relation is
-  removed, the metrics setup is torn down. A base MicroCloud deployment
-  performs no metrics setup.
+  LXD, MicroCeph, and MicroOVN and advertises them. MicroCeph's own logs are
+  also forwarded over this same relation (via its "ceph-logs" snap slot).
+  When the relation is removed, the metrics setup is torn down. A base
+  MicroCloud deployment performs no metrics setup.
+
+  Log forwarding for LXD is configured separately, over the "logging"
+  relation (loki_push_api interface). When related to a Loki-compatible
+  endpoint (e.g. opentelemetry-collector's receive-loki-logs endpoint), the
+  charm configures LXD's native Loki client (loki.api.url) to stream its
+  logs there directly. When the relation is removed, LXD's Loki streaming
+  is disabled again.
 
 links:
   source: https://github.com/canonical/microcloud
@@ -74,6 +82,12 @@ peers:
 provides:
   cos-agent:
     interface: cos_agent
+
+requires:
+  logging:
+    interface: loki_push_api
+    limit: 1
+    optional: true
 
 storage:
   local:
