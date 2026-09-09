@@ -122,3 +122,84 @@ jobs:
           path: "*.charm"
           if-no-files-found: error
           retention-days: 7
+
+  integration:
+    name: Integration (ubuntu@${{ matrix.base }}, Juju ${{ matrix.juju-version }})
+    # "build" already depends on "static".
+    needs: [build]
+    strategy:
+      fail-fast: false
+      matrix:
+        base: ["24.04", "26.04"]
+        juju-version: ["3.6"]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download packed charm
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: microcloud-charm-${{ matrix.base }}-amd64
+
+      - name: Install tox
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y tox
+
+      - name: Hold background updates
+        # A snap refreshing or unattended-upgrades running mid-test reads as a
+        # charm failure. Neither is wanted for the life of one CI job.
+        run: |
+          sudo snap refresh --hold
+          sudo systemctl mask --now unattended-upgrades.service || true
+
+      - name: Provision Juju and LXD
+        # concierge reads concierge.yaml from the working directory. The same
+        # file is used for local runs, so CI and a developer machine provision
+        # identically.
+        timeout-minutes: 30
+        env:
+          CONCIERGE_JUJU_CHANNEL: "${{ matrix.juju-version }}/stable"
+        run: |
+          sudo snap install --classic concierge
+          sudo --preserve-env=CONCIERGE_JUJU_CHANNEL \
+            concierge prepare -c concierge.yaml --verbose
+
+      - name: Run integration tests
+        # Smoke and configuration recovery each deploy into their own model.
+        timeout-minutes: 110
+        run: |
+          # The artifact holds exactly one charm: this job's platform.
+          charm="$(ls ./*.charm)"
+          mkdir -p logs
+          ./scripts/run-integration-tests --charm "${charm}" --juju-dump-logs logs/
+
+      - name: Collect diagnostics
+        if: ${{ !cancelled() }}
+        timeout-minutes: 10
+        run: |
+          # Best effort: the model may already be torn down, and a failure here
+          # must not mask the test result.
+          mkdir -p logs
+          juju controllers >logs/juju-controllers.txt 2>&1 || true
+          juju models >logs/juju-models.txt 2>&1 || true
+          juju status --relations >logs/juju-status.txt 2>&1 || true
+          juju debug-log --replay --no-tail >logs/juju-debug-log.txt 2>&1 || true
+          df -h >logs/df.txt 2>&1 || true
+          snap list >logs/snap-list.txt 2>&1 || true
+          sudo lxc list --all-projects 2>&1 | tee logs/lxc-list.txt >/dev/null || true
+
+      - name: Upload test logs
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: logs-integration-${{ matrix.base }}-juju-${{ matrix.juju-version }}
+          path: logs/
+          if-no-files-found: error
+          retention-days: 7
