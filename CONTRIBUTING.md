@@ -44,3 +44,28 @@ charmcraft pack
 `build` depends on `static`, so a lint error never reaches a charm build. Every job runs with
 `contents: read` and no other permission. The matrix covers every platform `charmcraft.yaml`
 declares.
+
+## Publishing
+
+Publishing is manual. Run the **Release** workflow (`.github/workflows/release.yaml`) from the
+Actions tab against the branch you want to publish: it builds and tests that branch, then uploads
+to Charmhub. A `<track>-rev<N>` git tag is pushed for each revision.
+
+The `track` input selects the Charmhub track and defaults to `3`, mirroring the MicroCloud
+snap's major version tracks.
+
+Nothing above `edge` is published automatically. Moving a revision up a risk level is a separate
+**Promote** workflow run (`.github/workflows/promote.yaml`), choosing the risk to promote from and
+to; it refuses anything that is not a step up.
+
+Both workflows need a `CHARMHUB_TOKEN` repository secret:
+
+```shell
+charmcraft login --export=token.txt --charm=microcloud \
+  --permission=package-manage-releases \
+  --permission=package-manage-revisions \
+  --permission=package-view-revisions --ttl=<seconds>
+```
+
+GitHub only offers a `workflow_dispatch` workflow once it exists on the default branch, so neither
+appears in the Actions tab until they have landed on `main`.
