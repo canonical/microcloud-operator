@@ -1,4 +1,5 @@
 name: microcloud
+title: MicroCloud
 type: charm
 subordinate: false
 
@@ -37,8 +38,9 @@ description: |
   relation is removed, LXD's Loki streaming is disabled again.
 
 links:
-  source: https://github.com/canonical/microcloud
-  issues: https://github.com/canonical/microcloud/issues
+  source: https://github.com/canonical/charm-microcloud
+  issues: https://github.com/canonical/charm-microcloud/issues
+  documentation: https://canonical.com/microcloud/docs/latest/
 
 assumes:
   - juju >= 3.6
