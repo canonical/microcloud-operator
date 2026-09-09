@@ -8,13 +8,19 @@ src/dashboards/{lxd,microceph,microovn}/, injecting a few extra tags too.
 
 The dashboard JSON files are NOT committed to the repository.
 
+Sources
+-------
 Dashboard sources:
 * LXD
-    https://github.com/canonical/lxd/blob/main/grafana/
+    https://github.com/canonical/lxd/blob/{rev}/grafana/
 * MicroCeph
-    https://github.com/canonical/charm-microceph/tree/main/files/grafana_dashboards
+    https://github.com/canonical/charm-microceph/tree/{rev}/files/grafana_dashboards
 * MicroOVN
-    https://github.com/canonical/microovn-operator/tree/main/src/dashboards
+    https://github.com/canonical/microovn-operator/tree/{rev}/src/dashboards
+
+Every source is pinned to an immutable revision or commit so that two packs of
+the same charm commit fetch identical content.  Bump the refs below to pick up
+upstream changes.
 """
 
 import json
@@ -32,18 +38,31 @@ _DATASOURCE_INPUTS: dict[str, str] = {
     "DS_LOKI": "lokids",
 }
 
+# ---------------------------------------------------------------------------
+# Pinned upstream revisions
+# ---------------------------------------------------------------------------
+
+# Commits in the upstream charm repositories.
+LXD_REF = "966a0381ef459724343b8b6d8fafccc87fb5f2cb"
+MICROCEPH_REF = "9e8e20aadd5cf8434cd24bb1b6770f3b1f7a2205"
+MICROOVN_REF = "be49a96072896c8c8aa4758455136e1c1df6de8e"
+
+# ---------------------------------------------------------------------------
+# Dashboard catalogue
+# ---------------------------------------------------------------------------
+
 # Each entry: (destination_filename, url, extra_tags_to_inject)
 DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
     "lxd": [
         (
             "lxd.json",
-            "https://raw.githubusercontent.com/canonical/lxd/refs/heads/main/grafana/LXD.json",
+            f"https://raw.githubusercontent.com/canonical/lxd/{LXD_REF}/grafana/LXD.json",
             ["microcloud", "lxd"],
         ),
     ],
     "microceph": [
         (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/charm-microceph/main/files/grafana_dashboards/{name}.json",
+         f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/grafana_dashboards/{name}.json",
          ["microcloud", "microceph"])
         for name in [
             "ceph-cluster-advanced",
@@ -64,7 +83,7 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
     ],
     "microovn": [
         (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/microovn-operator/main/src/dashboards/{name}.json",
+         f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/dashboards/{name}.json",
          ["microcloud", "microovn"])
         for name in [
             "central-north-daemon",
