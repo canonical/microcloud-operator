@@ -1,0 +1,82 @@
+name: Promote
+
+# Moves an already-published revision up a risk level. Nothing here builds or
+# uploads: release.yaml is the only thing that puts revisions on Charmhub, and
+# it only ever writes to edge. Every promotion above that is deliberate.
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: "Charmhub track"
+        type: string
+        default: "3"
+      from-risk:
+        description: Risk to promote from
+        required: true
+        type: choice
+        options:
+          - edge
+          - beta
+          - candidate
+      to-risk:
+        description: Risk to promote to
+        required: true
+        type: choice
+        options:
+          - beta
+          - candidate
+          - stable
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  promote:
+    name: Promote ${{ inputs.from-risk }} to ${{ inputs.to-risk }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Reject a promotion that does not move up
+        env:
+          FROM_RISK: ${{ inputs.from-risk }}
+          TO_RISK: ${{ inputs.to-risk }}
+        run: |
+          # The choice lists overlap, so beta -> beta and candidate -> edge are
+          # both selectable. Refuse rather than silently doing nothing or
+          # demoting a revision.
+          risks="edge beta candidate stable"
+          index_of() {
+            local i=0
+            for r in $risks; do
+              [ "$r" = "$1" ] && { echo "$i"; return; }
+              i=$((i + 1))
+            done
+            echo "-1"
+          }
+          from_index="$(index_of "${FROM_RISK}")"
+          to_index="$(index_of "${TO_RISK}")"
+          if [ "${to_index}" -le "${from_index}" ]; then
+            echo "Refusing to promote ${FROM_RISK} to ${TO_RISK}: not a step up." >&2
+            exit 1
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Promote
+        # Same commit pin as release.yaml; the 2.7.0 tag is still node20.
+        uses: canonical/charming-actions/promote-charm@9180b22741d2349858e35e1dcc2fe4e11c3ebf2d
+        with:
+          credentials: ${{ secrets.CHARMHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          origin-channel: ${{ inputs.track }}/${{ inputs.from-risk }}
+          destination-channel: ${{ inputs.track }}/${{ inputs.to-risk }}
+          charmcraft-channel: 4.x/stable
