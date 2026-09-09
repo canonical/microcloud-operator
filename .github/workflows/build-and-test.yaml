@@ -1,0 +1,115 @@
+name: Build & Test
+
+# Reusable workflow: static analysis, then pack the charm.
+#
+# amd64 only for now. arm64 needs either GitHub's arm runners or self-hosted
+# ones; add an `arch` matrix here when that is available.
+on:
+  workflow_call:
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  static:
+    name: Static analysis
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install tox
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y tox
+
+      - name: Lint
+        run: tox -e lint
+
+      - name: Unit tests
+        run: tox -e unit
+
+  build:
+    name: Pack charm
+    needs: [static]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CRAFT_SHARED_CACHE: /tmp/charmcraft
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Setup LXD
+        # charmcraft builds inside LXD.
+        uses: canonical/setup-lxd@a3c85fc6fb7fff43fcfeae87659e41a8f635b7dd # v0.1.3
+        timeout-minutes: 10
+        with:
+          channel: 6/stable
+
+      - name: Install charmcraft
+        run: sudo snap install --classic --channel=4.x/stable charmcraft
+        timeout-minutes: 10
+
+      - name: Cache charm build deps
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
+        with:
+          path: ${{ env.CRAFT_SHARED_CACHE }}/**
+          key: microcloud-deps-amd64-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          restore-keys: |
+            microcloud-deps-amd64-
+
+      - name: Pack charm
+        timeout-minutes: 45
+        run: |
+          # charmcraft.yaml declares four platforms; pack the amd64 pair
+          # explicitly, since multi-base packing inside LXD needs --platform.
+          for platform in "ubuntu@22.04:amd64" "ubuntu@24.04:amd64"; do
+            charmcraft pack --verbose --platform="$platform"
+          done
+
+          # Make the shared cache readable by the cache action.
+          sudo chown -R "$USER" "${CRAFT_SHARED_CACHE}"
+
+      - name: Analyse charm
+        # charmcraft's own linters: packaging faults the unit tests cannot see.
+        #
+        # "entrypoint" and "pydeps" are charmcraft bugs, not charm bugs. The
+        # dispatch script charmcraft's uv plugin generates ends in
+        # "${dispatch_path}/src/charm.py", and charmcraft's linter reads that
+        # line back without expanding the variable, so it looks for a literal
+        # "${dispatch_path}" directory; that also degrades language, framework
+        # and ops-main-call to "unknown". "pydeps" crashes outright and is
+        # graded fatal while printing its own success text.
+        run: |
+          for charm in ./*.charm; do
+            echo "::group::analyse $charm"
+            charmcraft analyse --ignore entrypoint,pydeps "$charm"
+            echo "::endgroup::"
+          done
+
+      - name: Upload charmcraft logs
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: logs-charmcraft-build
+          path: ~/.local/state/charmcraft/log/
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload packed charms
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: microcloud-charms-amd64
+          path: "*.charm"
+          if-no-files-found: error
+          retention-days: 7
