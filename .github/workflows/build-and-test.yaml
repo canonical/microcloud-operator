@@ -35,12 +35,19 @@ jobs:
         run: tox -e unit
 
   build:
-    name: Pack charm
+    name: Pack ubuntu@${{ matrix.base }}
     needs: [static]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: read
+    strategy:
+      # One base failing should not hide the state of the others.
+      fail-fast: false
+      matrix:
+        # amd64 only: charmcraft.yaml also declares arm64, but hosted arm64
+        # runners are not confirmed for this repository yet.
+        base: ["24.04", "26.04"]
     env:
       CRAFT_SHARED_CACHE: /tmp/charmcraft
     steps:
@@ -70,12 +77,10 @@ jobs:
 
       - name: Pack charm
         timeout-minutes: 45
+        env:
+          PLATFORM: ubuntu@${{ matrix.base }}:amd64
         run: |
-          # charmcraft.yaml declares four platforms; pack the amd64 pair
-          # explicitly, since multi-base packing inside LXD needs --platform.
-          for platform in "ubuntu@22.04:amd64" "ubuntu@24.04:amd64"; do
-            charmcraft pack --verbose --platform="$platform"
-          done
+          charmcraft pack --verbose --platform="${PLATFORM}"
 
           # Make the shared cache readable by the cache action.
           sudo chown -R "$USER" "${CRAFT_SHARED_CACHE}"
@@ -101,7 +106,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: logs-charmcraft-build
+          name: logs-charmcraft-${{ matrix.base }}
           path: ~/.local/state/charmcraft/log/
           if-no-files-found: error
           retention-days: 7
@@ -109,7 +114,7 @@ jobs:
       - name: Upload packed charms
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: microcloud-charms-amd64
+          name: microcloud-charm-${{ matrix.base }}-amd64
           path: "*.charm"
           if-no-files-found: error
           retention-days: 7
