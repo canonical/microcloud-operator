@@ -1231,9 +1231,7 @@ class TestPreseedInputs:
         )
 
         systems = [
-            SystemEntry(
-                name="node1", address="10.0.0.1", storage_ceph_paths=["/dev/nvme1n1"]
-            )
+            SystemEntry(name="node1", address="10.0.0.1", storage_ceph_paths=["/dev/nvme1n1"])
         ]
         inputs = MicroCloudCharm._preseed_inputs(stub, "10.0.0.1", "secret", systems)
 

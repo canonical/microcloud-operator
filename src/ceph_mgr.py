@@ -44,7 +44,10 @@ class CephMgrPrometheus:
     """
 
     def __init__(
-        self, port: int = _DEFAULT_PORT, rbd_stats_pools: str = "", enable_perf_metrics: bool = False
+        self,
+        port: int = _DEFAULT_PORT,
+        rbd_stats_pools: str = "",
+        enable_perf_metrics: bool = False,
     ) -> None:
         self._port = port
         self._rbd_stats_pools = rbd_stats_pools
@@ -70,7 +73,9 @@ class CephMgrPrometheus:
         try:
             result = subprocess.run(
                 ["snap", "services", "microceph"],
-                capture_output=True, text=True, check=False,
+                capture_output=True,
+                text=True,
+                check=False,
             )
             if result.returncode != 0:
                 # microceph snap not installed or not initialised.
@@ -103,18 +108,29 @@ class CephMgrPrometheus:
 
         self._ceph("mgr", "module", "enable", "prometheus")
         self._ceph(
-            "config", "set", "mgr", "mgr/prometheus/server_addr", _DEFAULT_ADDR,
+            "config",
+            "set",
+            "mgr",
+            "mgr/prometheus/server_addr",
+            _DEFAULT_ADDR,
         )
         self._ceph(
-            "config", "set", "mgr", "mgr/prometheus/server_port", str(self._port),
+            "config",
+            "set",
+            "mgr",
+            "mgr/prometheus/server_port",
+            str(self._port),
         )
         if self._rbd_stats_pools:
             self._ceph(
                 "config", "set", "mgr", "mgr/prometheus/rbd_stats_pools", self._rbd_stats_pools
             )
         self._ceph(
-            "config", "set", "mgr", "mgr/prometheus/exclude_perf_counters",
-            str(not self._enable_perf_metrics)
+            "config",
+            "set",
+            "mgr",
+            "mgr/prometheus/exclude_perf_counters",
+            str(not self._enable_perf_metrics),
         )
 
     def disable(self) -> None:

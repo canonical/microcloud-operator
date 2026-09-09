@@ -114,7 +114,9 @@ class OVNExporter:
     def _is_installed(self) -> bool:
         result = subprocess.run(
             ["snap", "list", SNAP_NAME],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         return result.returncode == 0
 
@@ -130,15 +132,15 @@ class OVNExporter:
                 if "already connected" in str(exc).lower():
                     logger.debug("Connection %s → %s already active", plug, slot)
                 else:
-                    raise OVNExporterError(
-                        f"Cannot connect {plug} to {slot}: {exc}"
-                    ) from exc
+                    raise OVNExporterError(f"Cannot connect {plug} to {slot}: {exc}") from exc
 
     def _missing_connections(self) -> list[tuple[str, str]]:
         """Return list of (plug, slot) pairs that are not currently connected."""
         result = subprocess.run(
             ["snap", "connections", SNAP_NAME],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if result.returncode != 0:
             return list(_CONNECTIONS)
@@ -161,12 +163,16 @@ class OVNExporter:
     def _is_service_active(self) -> bool:
         result = subprocess.run(
             ["snap", "services", SERVICE_NAME],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if result.returncode != 0:
             return False
         for line in result.stdout.splitlines():
-            if re.match(r"\s*" + re.escape(SERVICE_NAME) + r"\s+\w+\s+active", line, re.IGNORECASE):
+            if re.match(
+                r"\s*" + re.escape(SERVICE_NAME) + r"\s+\w+\s+active", line, re.IGNORECASE
+            ):
                 return True
         return False
 
