@@ -1,0 +1,31 @@
+# Provisioning for the charm's integration tests, applied with
+#   sudo concierge prepare -c concierge.yaml
+#
+# Mirrors the lxd-dev workspace's config/concierge.yaml so that a local run on
+# the lxd-juju-dev VM and a CI run provision the same way. Based on concierge's
+# `machine` preset rather than `dev`/`k8s`: this is a machine charm and needs no
+# Kubernetes substrate.
+#
+# See https://github.com/canonical/concierge for the full schema.
+
+juju:
+  channel: 3.6/stable
+  model-defaults:
+    test-mode: "true"
+    # Left off deliberately: in CI a hook that only passes on retry is a flake
+    # worth seeing, not one worth papering over.
+    automatically-retry-hooks: "false"
+  # Bootstrapping into a nested LXD can be slow on a loaded runner.
+  extra-bootstrap-args: --config bootstrap-timeout=1800
+
+providers:
+  lxd:
+    enable: true
+    bootstrap: true
+    # `channel` is deliberately unset: concierge then refreshes the lxd snap on
+    # its current channel instead of switching it.
+
+host:
+  snaps:
+    charmcraft:
+    jq:
