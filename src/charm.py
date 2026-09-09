@@ -82,6 +82,7 @@ _ALERT_RULES_DIR = "./src/prometheus_alert_rules"
 # LXD metrics address — dedicated loopback listener, always TLS.
 _LXD_METRICS_ADDRESS = "127.0.0.1:8444"
 
+
 class LXDConfigError(Exception):
     """Raised when an LXD configuration operation fails."""
 
@@ -255,10 +256,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         initialized = microcloud.is_initialized()
 
-        if initialized:
-            problem = self._reconcile_observe_only()
-        else:
-            problem = self._reconcile_deploy()
+        problem = self._reconcile_observe_only() if initialized else self._reconcile_deploy()
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -350,7 +348,9 @@ class MicroCloudCharm(ops.CharmBase):
                 return None
 
             if not self._coordinator.any_peer_acked():
-                self.unit.status = ops.WaitingStatus("Waiting for a peer to acknowledge initiator address")
+                self.unit.status = ops.WaitingStatus(
+                    "Waiting for a peer to acknowledge initiator address"
+                )
                 return None
 
         initiator_address = self._coordinator.initiator_address()
@@ -362,7 +362,9 @@ class MicroCloudCharm(ops.CharmBase):
             # First time seeing the address: ack it in this fast hook and
             # come back later to actually try joining (see docstring).
             self._coordinator.publish_ack()
-            self.unit.status = ops.MaintenanceStatus("Acknowledged initiator address; will join shortly")
+            self.unit.status = ops.MaintenanceStatus(
+                "Acknowledged initiator address; will join shortly"
+            )
             return None
 
         return self._bootstrap(passphrase or "", initiator_address)

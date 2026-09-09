@@ -341,7 +341,6 @@ class ClusterCoordinator:
 
         return secret.get_content(refresh=True)[_SECRET_FIELD]
 
-
     def _read_secret(self, relation: ops.Relation) -> str | None:
         secret_id = relation.data[self._charm.app].get(_APP_KEY_SECRET_ID)
         if not secret_id:

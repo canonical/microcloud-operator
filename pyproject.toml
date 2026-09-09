@@ -39,6 +39,9 @@ ignore = [
 
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["BLE001"]
+# The charm modules are imported only after stubbing out charm libraries and
+# extending sys.path, so these imports cannot sit at the top of the file.
+"tests/unit/test_charm.py" = ["E402"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
