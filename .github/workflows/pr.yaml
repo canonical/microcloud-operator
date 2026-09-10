@@ -25,6 +25,6 @@ permissions: {}
 
 jobs:
   build-and-test:
-    uses: ./.github/workflows/build-and-test.yaml
+    uses: $/.github/workflows/build-and-test.yaml
     permissions:
       contents: read
