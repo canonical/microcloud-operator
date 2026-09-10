@@ -38,9 +38,9 @@ charmcraft pack
 `.github/workflows/build-and-test.yaml`, which:
 
 1. **static** — `tox -e lint` and `tox -e unit`;
-2. **build** — one job per base, packing `ubuntu@<base>:amd64`, running `charmcraft analyse` on
-   the result and uploading it as its own artifact.
+2. **build** — one job per base and architecture, packing `ubuntu@<base>:<arch>`, running
+   `charmcraft analyse` on the result and uploading it as its own artifact.
 
 `build` depends on `static`, so a lint error never reaches a charm build. Every job runs with
-`contents: read` and no other permission. `charmcraft.yaml` also declares arm64, but hosted
-arm64 runners are not confirmed for this repository, so the matrix builds amd64 only.
+`contents: read` and no other permission. The matrix covers every platform `charmcraft.yaml`
+declares.
