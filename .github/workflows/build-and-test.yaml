@@ -35,9 +35,9 @@ jobs:
         run: tox -e unit
 
   build:
-    name: Pack ubuntu@${{ matrix.base }}
+    name: Pack ubuntu@${{ matrix.base }}:${{ matrix.arch }}
     needs: [static]
-    runs-on: ubuntu-24.04
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     permissions:
       contents: read
@@ -45,9 +45,13 @@ jobs:
       # One base failing should not hide the state of the others.
       fail-fast: false
       matrix:
-        # amd64 only: charmcraft.yaml also declares arm64, but hosted arm64
-        # runners are not confirmed for this repository yet.
         base: ["24.04", "26.04"]
+        arch: ["amd64", "arm64"]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     env:
       CRAFT_SHARED_CACHE: /tmp/charmcraft
     steps:
@@ -71,14 +75,14 @@ jobs:
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ env.CRAFT_SHARED_CACHE }}/**
-          key: microcloud-deps-amd64-${{ hashFiles('uv.lock', 'pyproject.toml') }}
+          key: microcloud-deps-${{ matrix.arch }}-${{ hashFiles('uv.lock', 'pyproject.toml') }}
           restore-keys: |
-            microcloud-deps-amd64-
+            microcloud-deps-${{ matrix.arch }}-
 
       - name: Pack charm
         timeout-minutes: 45
         env:
-          PLATFORM: ubuntu@${{ matrix.base }}:amd64
+          PLATFORM: ubuntu@${{ matrix.base }}:${{ matrix.arch }}
         run: |
           charmcraft pack --verbose --platform="${PLATFORM}"
 
@@ -106,7 +110,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: logs-charmcraft-${{ matrix.base }}
+          name: logs-charmcraft-${{ matrix.base }}-${{ matrix.arch }}
           path: ~/.local/state/charmcraft/log/
           if-no-files-found: error
           retention-days: 7
@@ -114,7 +118,7 @@ jobs:
       - name: Upload packed charms
         uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: microcloud-charm-${{ matrix.base }}-amd64
+          name: microcloud-charm-${{ matrix.base }}-${{ matrix.arch }}
           path: "*.charm"
           if-no-files-found: error
           retention-days: 7
