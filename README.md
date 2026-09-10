@@ -1,5 +1,7 @@
 # MicroCloud charm for MAAS
 
+<img align="right" alt="MicroCloud logo" src="https://documentation.ubuntu.com/microcloud/en/latest/_static/microcloud_tag.png">
+
 This charm deploys MicroCloud using Juju.
 
 ## Build the charm
