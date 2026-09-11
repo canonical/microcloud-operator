@@ -178,7 +178,7 @@ jobs:
           # The artifact holds exactly one charm: this job's platform.
           charm="$(ls ./*.charm)"
           mkdir -p logs
-          ./scripts/run-integration-tests --charm "${charm}" --juju-dump-logs logs/
+          tox -e integration -- --charm "${charm}" --juju-dump-logs logs/
 
       - name: Collect diagnostics
         if: ${{ !cancelled() }}
