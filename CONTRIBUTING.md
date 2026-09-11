@@ -52,7 +52,7 @@ sudo snap install --classic concierge
 sudo concierge prepare -c concierge.yaml --verbose
 
 charmcraft pack --platform=ubuntu@24.04:amd64
-./scripts/run-integration-tests --charm ./microcloud_ubuntu@24.04-amd64.charm
+tox -e integration -- --charm ./microcloud_ubuntu@24.04-amd64.charm
 ```
 
 Every argument is forwarded to `pytest`, so `--num-units`, `--constraints` and the usual
