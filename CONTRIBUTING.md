@@ -29,6 +29,35 @@ Build the charm in this git repository using:
 charmcraft pack
 ```
 
+## Integration tests
+
+The suite deploys a multi-unit, **LXD-only MicroCloud** (MicroCeph and MicroOVN are disabled by
+setting their snap channels to the empty string) and asserts that the charm forms the cluster and
+that MicroCloud, LXD and the Juju units all agree on membership. It also checks repeated
+status actions on every unit. A separate model tests invalid configuration before bootstrap,
+correction through `juju config`, and repeated configuration failure/recovery after bootstrap
+without changing cluster membership.
+
+These tests cover the current single-application charm. Fleet growth, bounded join batches,
+cross-application roles, and interrupted-join recovery need implementation before they can
+become passing acceptance tests. MicroCeph and MicroOVN health require a separate VM-backed
+suite with disks and suitable networking.
+
+It needs a bootstrapped Juju controller on a LXD cloud and a charm built with `charmcraft pack`.
+[`concierge`](https://github.com/canonical/concierge) provisions both from the `concierge.yaml` in
+this repo — the same file CI uses:
+
+```shell
+sudo snap install --classic concierge
+sudo concierge prepare -c concierge.yaml --verbose
+
+charmcraft pack --platform=ubuntu@24.04:amd64
+./scripts/run-integration-tests --charm ./microcloud_ubuntu@24.04-amd64.charm
+```
+
+Every argument is forwarded to `pytest`, so `--num-units`, `--constraints` and the usual
+[`pytest-jubilant`](https://pypi.org/project/pytest-jubilant/) options work.
+
 ## CI
 
 `.github/workflows/pr.yaml` runs on every pull request — except those touching only Markdown,
@@ -38,6 +67,8 @@ charmcraft pack
 1. **static** — `tox -e lint` and `tox -e unit`;
 2. **build** — one job per base and architecture, packing `ubuntu@<base>:<arch>`, running
    `charmcraft analyse` on the result and uploading it as its own artifact.
+   the result and uploading it as its own artifact;
+3. **integration** — deploys each packed charm with `concierge` and runs the suite against it.
 
 `build` depends on `static`, so a lint error never reaches a charm build. Every job runs with
 `contents: read` and no other permission. The matrix covers every platform `charmcraft.yaml`
