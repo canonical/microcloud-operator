@@ -1367,3 +1367,186 @@ class TestMicroCloudWrappers:
         ):
             with pytest.raises(microcloud.MicroCloudError):
                 microcloud.list_members()
+
+
+# ---------------------------------------------------------------------------
+# Join sessions
+# ---------------------------------------------------------------------------
+
+
+class TestSession:
+    """Starting and following join session workers."""
+
+    @pytest.fixture(autouse=True)
+    def _state_dir(self, tmp_path):
+        with patch("session.STATE_DIR", tmp_path):
+            yield tmp_path
+
+    def test_start_hands_the_document_to_a_detached_worker(self, _state_dir):
+        import subprocess
+
+        import session
+
+        worker = MagicMock(pid=42)
+        with (
+            patch("session.subprocess.Popen", return_value=worker) as popen,
+            patch("session.stop") as stop,
+            patch.dict("os.environ", {"JUJU_CONTEXT_ID": "microcloud/0-hook-1", "PATH": "/bin"}),
+        ):
+            pid = session.start(
+                "abc",
+                "passphrase: secret\n",
+                "microcloud/0",
+                Path("/charm"),
+                retry_until=123.5,
+                replacing=7,
+            )
+
+        assert pid == 42
+        stop.assert_called_once_with(7)
+        assert popen.call_args.args[0] == [
+            "/usr/bin/python3",
+            "/charm/src/join_session.py",
+            "abc",
+            str(_state_dir / "session.json"),
+            "123.5",
+            "microcloud/0",
+            "/charm",
+        ]
+
+        kwargs = popen.call_args.kwargs
+        assert kwargs["stdin"] == subprocess.PIPE
+        # The hook's own output must not be inherited, or Juju waits on it.
+        assert kwargs["stdout"] not in (None, subprocess.PIPE)
+        assert kwargs["start_new_session"] is True
+        # juju-exec refuses to run from what looks like a hook context.
+        assert "JUJU_CONTEXT_ID" not in kwargs["env"]
+        assert kwargs["env"]["PATH"] == "/bin"
+
+        worker.stdin.write.assert_called_once_with("passphrase: secret\n")
+        worker.stdin.close.assert_called_once()
+        assert "secret" not in "".join(p.read_text() for p in _state_dir.iterdir())
+
+    def test_start_failure_raises(self):
+        import session
+
+        with (
+            patch("session.subprocess.Popen", side_effect=OSError("no python3")),
+            pytest.raises(session.SessionError),
+        ):
+            session.start("abc", "doc", "microcloud/0", Path("/charm"))
+
+    def test_result_waits_for_the_worker(self, _state_dir):
+        import session
+
+        assert session.result("abc") is None
+
+        (_state_dir / "session.json").write_text(
+            json.dumps({"id": "abc", "rc": 1, "output": "Error: boom\n"})
+        )
+        assert session.result("abc") == (1, "Error: boom\n")
+
+    def test_result_ignores_another_session(self, _state_dir):
+        import session
+
+        (_state_dir / "session.json").write_text(json.dumps({"id": "abc", "rc": 0}))
+
+        assert session.result("def") is None
+
+    def test_clear_forgets_the_result(self, _state_dir):
+        import session
+
+        (_state_dir / "session.json").write_text(json.dumps({"id": "abc", "rc": 0}))
+
+        session.clear()
+
+        assert session.result("abc") is None
+
+    def test_is_running_only_matches_a_worker(self):
+        import session
+
+        assert session.is_running(0) is False
+        with patch(
+            "session.Path.read_bytes", return_value=b"/usr/bin/python3\0x/join_session.py\0"
+        ):
+            assert session.is_running(42) is True
+        # A reused PID belongs to something else.
+        with patch("session.Path.read_bytes", return_value=b"/usr/sbin/sshd\0"):
+            assert session.is_running(42) is False
+        with patch("session.Path.read_bytes", side_effect=FileNotFoundError):
+            assert session.is_running(42) is False
+
+    def test_stop_terminates_only_a_running_worker(self):
+        import signal
+
+        import session
+
+        with patch("session.is_running", return_value=True), patch("session.os.killpg") as kill:
+            session.stop(42)
+        kill.assert_called_once_with(42, signal.SIGTERM)
+
+        with patch("session.is_running", return_value=False), patch("session.os.killpg") as kill:
+            session.stop(42)
+        kill.assert_not_called()
+
+
+class TestJoinSessionWorker:
+    """The background worker itself."""
+
+    def _run(self, tmp_path, attempts, now):
+        import join_session
+
+        results = [MagicMock(returncode=rc, stdout=out, stderr="") for rc, out in attempts]
+        result_file = tmp_path / "session.json"
+        with (
+            patch("join_session.subprocess.run", side_effect=results) as run,
+            patch("join_session.time.time", side_effect=now),
+            patch("join_session.time.sleep") as sleep,
+        ):
+            rc = join_session.run("abc", "doc", str(result_file), retry_until=100.0)
+        return rc, json.loads(result_file.read_text()), run, sleep
+
+    def test_retries_until_the_session_opens(self, tmp_path):
+        rc, data, run, sleep = self._run(
+            tmp_path,
+            attempts=[(1, "No active session\n"), (1, "No active session\n"), (0, "joined\n")],
+            now=[10.0, 20.0, 30.0],
+        )
+
+        assert rc == 0
+        assert data == {
+            "id": "abc",
+            "rc": 0,
+            "output": "No active session\nNo active session\njoined\n",
+        }
+        assert run.call_count == 3
+        assert all(c.kwargs["input"] == "doc" for c in run.call_args_list)
+        assert run.call_args.args[0] == ["microcloud", "preseed"]
+        assert sleep.call_count == 2
+
+    def test_gives_up_at_the_deadline(self, tmp_path):
+        rc, data, run, _ = self._run(
+            tmp_path,
+            attempts=[(1, "No active session\n"), (1, "No active session\n")],
+            now=[50.0, 150.0],
+        )
+
+        assert rc == 1
+        assert data["rc"] == 1
+        assert run.call_count == 2
+
+    def test_dispatches_join_session_ended(self):
+        import join_session
+
+        with patch("join_session.subprocess.run") as run:
+            join_session.dispatch("microcloud/0", "/charm")
+
+        run.assert_called_once_with(
+            [
+                "/usr/bin/juju-exec",
+                "-u",
+                "microcloud/0",
+                "JUJU_DISPATCH_PATH=hooks/join_session_ended /charm/dispatch",
+            ],
+            check=False,
+        )
