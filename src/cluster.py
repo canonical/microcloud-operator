@@ -35,6 +35,7 @@ _KEY_OVN_UNDERLAY_IP = "microcloud-ovn-underlay-ip"
 _KEY_STORAGE_LOCAL_PATH = "microcloud-storage-local-path"
 _KEY_STORAGE_CEPH_PATHS = "microcloud-storage-ceph-paths"
 _KEY_READY = "microcloud-ready"
+_KEY_INITIALIZED = "microcloud-initialized"
 
 # App databag keys / secret label (leader-owned).
 _APP_KEY_SECRET_ID = "session-passphrase-secret-id"
@@ -53,6 +54,7 @@ class PeerSystem:
     ovn_underlay_ip: str = ""
     storage_local_path: str = ""
     storage_ceph_paths: list[str] = field(default_factory=list)
+    initialized: bool = False
 
 
 @dataclass
@@ -101,6 +103,7 @@ class ClusterCoordinator:
         ovn_underlay_ip: str = "",
         storage_local_path: str = "",
         storage_ceph_paths: list[str] | None = None,
+        initialized: bool = False,
     ) -> None:
         """Publish this unit's MicroCloud identity on the peer databag.
 
@@ -121,6 +124,10 @@ class ClusterCoordinator:
         relation.data[self._charm.unit][_KEY_STORAGE_CEPH_PATHS] = json.dumps(
             storage_ceph_paths or []
         )
+        # Whether this unit's own MicroCloud daemon is already clustered. The
+        # leader reads this to tell a first bootstrap from growing an existing
+        # cluster, and to decide which systems belong in the preseed.
+        relation.data[self._charm.unit][_KEY_INITIALIZED] = "true" if initialized else "false"
 
     def all_members(self) -> list[tuple[str, str]]:
         """Return (name, address) for every peer unit that has published, plus self.
@@ -149,6 +156,7 @@ class ClusterCoordinator:
             ovn_uplink_interface = data.get(_KEY_OVN_UPLINK_INTERFACE, "")
             ovn_underlay_ip = data.get(_KEY_OVN_UNDERLAY_IP, "")
             storage_local_path = data.get(_KEY_STORAGE_LOCAL_PATH, "")
+            initialized = data.get(_KEY_INITIALIZED) == "true"
             try:
                 storage_ceph_paths = json.loads(data.get(_KEY_STORAGE_CEPH_PATHS) or "[]")
             except (json.JSONDecodeError, TypeError):
@@ -162,6 +170,7 @@ class ClusterCoordinator:
                         ovn_underlay_ip=ovn_underlay_ip,
                         storage_local_path=storage_local_path,
                         storage_ceph_paths=storage_ceph_paths,
+                        initialized=initialized,
                     )
                 )
         # De-duplicate while preserving order.

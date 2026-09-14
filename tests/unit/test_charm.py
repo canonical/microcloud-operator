@@ -1603,6 +1603,83 @@ class TestJoinSessionWorker:
         )
 
 
+class TestGrowCoordinator:
+    """Peer relation state the leader uses to tell forming from growing."""
+
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+peers:
+  cluster:
+    interface: microcloud-peer
+""",
+        )
+        harness.set_leader(True)
+        harness.begin()
+        return harness
+
+    def _publish(self, harness, rel_id, unit, name, address, initialized):
+        harness.add_relation_unit(rel_id, unit)
+        harness.update_relation_data(
+            rel_id,
+            unit,
+            {
+                "microcloud-name": name,
+                "microcloud-address": address,
+                "microcloud-initialized": "true" if initialized else "false",
+            },
+        )
+
+    def test_pending_systems_excludes_clustered_units(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", True)
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", False)
+
+            assert {s.name for s in coordinator.pending_systems()} == {"node2"}
+        finally:
+            harness.cleanup()
+
+    def test_membership_overrides_lagging_flags(self):
+        """A unit that has just joined still publishes "false" until its next hook."""
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", False)
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", False)
+
+            pending = coordinator.pending_systems({"node0", "node1"})
+            assert {s.name for s in pending} == {"node2"}
+        finally:
+            harness.cleanup()
+
+    def test_any_initialized(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", False)
+            assert coordinator.any_initialized() is False
+
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", True)
+            assert coordinator.any_initialized() is True
+        finally:
+            harness.cleanup()
+
+
 class TestGrowCharm:
     """Forming the cluster through join sessions."""
 
