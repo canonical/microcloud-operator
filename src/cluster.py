@@ -35,13 +35,12 @@ _KEY_OVN_UNDERLAY_IP = "microcloud-ovn-underlay-ip"
 _KEY_STORAGE_LOCAL_PATH = "microcloud-storage-local-path"
 _KEY_STORAGE_CEPH_PATHS = "microcloud-storage-ceph-paths"
 _KEY_READY = "microcloud-ready"
-_KEY_ACK = "microcloud-initiator-ack"
 
 # App databag keys / secret label (leader-owned).
 _APP_KEY_SECRET_ID = "session-passphrase-secret-id"
 _SECRET_LABEL = "microcloud-session-passphrase"
 _SECRET_FIELD = "passphrase"
-_APP_KEY_INITIATOR_ADDRESS = "initiator-address"
+_APP_KEY_SESSION = "join-session"
 
 
 @dataclass
@@ -54,6 +53,22 @@ class PeerSystem:
     ovn_underlay_ip: str = ""
     storage_local_path: str = ""
     storage_ceph_paths: list[str] = field(default_factory=list)
+
+
+@dataclass
+class JoinSession:
+    """A join session the leader has opened.
+
+    ``systems`` names every system listed in the session's preseed, which
+    joiners render verbatim so that every document matches the
+    initiator's. ``deadline`` (seconds since the epoch) is when the session
+    has certainly ended, after which a new leader may open another.
+    """
+
+    id: str
+    address: str
+    systems: list[str]
+    deadline: float
 
 
 class ClusterCoordinator:
@@ -199,87 +214,76 @@ class ClusterCoordinator:
         )
         return ready_count >= self.expected_unit_count()
 
+    def pending_systems(self, members: set[str] | None = None) -> list[PeerSystem]:
+        """Return the published systems whose MicroCloud is not yet clustered.
+
+        ``members`` is the cluster's own member list, which only a unit that
+        is already clustered can read, and it takes precedence when given.
+        Each peer's published flag lags behind: it is computed at the start
+        of a hook, before that hook runs "microcloud preseed", so a unit
+        that has just joined still reads as unclustered until its next
+        hook. Trusting the flag there would have the initiator open a
+        session for units that will never dial in.
+        """
+        if members is not None:
+            return [system for system in self.all_systems() if system.name not in members]
+        return [system for system in self.all_systems() if not system.initialized]
+
+    def any_initialized(self) -> bool:
+        """Return True if any unit has published that it is clustered.
+
+        The flag can lag behind (see ``pending_systems``) but never leads,
+        so True reliably means a cluster already exists.
+        """
+        return any(system.initialized for system in self.all_systems())
+
     # ------------------------------------------------------------------
-    # Initiator address (leader-owned, app databag)
+    # Join session (leader-owned, app databag)
     # ------------------------------------------------------------------
 
-    def publish_initiator_address(self, address: str) -> None:
-        """Leader publishes its bind address as the preseed initiator.
+    def publish_session(self, session: JoinSession | None) -> None:
+        """Leader publishes the join session it has opened, or clears it.
 
-        Every unit (leader and joiners) renders and runs the *same* preseed
-        document; each MicroCloud daemon decides its own role by matching
-        this address. Only the leader may write application data.
+        Publishing is what tells the joiners to dial in: the write commits
+        when the leader's hook exits, and a change to application data
+        triggers relation-changed on every other unit. Only the leader may
+        write application data.
         """
         relation = self.relation
         if relation is None or not self._charm.unit.is_leader():
             return
-        relation.data[self._charm.app][_APP_KEY_INITIATOR_ADDRESS] = address
+        app_data = relation.data[self._charm.app]
+        if session is None:
+            app_data.pop(_APP_KEY_SESSION, None)
+            return
+        app_data[_APP_KEY_SESSION] = json.dumps(
+            {
+                "id": session.id,
+                "address": session.address,
+                "systems": session.systems,
+                "deadline": session.deadline,
+            }
+        )
 
-    def initiator_address(self) -> str | None:
-        """Return the published initiator address, or None if not yet set."""
+    def session(self) -> JoinSession | None:
+        """Return the published join session, or None if there is none."""
         relation = self.relation
         if relation is None:
             return None
-        return relation.data[self._charm.app].get(_APP_KEY_INITIATOR_ADDRESS) or None
-
-    def publish_ack(self) -> None:
-        """Non-leader unit acknowledges it has seen ``initiator_address``.
-
-        Juju only propagates a unit's relation-data writes to peers once
-        the *writing* hook exits successfully - a still-running hook's
-        writes are invisible to everyone else until then. This means the
-        leader cannot publish its address and immediately block on opening
-        its own "microcloud preseed" session in the very same hook: no
-        joiner could ever learn the address in time, since the leader's
-        hook would not exit (and therefore not commit the write) until
-        that blocking call itself finishes or times out.
-
-        To avoid that deadlock, joiners "ack" the address in a fast,
-        separate hook of their own as soon as they see it, before ever
-        calling "microcloud preseed" themselves. That ack is a peer data
-        change, so Juju delivers it to the leader (and other joiners) as a
-        fresh relation-changed event - only then does the leader dare open
-        its own session (see ``any_peer_acked()``), and only then does this
-        joiner itself proceed to actually try joining (see ``has_acked()``).
-        """
-        relation = self.relation
-        if relation is None:
-            return
-        relation.data[self._charm.unit][_KEY_ACK] = "true"
-
-    def has_acked(self) -> bool:
-        """Return True if this unit has already published its own ack.
-
-        Used by a unit to tell "I am seeing initiator_address for the
-        first time, and must return without bootstrapping so the ack
-        commits" apart from "I already acked in an earlier hook, and can
-        now safely proceed to actually run microcloud preseed".
-        """
-        relation = self.relation
-        if relation is None:
-            return False
-        return relation.data[self._charm.unit].get(_KEY_ACK) == "true"
-
-    def any_peer_acked(self) -> bool:
-        """Leader-side: return True once at least one *other* unit has acked.
-
-        Gates the leader from opening its own "microcloud preseed" session
-        until it knows at least one joiner has already committed (in its
-        own hook) that it has seen the initiator address and is about to
-        try joining - otherwise the leader's session could open and time
-        out before any joiner even knew to dial in.
-
-        On a single-node deployment there are no peers at all, so there is
-        no one who could ever ack: waiting on this condition would block
-        forever. In that case, return True immediately so the lone leader
-        proceeds straight to opening its own session.
-        """
-        relation = self.relation
-        if relation is None:
-            return False
-        if not relation.units:
-            return True
-        return any(relation.data.get(unit, {}).get(_KEY_ACK) == "true" for unit in relation.units)
+        raw = relation.data[self._charm.app].get(_APP_KEY_SESSION)
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            return JoinSession(
+                id=str(data["id"]),
+                address=str(data["address"]),
+                systems=[str(name) for name in data["systems"]],
+                deadline=float(data["deadline"]),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
+            logger.warning("Ignoring malformed join session data: %r", raw)
+            return None
 
     # ------------------------------------------------------------------
     # Session passphrase (Juju secret, leader-owned)

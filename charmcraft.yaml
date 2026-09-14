@@ -189,12 +189,10 @@ config:
       type: int
       default: 300
       description: >
-        Seconds the initiator keeps the trust-establishment session open
-        while waiting for joiners. Bumped from the MicroCloud CLI default
-        (60 min) down to 5 min, but raised well above the MicroCloud CLI's
-        own lookup-timeout default (60s), so the initiator reliably
-        outlasts joiners whose own hooks may run on a delayed Juju
-        schedule.
+        Seconds a join session stays open, and so how long the initiator
+        waits for every listed unit to dial in before failing the session
+        and opening another. Well below the MicroCloud CLI default (60
+        min), since the charm starts joiners as soon as a session opens.
 
     # ------------------------------------------------------------------
     # Ceph preseed options

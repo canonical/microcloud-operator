@@ -10,19 +10,17 @@ Deployment mode (MicroCloud not yet initialized)
 install / config-changed / peer-relation-changed
     • Install the microcloud, lxd, and (optionally) microceph/microovn snaps
       at the configured channels with a shared cohort, then hold refreshes.
-    • Once every unit has reported its identity, the leader publishes its
-      own bind address as the preseed initiator address. Every unit
-      (leader and joiners alike) then renders and runs the identical
-      "microcloud preseed" document; each daemon determines its own role
-      (initiator vs. joiner) by matching its address against the published
-      initiator address. Joining is unicast (not multicast): a joiner
-      dials the initiator directly, so it must land after the initiator
-      has actually opened its session. A generous session-timeout default
-      (5 min) keeps the initiator's session open long enough to absorb
-      timing skew between independently scheduled Juju hooks, and
-      bootstrap retries "microcloud preseed" (10 times, 15s apart, both
-      fixed) within the same hook execution if a unit's own attempt
-      lands before the initiator's session has opened.
+    • Once every unit is ready, the leader opens a join session: it starts
+      "microcloud preseed" in the background, outside the hook, and
+      publishes the session (its address and the systems it lists) on the
+      peer relation. Joining is unicast (not multicast), so every unit
+      renders the same document and each daemon determines its own role by
+      matching its address against the initiator address.
+    • Publishing the session triggers a hook on every other unit, from
+      which each listed joiner starts dialling in, in the background too,
+      retrying until the session has opened.
+    • Once the session ends, it fires update-status on the leader, which
+      picks up the result and clears it.
 
 Observe-only mode (MicroCloud already initialized out-of-band)
 --------------------------------------------------------------
@@ -55,6 +53,7 @@ import logging
 import re
 import subprocess
 import time
+import uuid
 from typing import Any
 
 import ops
@@ -63,9 +62,10 @@ from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import microcloud
+import session
 import snap
 from ceph_mgr import CephMgrError, CephMgrPrometheus
-from cluster import ClusterCoordinator, validate_membership
+from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_membership
 from ovn_exporter import OVNExporter, OVNExporterError
 from preseed import PreseedInputs, SystemEntry, render
 
@@ -82,16 +82,38 @@ _ALERT_RULES_DIR = "./src/prometheus_alert_rules"
 # LXD metrics address — dedicated loopback listener, always TLS.
 _LXD_METRICS_ADDRESS = "127.0.0.1:8444"
 
+# How long past its session timeout a join session is assumed to have ended,
+# for a new leader deciding whether it may open another.
+_SESSION_GRACE = 120
+
+# How many join sessions in a row may fail before the leader stops opening
+# the next one straight away and blocks, retrying only on later hooks.
+_SESSION_RETRIES = 3
+
 
 class LXDConfigError(Exception):
     """Raised when an LXD configuration operation fails."""
 
 
+class JoinSessionEndedEvent(ops.EventBase):
+    """A join session worker on this unit has finished."""
+
+
+class MicroCloudCharmEvents(ops.CharmEvents):
+    """Charm events, including the one join session workers dispatch."""
+
+    join_session_ended = ops.EventSource(JoinSessionEndedEvent)
+
+
 class MicroCloudCharm(ops.CharmBase):
     """Deploys and operates a MicroCloud cluster, optionally wired to COS."""
 
+    on = MicroCloudCharmEvents()  # pyright: ignore[reportAssignmentType]
+    _stored = ops.StoredState()
+
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
+        self._stored.set_default(session_failures=0, worker_pid=0, worker_session="")
 
         # Lazy-initialised observability helpers.
         self._ceph: CephMgrPrometheus | None = None
@@ -122,6 +144,7 @@ class MicroCloudCharm(ops.CharmBase):
         self.framework.observe(self.on.upgrade_charm, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.update_status, self._on_update_status)
+        self.framework.observe(self.on.join_session_ended, self._on_join_session_ended)
         self.framework.observe(self.on.cluster_relation_changed, self._on_cluster_relation_changed)
         self.framework.observe(
             self.on.cluster_relation_departed, self._on_cluster_relation_changed
@@ -205,6 +228,9 @@ class MicroCloudCharm(ops.CharmBase):
     def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
         self._reconcile()
 
+    def _on_join_session_ended(self, event: JoinSessionEndedEvent) -> None:
+        self._reconcile()
+
     def _on_stop(self, event: ops.StopEvent) -> None:
         if self._cos_related():
             self._teardown_observability(full_cleanup=False)
@@ -249,6 +275,8 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        initialized = microcloud.is_initialized()
+
         # Publish our identity for peers as early as possible.
         self._coordinator.publish_identity(
             microcloud.hostname(),
@@ -259,9 +287,15 @@ class MicroCloudCharm(ops.CharmBase):
             storage_ceph_paths=self._storage_ceph_paths(),
         )
 
-        initialized = microcloud.is_initialized()
+        # A clustered unit just observes, except for the leader while its join
+        # session is published: it stays on the deploy path to pick up the
+        # result and clear it.
+        initiating = self.unit.is_leader() and self._coordinator.session() is not None
 
-        problem = self._reconcile_observe_only() if initialized else self._reconcile_deploy()
+        if initialized and not initiating:
+            problem = self._reconcile_observe_only()
+        else:
+            problem = self._reconcile_deploy(initialized)
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -283,48 +317,42 @@ class MicroCloudCharm(ops.CharmBase):
 
     # ---- Deployment mode ----
 
-    def _reconcile_deploy(self) -> str | None:
-        """Install snaps, then run "microcloud preseed" on every unit.
-
-        Every unit publishes readiness once its own prerequisites are met.
-        The leader waits for all units to be ready before publishing its
-        bind address as the preseed initiator.
+    def _reconcile_deploy(self, initialized: bool) -> str | None:
+        """Install snaps, then form or grow the cluster through a join session.
 
         Juju only propagates a unit's relation-data writes to its peers
-        once the writing hook exits successfully - a hook that is still
-        running (e.g. blocked inside "microcloud preseed") has not
-        committed anything yet, and peers cannot see it. This means the
-        leader must not publish its address and immediately block on
-        opening its own session in the very same hook: no joiner could
-        ever learn the address in time to dial in, since the leader's
-        hook would not exit (and so not commit) until that blocking call
-        itself finished or timed out - a deadlock. Instead:
+        once the writing hook exits, and a unit's own write never triggers a
+        hook on that unit. A session opened inside a hook could therefore not
+        be announced until it was already over. Instead:
 
-        1. The leader publishes ``initiator_address`` and returns (a fast,
-           committing hook).
-        2. Joiners see the address, "ack" it themselves (another fast,
-           committing hook) rather than immediately trying to join, and
-           only try in a later hook.
-        3. Once the leader sees at least one peer's ack, it knows a joiner
-           is actually about to dial in, and only then opens its own
-           session by running "microcloud preseed".
-        4. Joiners, having already acked in an earlier hook, now run their
-           own "microcloud preseed", retrying a few times (unicast joining
-           means dialing in before the initiator's session exists is
-           rejected immediately rather than waited on).
+        1. The leader starts "microcloud preseed" in the background (see
+           ``session``), publishes the session it opened and exits. The
+           commit triggers relation-changed on every other unit.
+        2. Each joiner listed in the session starts dialling in from that
+           hook, also in the background, retrying until the session opens.
+           A later session replaces an attempt still waiting on this one.
+        3. When the session ends, the leader picks up its result from a hook
+           the background process fires and clears the session.
+
+        ``initialized`` is whether this unit is already clustered, which
+        only holds for the leader while it follows its join session.
 
         Returns a problem string to block on, or None.
         """
-        channels = {
-            "lxd": self.config.get("snap-channel-lxd", "6/stable"),
-            "microceph": self.config.get("snap-channel-microceph", ""),
-            "microovn": self.config.get("snap-channel-microovn", ""),
-            "microcloud": self.config.get("snap-channel-microcloud", "3/stable"),
-        }
-        try:
-            snap.ensure_snaps(channels)
-        except snap.SnapError as exc:
-            return f"Snap install: {exc}"
+        # A clustered leader only gets here to run a join session. Its snaps
+        # are already in place, and refreshing them now would upgrade this
+        # one member ahead of the rest of the cluster.
+        if not initialized:
+            channels = {
+                "lxd": self.config.get("snap-channel-lxd", "6/stable"),
+                "microceph": self.config.get("snap-channel-microceph", ""),
+                "microovn": self.config.get("snap-channel-microovn", ""),
+                "microcloud": self.config.get("snap-channel-microcloud", "3/stable"),
+            }
+            try:
+                snap.ensure_snaps(channels)
+            except snap.SnapError as exc:
+                return f"Snap install: {exc}"
 
         if not microcloud.waitready(timeout=60):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
@@ -340,47 +368,157 @@ class MicroCloudCharm(ops.CharmBase):
             return None
 
         # Every unit has now cleared all its own prerequisites: signal that
-        # it is ready to bootstrap as soon as told to.
+        # it is ready to be listed in a join session.
         self._coordinator.publish_ready()
 
         if self.unit.is_leader():
-            if not self._coordinator.all_ready():
-                self._hold_status(ops.WaitingStatus("Waiting for all peers to be ready"))
-                return None
+            return self._lead_session(initialized, passphrase or "")
+        return self._join_session(passphrase or "")
 
-            if not self._coordinator.initiator_address():
-                # First time all units are ready: commit our address in
-                # this fast hook and come back later to actually open the
-                # session, once we know a peer has seen it (see docstring).
-                self._coordinator.publish_initiator_address(self._bind_address())
+    def _lead_session(self, initialized: bool, passphrase: str) -> str | None:
+        """Leader side: follow the published join session, or open the next one."""
+        address = self._bind_address()
+        current = self._coordinator.session()
+        failure = ""
+
+        if current is not None and current.address != address:
+            # Opened by a previous leader. This unit's own state for that
+            # session is from dialling in to it, not the session's result.
+            if time.time() < current.deadline:
+                # It may still be running on that unit, and opening another
+                # now would compete with it.
                 self._hold_status(
-                    ops.MaintenanceStatus(
-                        "Initiator address published; waiting for a peer to acknowledge"
-                    )
+                    ops.WaitingStatus("Waiting for the previous leader's join session to end")
                 )
                 return None
+            self._coordinator.publish_session(None)
 
-            if not self._coordinator.any_peer_acked():
-                self._hold_status(
-                    ops.WaitingStatus("Waiting for a peer to acknowledge initiator address")
-                )
+        elif current is not None:
+            # Check for a result before whether the worker is running: the
+            # hook the worker fires once it is done runs while the worker is
+            # still waiting on that hook.
+            outcome = session.result(current.id)
+            if outcome is None and self._worker_running(current.id):
+                self._hold_status(ops.MaintenanceStatus(_session_message(current)))
                 return None
 
-        initiator_address = self._coordinator.initiator_address()
-        if not initiator_address:
-            self._hold_status(ops.WaitingStatus("Waiting for leader to select initiator"))
+            self._coordinator.publish_session(None)
+            session.clear()
+            if outcome is not None and outcome[0] != 0:
+                logger.error("Join session %s failed:\n%s", current.id, outcome[1])
+                failure = _last_line(outcome[1])
+                self._stored.session_failures += 1
+                # Nothing else wakes the leader once its session is cleared,
+                # so open the next one from this hook, unless sessions keep
+                # failing: then block and leave retrying to later hooks.
+                if self._stored.session_failures >= _SESSION_RETRIES:
+                    return f"Join session failed: {failure}"
+            else:
+                self._stored.session_failures = 0
+
+        if initialized:
             return None
 
-        if not self.unit.is_leader() and not self._coordinator.has_acked():
-            # First time seeing the address: ack it in this fast hook and
-            # come back later to actually try joining (see docstring).
-            self._coordinator.publish_ack()
+        if not self._coordinator.all_ready():
+            self._hold_status(ops.WaitingStatus("Waiting for all peers to be ready"))
+            return None
+
+        listed = self._coordinator.all_systems()
+        timeout = int(self.config.get("session-timeout", 300))
+        opened = JoinSession(
+            id=uuid.uuid4().hex,
+            address=address,
+            systems=[system.name for system in listed],
+            deadline=time.time() + timeout + _SESSION_GRACE,
+        )
+
+        document = render(self._preseed_inputs(address, passphrase, _system_entries(listed)))
+        try:
+            self._start_worker(opened.id, document)
+        except session.SessionError as exc:
+            return str(exc)
+
+        self._coordinator.publish_session(opened)
+        message = _session_message(opened)
+        if failure:
+            message = f"{message}; retrying after: {failure}"
+        self._hold_status(ops.MaintenanceStatus(message))
+        return None
+
+    def _join_session(self, passphrase: str) -> str | None:
+        """Joiner side: dial in to the published join session if listed in it.
+
+        The attempt runs in the background, like the initiator's session, so
+        that a later session can replace it: a joiner still waiting on a
+        session that failed would otherwise miss the next one. Once it
+        succeeds, the hook it fires finds this unit clustered and publishes
+        that, which is what tells the leader.
+        """
+        current = self._coordinator.session()
+        if current is None:
+            self._hold_status(ops.WaitingStatus("Waiting for the leader to open a join session"))
+            return None
+
+        if microcloud.hostname() not in current.systems:
+            self._hold_status(ops.WaitingStatus("Waiting for the next join session"))
+            return None
+
+        # A leader that lost leadership mid-session is still its initiator.
+        if current.address == self._bind_address():
             self._hold_status(
-                ops.MaintenanceStatus("Acknowledged initiator address; will join shortly")
+                ops.WaitingStatus("Waiting for the join session this unit opened to end")
             )
             return None
 
-        return self._bootstrap(passphrase or "", initiator_address)
+        outcome = session.result(current.id)
+        if outcome is not None and outcome[0] == 0:
+            # MicroCloud reports this unit as clustered only once the other
+            # services have joined too, a little after the attempt succeeds.
+            self._hold_status(ops.MaintenanceStatus("Joined the MicroCloud cluster"))
+            return None
+        if outcome is not None:
+            # The leader opens the next session; this unit just waits for it.
+            logger.error("Joining session %s failed:\n%s", current.id, outcome[1])
+            self._hold_status(
+                ops.WaitingStatus(
+                    f"Waiting for the next join session; joining failed: {_last_line(outcome[1])}"
+                )
+            )
+            return None
+
+        if not self._worker_running(current.id):
+            # Render exactly the systems the initiator listed, so this
+            # document matches the one the session was opened with.
+            by_name = {system.name: system for system in self._coordinator.all_systems()}
+            listed = [by_name[name] for name in current.systems if name in by_name]
+            document = render(
+                self._preseed_inputs(current.address, passphrase, _system_entries(listed))
+            )
+            try:
+                self._start_worker(current.id, document, retry_until=current.deadline)
+            except session.SessionError as exc:
+                return str(exc)
+
+        self._hold_status(ops.MaintenanceStatus("Joining the MicroCloud cluster"))
+        return None
+
+    def _worker_running(self, session_id: str) -> bool:
+        """Return True while this unit's worker for ``session_id`` is running."""
+        return self._stored.worker_session == session_id and session.is_running(
+            self._stored.worker_pid
+        )
+
+    def _start_worker(self, session_id: str, document: str, retry_until: float = 0) -> None:
+        """Replace this unit's join session worker with one for ``session_id``."""
+        self._stored.worker_pid = session.start(
+            session_id,
+            document,
+            self.unit.name,
+            self.charm_dir,
+            retry_until=retry_until,
+            replacing=self._stored.worker_pid,
+        )
+        self._stored.worker_session = session_id
 
     def _preseed_inputs(
         self, initiator_address: str, passphrase: str, systems: list[SystemEntry]
@@ -393,6 +531,11 @@ class MicroCloudCharm(ops.CharmBase):
             session_passphrase=passphrase,
             systems=systems,
             session_timeout=int(self.config.get("session-timeout", 300)),
+            # In preseed mode this is how long the initiator waits for every
+            # listed system to reach out, not just a multicast setting. Its
+            # 60s default would expire long before a joiner held up in
+            # another hook dials in, so wait for the whole session.
+            lookup_timeout=int(self.config.get("session-timeout", 300)),
             with_ceph=bool(self.config.get("snap-channel-microceph", "")),
             ceph_cephfs=bool(self.config.get("ceph-cephfs", False)),
             # "microcloud preseed" rejects a public/internal network without
@@ -438,67 +581,6 @@ class MicroCloudCharm(ops.CharmBase):
         each becomes a separate Ceph OSD on this system.
         """
         return [str(storage.location) for storage in self.model.storages["ceph"]]
-
-    def _bootstrap(self, passphrase: str, initiator_address: str) -> str | None:
-        """Render preseed and run it on this unit. Returns problem or None."""
-        systems = [
-            SystemEntry(
-                name=system.name,
-                address=system.address,
-                ovn_uplink_interface=system.ovn_uplink_interface,
-                ovn_underlay_ip=system.ovn_underlay_ip,
-                storage_local_path=system.storage_local_path,
-                storage_ceph_paths=system.storage_ceph_paths,
-            )
-            for system in self._coordinator.all_systems()
-        ]
-
-        inputs = self._preseed_inputs(initiator_address, passphrase, systems)
-
-        self._hold_status(ops.MaintenanceStatus("Bootstrapping MicroCloud cluster"))
-
-        rendered = render(inputs)
-        retries = 10
-        retry_delay = 15
-
-        # We use unicast (not multicast) joining: a joiner must dial the
-        # initiator's already-open session. If this unit's own hook runs
-        # before the initiator has started its session (e.g. still
-        # installing snaps, or its hook simply hasn't fired yet on Juju's
-        # independent per-unit schedule), the daemon rejects the attempt
-        # immediately with "No active session" rather than waiting - the
-        # MicroCloud CLI's lookup_timeout only bounds the wait *after* a
-        # session is found (and only applies to multicast discovery, which
-        # this charm never uses), so it does not help here. Retrying a few
-        # times lets this unit catch up once the initiator's session
-        # opens, instead of waiting for Juju's much slower periodic
-        # update-status reconciliation.
-        last_exc: microcloud.MicroCloudError | None = None
-        for attempt in range(retries + 1):
-            try:
-                microcloud.run_preseed(rendered)
-                return None
-            except microcloud.MicroCloudError as exc:
-                last_exc = exc
-                # microcloud.run_preseed() already logs the full
-                # stdout/stderr; log here too so the failure is visible
-                # from this module's logger context, since the returned
-                # status string is truncated to a single line by Juju.
-                logger.error(
-                    "MicroCloud bootstrap attempt %d/%d failed: %s",
-                    attempt + 1,
-                    retries + 1,
-                    exc,
-                )
-                if attempt < retries:
-                    self._hold_status(
-                        ops.MaintenanceStatus(
-                            f"Bootstrapping MicroCloud cluster (retry {attempt + 1}/{retries})"
-                        )
-                    )
-                    time.sleep(retry_delay)
-
-        return f"Bootstrap: {last_exc}"
 
     # ---- Observe-only mode ----
 
@@ -886,6 +968,32 @@ class MicroCloudCharm(ops.CharmBase):
                 f"known entries: {known}"
             )
         return str(interface), None
+
+
+def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
+    """Convert published peer identities into preseed system entries."""
+    return [
+        SystemEntry(
+            name=system.name,
+            address=system.address,
+            ovn_uplink_interface=system.ovn_uplink_interface,
+            ovn_underlay_ip=system.ovn_underlay_ip,
+            storage_local_path=system.storage_local_path,
+            storage_ceph_paths=system.storage_ceph_paths,
+        )
+        for system in systems
+    ]
+
+
+def _session_message(opened: JoinSession) -> str:
+    """Describe a join session in progress for the leader's status."""
+    return f"Forming the MicroCloud cluster with {len(opened.systems)} units"
+
+
+def _last_line(output: str) -> str:
+    """Return the last non-empty line of command output, for a status message."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines else "no output"
 
 
 def _lxc_config_set(key: str, value: str) -> None:
