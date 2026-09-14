@@ -1742,6 +1742,7 @@ class TestGrowCharm:
         running=False,
         outcome=None,
         now=1000.0,
+        ceph=True,
         pending_after=None,
     ):
         """Run ``_lead_session``.
@@ -1753,6 +1754,7 @@ class TestGrowCharm:
 
         stub._pending_systems.return_value = pending if pending_after is None else pending_after
         with (
+            patch("charm.snap.is_installed", return_value=ceph),
             patch("charm.render", side_effect=lambda inputs: inputs),
             patch("charm.session.result", return_value=outcome),
             patch("charm.session.clear") as clear,
@@ -1810,6 +1812,29 @@ class TestGrowCharm:
         assert stub._coordinator.publish_session.call_args.args[0].systems == ["node1"]
         assert "Joining 1 unit(s)" in stub.unit.status.message
 
+    def test_clustered_leader_without_microceph_blocks_instead_of_adding(self):
+        """MicroCloud's preseed panics adding systems to a cluster without MicroCeph."""
+        stub = self._stub(leader=True)
+
+        problem, start, _ = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], ceph=False
+        )
+
+        assert problem is not None
+        assert "MicroCeph" in problem
+        assert "1 unit(s)" in problem
+        start.assert_not_called()
+        stub._coordinator.publish_session.assert_not_called()
+
+    def test_forming_a_cluster_does_not_need_microceph(self):
+        systems = [self._system("node0", "10.0.0.1"), self._system("node1", "10.0.0.2")]
+        stub = self._stub(leader=True, systems=systems)
+
+        problem, start, _ = self._lead(stub, initialized=False, pending=systems, ceph=False)
+
+        assert problem is None
+        start.assert_called_once()
+
     def test_clustered_leader_only_waits_for_joining_units_to_be_ready(self):
         """Members of a cluster formed outside Juju never report ready."""
         pending = [self._system("node1", "10.0.0.2")]
@@ -1854,6 +1879,7 @@ class TestGrowCharm:
         from charm import MicroCloudCharm
 
         with (
+            patch("charm.snap.is_installed", return_value=True),
             patch("charm.render", side_effect=lambda inputs: inputs),
         ):
             stub._start_worker.side_effect = session.SessionError("no worker")

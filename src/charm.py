@@ -461,6 +461,15 @@ class MicroCloudCharm(ops.CharmBase):
             self._hold_status(ops.WaitingStatus("Waiting for all peers to be ready"))
             return None
 
+        # "microcloud preseed" cannot add systems to a cluster without
+        # MicroCeph: it panics looking up the cluster's Ceph networks. Say so,
+        # rather than open sessions that are bound to fail.
+        if initialized and not snap.is_installed("microceph"):
+            return (
+                f"Cannot add {len(pending)} unit(s): MicroCloud cannot add systems "
+                "to a cluster without MicroCeph"
+            )
+
         # Only a clustered unit can add others to the cluster, so an
         # unclustered leader must not take over from a cluster that already
         # exists: it would bootstrap a second one instead.
