@@ -4,6 +4,7 @@
 # TODO: Get rid of ca_file config for LXD metrics scrape completely then re-check if metrics end up on prometheus.
 
 name: microcloud
+title: MicroCloud
 type: charm
 subordinate: false
 
@@ -49,8 +50,9 @@ description: |
   is disabled again.
 
 links:
-  source: https://github.com/canonical/microcloud
-  issues: https://github.com/canonical/microcloud/issues
+  source: https://github.com/canonical/charm-microcloud
+  issues: https://github.com/canonical/charm-microcloud/issues
+  documentation: https://documentation.ubuntu.com/microcloud/
 
 assumes:
   - juju >= 3.6

@@ -1,0 +1,75 @@
+name: Release
+
+# Publishes to Charmhub's edge risk. Triggered by hand for now: run it from
+# the branch you want to publish. Anything above edge is promoted separately;
+# see promote.yaml.
+
+on:
+  workflow_dispatch:
+    inputs:
+      track:
+        description: "Charmhub track"
+        type: string
+        default: "3"
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  ci:
+    name: Build & test
+    uses: $/.github/workflows/build-and-test.yaml
+    permissions:
+      contents: read
+
+  release:
+    name: Release to Charmhub
+    needs: [ci]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      # upload-charm pushes a git tag for the published revision.
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download packed charms
+        # Publish the exact artifacts the build and integration jobs used,
+        # rather than packing again and shipping bytes nothing tested.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: microcloud-charm-*
+          merge-multiple: true
+
+      - name: Collect charm paths
+        id: charms
+        run: |
+          # nullglob so an unmatched glob expands to nothing rather than the
+          # literal pattern, letting the empty check below actually fire.
+          shopt -s nullglob
+          charms=(./*.charm)
+          if (( ${#charms[@]} == 0 )); then
+            echo "No charm artifacts were downloaded" >&2
+            exit 1
+          fi
+          ls -l "${charms[@]}"
+          echo "paths=$(IFS=,; echo "${charms[*]}")" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload and release to edge
+        # Pinned to the commit rather than 2.7.0: that tag still declares
+        # "using: node20", and the node24 fix is on main with no release
+        # carrying it yet.
+        uses: canonical/charming-actions/upload-charm@9180b22741d2349858e35e1dcc2fe4e11c3ebf2d
+        with:
+          credentials: ${{ secrets.CHARMHUB_TOKEN }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          channel: ${{ inputs.track }}/edge
+          built-charm-path: ${{ steps.charms.outputs.paths }}
+          charmcraft-channel: 4.x/stable
+          tag-prefix: ${{ inputs.track }}

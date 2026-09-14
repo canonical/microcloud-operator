@@ -19,7 +19,7 @@ Sources
 -------
 LXD
     Grafana dashboard #19131 (https://grafana.com/grafana/dashboards/19131-lxd/)
-    Downloaded via the Grafana API: GET /api/dashboards/{id}/revisions/latest/download
+    Downloaded via the Grafana API: GET /api/dashboards/{id}/revisions/{rev}/download
 
 MicroCeph
     canonical/charm-microceph, files/grafana_dashboards/
@@ -28,6 +28,10 @@ MicroCeph
 MicroOVN
     canonical/microovn-operator, src/dashboards/
     https://github.com/canonical/microovn-operator/tree/main/src/dashboards
+
+Every source is pinned to an immutable revision or commit so that two packs of
+the same charm commit fetch identical content.  Bump the refs below to pick up
+upstream changes.
 """
 
 import json
@@ -58,6 +62,17 @@ _DATASOURCE_INPUTS: dict[str, tuple[str, str]] = {
 }
 
 # ---------------------------------------------------------------------------
+# Pinned upstream revisions
+# ---------------------------------------------------------------------------
+
+# Grafana dashboard #19131 revision (grafana.com "Revisions" tab).
+LXD_DASHBOARD_REVISION = 5
+
+# Commits in the upstream charm repositories.
+MICROCEPH_REF = "9e8e20aadd5cf8434cd24bb1b6770f3b1f7a2205"
+MICROOVN_REF = "be49a96072896c8c8aa4758455136e1c1df6de8e"
+
+# ---------------------------------------------------------------------------
 # Dashboard catalogue
 # ---------------------------------------------------------------------------
 
@@ -66,13 +81,13 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
     "lxd": [
         (
             "lxd.json",
-            "https://grafana.com/api/dashboards/19131/revisions/latest/download",
+            f"https://grafana.com/api/dashboards/19131/revisions/{LXD_DASHBOARD_REVISION}/download",
             ["microcloud", "lxd"],
         ),
     ],
     "microceph": [
         (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/charm-microceph/main/files/grafana_dashboards/{name}.json",
+         f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/grafana_dashboards/{name}.json",
          ["microcloud", "microceph"])
         for name in [
             "ceph-cluster-advanced",
@@ -93,7 +108,7 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
     ],
     "microovn": [
         (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/microovn-operator/main/src/dashboards/{name}.json",
+         f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/dashboards/{name}.json",
          ["microcloud", "microovn"])
         for name in [
             "central-north-daemon",
