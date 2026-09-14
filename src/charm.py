@@ -99,6 +99,11 @@ class MicroCloudCharm(ops.CharmBase):
 
         self._coordinator = ClusterCoordinator(self)
 
+        # Set once the deploy path reports a transitional status of its own,
+        # so the generic status at the end of reconciliation does not
+        # overwrite it.
+        self._status_held = False
+
         self._cos_agent = COSAgentProvider(
             self,
             scrape_configs=self._build_scrape_configs,
@@ -268,7 +273,13 @@ class MicroCloudCharm(ops.CharmBase):
                 self.unit.status = ops.BlockedStatus(obs_problem)
                 return
 
-        self._set_status(initialized=microcloud.is_initialized())
+        if not self._status_held:
+            self._set_status(initialized=microcloud.is_initialized())
+
+    def _hold_status(self, status: ops.StatusBase) -> None:
+        """Report a transitional status that reconciliation must not overwrite."""
+        self.unit.status = status
+        self._status_held = True
 
     # ---- Deployment mode ----
 
@@ -316,16 +327,16 @@ class MicroCloudCharm(ops.CharmBase):
             return f"Snap install: {exc}"
 
         if not microcloud.waitready(timeout=60):
-            self.unit.status = ops.WaitingStatus("Waiting for microcloud daemon")
+            self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
 
         if not self._coordinator.all_identities_published():
-            self.unit.status = ops.WaitingStatus("Waiting for all peers to report identity")
+            self._hold_status(ops.WaitingStatus("Waiting for all peers to report identity"))
             return None
 
         passphrase = self._coordinator.ensure_passphrase()
         if len(self._coordinator.all_members()) > 1 and not passphrase:
-            self.unit.status = ops.WaitingStatus("Waiting for session passphrase")
+            self._hold_status(ops.WaitingStatus("Waiting for session passphrase"))
             return None
 
         # Every unit has now cleared all its own prerequisites: signal that
@@ -334,7 +345,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         if self.unit.is_leader():
             if not self._coordinator.all_ready():
-                self.unit.status = ops.WaitingStatus("Waiting for all peers to be ready")
+                self._hold_status(ops.WaitingStatus("Waiting for all peers to be ready"))
                 return None
 
             if not self._coordinator.initiator_address():
@@ -342,28 +353,30 @@ class MicroCloudCharm(ops.CharmBase):
                 # this fast hook and come back later to actually open the
                 # session, once we know a peer has seen it (see docstring).
                 self._coordinator.publish_initiator_address(self._bind_address())
-                self.unit.status = ops.MaintenanceStatus(
-                    "Initiator address published; waiting for a peer to acknowledge"
+                self._hold_status(
+                    ops.MaintenanceStatus(
+                        "Initiator address published; waiting for a peer to acknowledge"
+                    )
                 )
                 return None
 
             if not self._coordinator.any_peer_acked():
-                self.unit.status = ops.WaitingStatus(
-                    "Waiting for a peer to acknowledge initiator address"
+                self._hold_status(
+                    ops.WaitingStatus("Waiting for a peer to acknowledge initiator address")
                 )
                 return None
 
         initiator_address = self._coordinator.initiator_address()
         if not initiator_address:
-            self.unit.status = ops.WaitingStatus("Waiting for leader to select initiator")
+            self._hold_status(ops.WaitingStatus("Waiting for leader to select initiator"))
             return None
 
         if not self.unit.is_leader() and not self._coordinator.has_acked():
             # First time seeing the address: ack it in this fast hook and
             # come back later to actually try joining (see docstring).
             self._coordinator.publish_ack()
-            self.unit.status = ops.MaintenanceStatus(
-                "Acknowledged initiator address; will join shortly"
+            self._hold_status(
+                ops.MaintenanceStatus("Acknowledged initiator address; will join shortly")
             )
             return None
 
@@ -442,7 +455,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         inputs = self._preseed_inputs(initiator_address, passphrase, systems)
 
-        self.unit.status = ops.MaintenanceStatus("Bootstrapping MicroCloud cluster")
+        self._hold_status(ops.MaintenanceStatus("Bootstrapping MicroCloud cluster"))
 
         rendered = render(inputs)
         retries = 10
@@ -478,8 +491,10 @@ class MicroCloudCharm(ops.CharmBase):
                     exc,
                 )
                 if attempt < retries:
-                    self.unit.status = ops.MaintenanceStatus(
-                        f"Bootstrapping MicroCloud cluster (retry {attempt + 1}/{retries})"
+                    self._hold_status(
+                        ops.MaintenanceStatus(
+                            f"Bootstrapping MicroCloud cluster (retry {attempt + 1}/{retries})"
+                        )
                     )
                     time.sleep(retry_delay)
 

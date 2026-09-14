@@ -1370,6 +1370,51 @@ class TestMicroCloudWrappers:
 
 
 # ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+
+class TestHeldStatus:
+    def test_held_status_is_not_overwritten(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._status_held = False
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._cos_related.return_value = False
+        stub._coordinator = MagicMock()
+
+        def deploy(*args):
+            stub._status_held = True
+
+        stub._reconcile_deploy.side_effect = deploy
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=False),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        stub._set_status.assert_not_called()
+
+    def test_status_set_when_nothing_is_held(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._status_held = False
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._cos_related.return_value = False
+        stub._coordinator = MagicMock()
+        stub._reconcile_deploy.return_value = None
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=False),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        stub._set_status.assert_called_once_with(initialized=False)
+
+
+# ---------------------------------------------------------------------------
 # Join sessions
 # ---------------------------------------------------------------------------
 
