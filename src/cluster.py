@@ -212,12 +212,23 @@ class ClusterCoordinator:
             return
         relation.data[self._charm.unit][_KEY_READY] = "true"
 
-    def all_ready(self) -> bool:
-        """Return True once every peer unit (and self) has published ready."""
+    def all_ready(self, pending: list[PeerSystem] | None = None) -> bool:
+        """Return True once every unit that is to be listed has published ready.
+
+        That is every peer unit (and self), or with ``pending`` only the
+        units still waiting to join an existing cluster.
+        """
         relation = self.relation
         if relation is None:
             return False
         units = list(relation.units) + [self._charm.unit]
+        if pending is not None:
+            names = {system.name for system in pending}
+            return all(
+                relation.data.get(unit, {}).get(_KEY_READY) == "true"
+                for unit in units
+                if relation.data.get(unit, {}).get(_KEY_NAME) in names
+            )
         ready_count = sum(
             1 for unit in units if relation.data.get(unit, {}).get(_KEY_READY) == "true"
         )

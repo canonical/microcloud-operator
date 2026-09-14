@@ -20,7 +20,8 @@ install / config-changed / peer-relation-changed
       which each listed joiner starts dialling in, in the background too,
       retrying until the session has opened.
     • Once the session ends, it fires update-status on the leader, which
-      picks up the result and clears it.
+      clears it and opens the next session if any unit is still waiting.
+      Units added to a formed cluster join it the same way.
 
 Observe-only mode (MicroCloud already initialized out-of-band)
 --------------------------------------------------------------
@@ -285,17 +286,35 @@ class MicroCloudCharm(ops.CharmBase):
             ovn_underlay_ip=self._space_bind_address("ovn-underlay"),
             storage_local_path=self._storage_local_path(),
             storage_ceph_paths=self._storage_ceph_paths(),
+            initialized=initialized,
         )
 
-        # A clustered unit just observes, except for the leader while its join
-        # session is published: it stays on the deploy path to pick up the
-        # result and clear it.
-        initiating = self.unit.is_leader() and self._coordinator.session() is not None
+        # A unit that is not yet clustered runs the deploy path, whether that
+        # forms the cluster or joins an existing one.
+        #
+        # A clustered unit normally just observes. The one exception is the
+        # leader while peers are still joining: it is the initiator of that
+        # join and has to open the session. Other clustered units must stay
+        # out of it entirely - running "microcloud preseed" on an already
+        # clustered non-initiator is rejected outright ("MicroCloud is already
+        # initialized and can only be the initiator"), which would leave them
+        # retrying instead of sitting active.
+        try:
+            pending = self._pending_systems(initialized)
+        except microcloud.MicroCloudError as exc:
+            self.unit.status = ops.BlockedStatus(f"Cannot read MicroCloud members: {exc}")
+            return
+
+        # The leader also stays on the deploy path while its join session is
+        # published, to pick up the result and clear it.
+        initiating = self.unit.is_leader() and (
+            bool(pending) or self._coordinator.session() is not None
+        )
 
         if initialized and not initiating:
             problem = self._reconcile_observe_only()
         else:
-            problem = self._reconcile_deploy(initialized)
+            problem = self._reconcile_deploy(initialized, pending)
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -317,7 +336,7 @@ class MicroCloudCharm(ops.CharmBase):
 
     # ---- Deployment mode ----
 
-    def _reconcile_deploy(self, initialized: bool) -> str | None:
+    def _reconcile_deploy(self, initialized: bool, pending: list[PeerSystem]) -> str | None:
         """Install snaps, then form or grow the cluster through a join session.
 
         Juju only propagates a unit's relation-data writes to its peers
@@ -332,10 +351,12 @@ class MicroCloudCharm(ops.CharmBase):
            hook, also in the background, retrying until the session opens.
            A later session replaces an attempt still waiting on this one.
         3. When the session ends, the leader picks up its result from a hook
-           the background process fires and clears the session.
+           the background process fires, clears the session and opens the
+           next one if units are still waiting to join.
 
         ``initialized`` is whether this unit is already clustered, which
-        only holds for the leader while it follows its join session.
+        only holds for the leader when it is growing the cluster.
+        ``pending`` is the systems not yet clustered.
 
         Returns a problem string to block on, or None.
         """
@@ -372,10 +393,12 @@ class MicroCloudCharm(ops.CharmBase):
         self._coordinator.publish_ready()
 
         if self.unit.is_leader():
-            return self._lead_session(initialized, passphrase or "")
+            return self._lead_session(initialized, pending, passphrase or "")
         return self._join_session(passphrase or "")
 
-    def _lead_session(self, initialized: bool, passphrase: str) -> str | None:
+    def _lead_session(
+        self, initialized: bool, pending: list[PeerSystem], passphrase: str
+    ) -> str | None:
         """Leader side: follow the published join session, or open the next one."""
         address = self._bind_address()
         current = self._coordinator.session()
@@ -399,7 +422,9 @@ class MicroCloudCharm(ops.CharmBase):
             # still waiting on that hook.
             outcome = session.result(current.id)
             if outcome is None and self._worker_running(current.id):
-                self._hold_status(ops.MaintenanceStatus(_session_message(current)))
+                self._hold_status(
+                    ops.MaintenanceStatus(_session_message(current, microcloud.hostname()))
+                )
                 return None
 
             self._coordinator.publish_session(None)
@@ -416,14 +441,40 @@ class MicroCloudCharm(ops.CharmBase):
             else:
                 self._stored.session_failures = 0
 
-        if initialized:
+        if current is not None:
+            # The membership read at the start of this hook can predate the
+            # session that just ended: its result may have landed while this
+            # hook was already running. Read it again, or the next session
+            # would list units that have just joined, and that never dial in.
+            initialized = microcloud.is_initialized()
+            try:
+                pending = self._pending_systems(initialized)
+            except microcloud.MicroCloudError as exc:
+                return f"Cannot read MicroCloud members: {exc}"
+
+        if not pending:
             return None
 
-        if not self._coordinator.all_ready():
+        # Units already in the cluster have nothing left to get ready for,
+        # and in a cluster formed outside Juju they never report ready.
+        if not self._coordinator.all_ready(pending if initialized else None):
             self._hold_status(ops.WaitingStatus("Waiting for all peers to be ready"))
             return None
 
-        listed = self._coordinator.all_systems()
+        # Only a clustered unit can add others to the cluster, so an
+        # unclustered leader must not take over from a cluster that already
+        # exists: it would bootstrap a second one instead.
+        if not initialized and self._coordinator.any_initialized():
+            return (
+                f"Leader {microcloud.hostname()} is not a MicroCloud member "
+                "but other units are; cannot initiate"
+            )
+
+        # MicroCloud infers whether to form a cluster or add to one from
+        # whether the initiator is itself listed under "systems". Listing
+        # every unit forms a cluster; listing only the units not yet
+        # clustered adds them to the one the initiator belongs to.
+        listed = pending if initialized else self._coordinator.all_systems()
         timeout = int(self.config.get("session-timeout", 300))
         opened = JoinSession(
             id=uuid.uuid4().hex,
@@ -439,11 +490,25 @@ class MicroCloudCharm(ops.CharmBase):
             return str(exc)
 
         self._coordinator.publish_session(opened)
-        message = _session_message(opened)
+        message = _session_message(opened, microcloud.hostname())
         if failure:
             message = f"{message}; retrying after: {failure}"
         self._hold_status(ops.MaintenanceStatus(message))
         return None
+
+    def _pending_systems(self, initialized: bool) -> list[PeerSystem]:
+        """Return the systems not yet clustered.
+
+        ``initialized`` is whether this unit is clustered. The published flags
+        lag behind, so a clustered leader reads the membership back from
+        MicroCloud instead.
+
+        Raises microcloud.MicroCloudError if the membership cannot be read.
+        """
+        if initialized and self.unit.is_leader():
+            members = {member.name for member in microcloud.list_members()}
+            return self._coordinator.pending_systems(members)
+        return self._coordinator.pending_systems()
 
     def _join_session(self, passphrase: str) -> str | None:
         """Joiner side: dial in to the published join session if listed in it.
@@ -985,8 +1050,11 @@ def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
     ]
 
 
-def _session_message(opened: JoinSession) -> str:
+def _session_message(opened: JoinSession, initiator: str) -> str:
     """Describe a join session in progress for the leader's status."""
+    # A session that does not list its initiator adds to an existing cluster.
+    if initiator not in opened.systems:
+        return f"Joining {len(opened.systems)} unit(s) to the MicroCloud cluster"
     return f"Forming the MicroCloud cluster with {len(opened.systems)} units"
 
 
