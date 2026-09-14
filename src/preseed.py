@@ -45,6 +45,7 @@ class PreseedInputs:
     session_passphrase: str
     systems: list[SystemEntry]
     session_timeout: int = 3600
+    lookup_timeout: int = 0
 
     # Ceph
     with_ceph: bool = True
@@ -95,6 +96,8 @@ def build_preseed(inputs: PreseedInputs) -> dict:
         "session_timeout": inputs.session_timeout,
         "systems": systems,
     }
+    if inputs.lookup_timeout:
+        doc["lookup_timeout"] = inputs.lookup_timeout
 
     # ---- Ceph ----
     if inputs.with_ceph:

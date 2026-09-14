@@ -748,6 +748,12 @@ class TestPreseed:
         doc = build_preseed(self._inputs())
         assert "storage" not in doc["systems"][0]
 
+    def test_lookup_timeout_included_when_set(self):
+        from preseed import build_preseed
+
+        assert "lookup_timeout" not in build_preseed(self._inputs())
+        assert build_preseed(self._inputs(lookup_timeout=300))["lookup_timeout"] == 300
+
     def test_render_produces_yaml(self):
         import yaml
 
