@@ -34,7 +34,8 @@ charmcraft pack
 ## CI
 
 `.github/workflows/pr.yaml` runs on every pull request — except those touching only Markdown,
-`LICENSE`, `.gitignore` or `.jujuignore` — and calls the reusable
+`LICENSE`, `.gitignore` or `.jujuignore`. Pushes to `main` and `dev` are tested by the Release
+workflow instead (see [Publishing](#publishing)). Both call the reusable
 `.github/workflows/build-and-test.yaml`, which:
 
 1. **static** — `tox -e lint` and `tox -e unit`;
@@ -47,18 +48,26 @@ declares.
 
 ## Publishing
 
-Publishing is manual. Run the **Release** workflow (`.github/workflows/release.yaml`) from the
-Actions tab against the branch you want to publish: it builds and tests that branch, then uploads
-to Charmhub. A `<track>-rev<N>` git tag is pushed for each revision.
+Every push to `main` or `dev` runs the **Release** workflow (`.github/workflows/release.yaml`):
+it builds and tests the pushed commit with the same `build-and-test.yaml` pull requests use, then
+uploads the packed charms to Charmhub:
 
-The `track` input selects the Charmhub track and defaults to `3`, mirroring the MicroCloud
-snap's major version tracks.
+| Branch | Channel       |
+| ------ | ------------- |
+| `main` | `3/edge`      |
+| `dev`  | `3/edge/eken` |
+
+The track, `3`, mirrors the MicroCloud snap's major version track. Each `main` revision also gets
+a `3-rev<N>` GitHub release and tag; `dev` revisions do not.
+
+`3/edge/eken` is a Charmhub branch. Branches are temporary and close if nothing is released to
+them for a while, so a quiet `dev` can leave it empty.
 
 Nothing above `edge` is published automatically. Moving a revision up a risk level is a separate
 **Promote** workflow run (`.github/workflows/promote.yaml`), choosing the risk to promote from and
 to; it refuses anything that is not a step up.
 
-Both workflows need a `CHARMHUB_TOKEN` repository secret:
+Both need a `CHARMHUB_TOKEN` repository secret:
 
 ```shell
 charmcraft login --export=token.txt --charm=microcloud \
@@ -67,5 +76,5 @@ charmcraft login --export=token.txt --charm=microcloud \
   --permission=package-view-revisions --ttl=<seconds>
 ```
 
-GitHub only offers a `workflow_dispatch` workflow once it exists on the default branch, so neither
-appears in the Actions tab until they have landed on `main`.
+GitHub only offers a `workflow_dispatch` workflow once it exists on the default branch, so Promote
+cannot be run until it has landed on `main`.

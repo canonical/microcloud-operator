@@ -7,15 +7,6 @@ on:
       - LICENSE
       - .gitignore
       - .jujuignore
-  push:
-    branches:
-      - main
-      - dev
-    paths-ignore:
-      - "**.md"
-      - LICENSE
-      - .gitignore
-      - .jujuignore
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
