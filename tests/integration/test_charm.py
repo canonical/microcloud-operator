@@ -24,6 +24,8 @@ from tests.integration.helpers import (
     assert_no_session_state,
     cluster_members,
     deploy_microcloud,
+    lxd_members,
+    machine_zones,
     member_addresses,
     run_action,
     snap_installed,
@@ -134,3 +136,48 @@ def test_status_action_on_every_unit(juju: jubilant.Juju, num_units: int) -> Non
 def test_no_session_state_left_behind(juju: jubilant.Juju) -> None:
     """Forming the cluster leaves no join session, worker or passphrase behind."""
     assert_no_session_state(juju)
+
+
+def test_failure_domains_match_zones(juju: jubilant.Juju) -> None:
+    """Every member's LXD failure domain is its machine's zone, unchanged."""
+    zones = machine_zones(juju)
+    assert all(zones.values()), f"the substrate reports no zone for some machines: {zones}"
+
+    members = lxd_members(juju)
+    assert {name: member["failure_domain"] for name, member in members.items()} == zones
+
+
+def test_failure_domain_is_restored(juju: jubilant.Juju) -> None:
+    """A failure domain changed behind the charm's back is set back on the next hook."""
+    unit = unit_names(juju)[0]
+    hostname = unit_hostnames(juju)[unit]
+    zone = machine_zones(juju)[hostname]
+
+    ssh(juju, unit, f"sudo lxc cluster failure-domain set {hostname} not-{zone}")
+    assert lxd_members(juju)[hostname]["failure_domain"] == f"not-{zone}"
+
+    charm_dir = f"/var/lib/juju/agents/unit-{unit.replace('/', '-')}/charm"
+    juju.cli(
+        "exec",
+        "--unit",
+        unit,
+        "--",
+        f"JUJU_DISPATCH_PATH=hooks/update-status {charm_dir}/dispatch",
+    )
+
+    assert lxd_members(juju)[hostname]["failure_domain"] == zone
+
+
+def test_status_action_renders_the_member_table(juju: jubilant.Juju, num_units: int) -> None:
+    """The status action shows each member's roles, failure domain and architecture."""
+    results = run_action(juju, "status")
+    header, *rows = results["members"].splitlines()
+    assert header.split() == ["NAME", "ROLES", "FAILURE", "DOMAIN", "ARCHITECTURE"]
+    assert len(rows) == num_units
+
+    members = lxd_members(juju)
+    for row in rows:
+        name, roles, failure_domain, architecture = row.split()
+        assert roles == (",".join(members[name]["roles"]) or "-")
+        assert failure_domain == members[name]["failure_domain"]
+        assert architecture == members[name]["architecture"]
