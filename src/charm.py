@@ -63,6 +63,7 @@ import yaml
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
+import lxd_cluster
 import microcloud
 import session
 import snap
@@ -316,6 +317,21 @@ class MicroCloudCharm(ops.CharmBase):
             problem = self._reconcile_observe_only()
         else:
             problem = self._reconcile_deploy(initialized, pending)
+
+        # Only a unit that was clustered when this hook started, and only once
+        # its LXD has joined too. MicroCloud reports a joining unit as clustered
+        # as soon as it has joined MicroCloud itself, before the initiator adds
+        # its LXD. The leader clearing its join session wakes it up again.
+        if not problem and initialized:
+            try:
+                lxd_clustered = lxd_cluster.is_clustered()
+            except lxd_cluster.LXDClusterError as exc:
+                problem = f"Cannot read the LXD cluster: {exc}"
+            else:
+                if lxd_clustered:
+                    problem = self._reconcile_failure_domain()
+                else:
+                    self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -672,6 +688,34 @@ class MicroCloudCharm(ops.CharmBase):
     def _zone_missing(self) -> bool:
         """Return True if this unit has no zone although one is required."""
         return not self._zone() and bool(self.config.get("require-zone", True))
+
+    def _reconcile_failure_domain(self) -> str | None:
+        """Set this unit's LXD failure domain to its zone. Returns problem or None.
+
+        The name is carried through unchanged, so the zone an operator reads
+        in the substrate is the failure domain they read in LXD. Each unit
+        sets its own member, so no coordination is needed across units or
+        applications.
+
+        A clustered unit without a zone keeps whatever failure domain it has:
+        units only join with a zone, so the substrate has opted out of zones.
+        """
+        hostname = microcloud.hostname()
+        zone = self._zone()
+        if not zone:
+            return None
+
+        try:
+            member = next((m for m in lxd_cluster.members() if m.name == hostname), None)
+            if member is None:
+                return f"{hostname} is not an LXD cluster member"
+            if member.failure_domain == zone:
+                return None
+            logger.info("Setting the failure domain of %s to %s", hostname, zone)
+            lxd_cluster.set_failure_domain(hostname, zone)
+        except lxd_cluster.LXDClusterError as exc:
+            return f"Cannot set the failure domain of {hostname} to {zone!r}: {exc}"
+        return None
 
     # ---- Observe-only mode ----
 
