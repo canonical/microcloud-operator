@@ -51,6 +51,7 @@ sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from ceph_mgr import CephMgrPrometheus
+from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import Observability
 from ovn_exporter import OVNExporter
@@ -1652,6 +1653,8 @@ class TestGrowCharm:
         stub._cos_related.return_value = False
         stub._reconcile_observe_only.return_value = None
         stub._reconcile_deploy.return_value = None
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.reconcile.return_value = None
         stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
             stub, initialized
         )
@@ -1659,6 +1662,7 @@ class TestGrowCharm:
         with (
             patch("charm.microcloud.hostname", return_value="node0"),
             patch("charm.microcloud.is_initialized", return_value=initialized),
+            patch("charm.lxd_cluster.is_clustered", return_value=True),
             patch(
                 "charm.microcloud.list_members",
                 return_value=[Member(name, "") for name in members],
@@ -1779,3 +1783,197 @@ class TestSessionWorkerHelpers:
             "abc", "doc", "microcloud/0", Path("/charm"), retry_until=5.0, replacing=42
         )
         assert (stub._stored.worker_pid, stub._stored.worker_session) == (99, "abc")
+
+
+# ---------------------------------------------------------------------------
+# Failure domains
+# ---------------------------------------------------------------------------
+
+
+def _member(name, domain="zone-1", roles=(), status="Online", arch="x86_64"):
+    from lxd_cluster import Member
+
+    return Member(
+        name=name, status=status, failure_domain=domain, architecture=arch, roles=list(roles)
+    )
+
+
+class TestLxdCluster:
+    """LXD cluster members and their failure domains."""
+
+    def test_members_parses_the_cluster_member_list(self):
+        import lxd_cluster
+
+        payload = json.dumps(
+            [
+                {
+                    "server_name": "node1",
+                    "status": "Online",
+                    "failure_domain": "zone-1",
+                    "architecture": "x86_64",
+                    "roles": ["database-leader", "database-voter"],
+                }
+            ]
+        )
+        with patch("lxd_cluster.subprocess.run", return_value=MagicMock(stdout=payload)) as run:
+            [member] = lxd_cluster.members()
+
+        assert run.call_args.args[0] == [
+            "lxc",
+            "query",
+            "-X",
+            "GET",
+            "/1.0/cluster/members?recursion=1",
+        ]
+        assert member.name == "node1"
+
+    @pytest.mark.parametrize(
+        ("payload", "clustered"), [({"enabled": True}, True), ({"enabled": False}, False)]
+    )
+    def test_is_clustered_reads_the_cluster_state(self, payload, clustered):
+        import lxd_cluster
+
+        with patch(
+            "lxd_cluster.subprocess.run", return_value=MagicMock(stdout=json.dumps(payload))
+        ) as run:
+            assert lxd_cluster.is_clustered() is clustered
+
+        assert run.call_args.args[0] == ["lxc", "query", "-X", "GET", "/1.0/cluster"]
+
+    def test_set_failure_domain_writes_back_the_whole_member(self):
+        """LXD empties any writable field left out, and refuses a member without groups."""
+        import lxd_cluster
+
+        member = {
+            "server_name": "node1",
+            "config": {"scheduler.instance": "all"},
+            "description": "rack 4",
+            "groups": ["default", "gpu"],
+            "roles": ["database-voter", "database-leader", "control-plane"],
+            "failure_domain": "default",
+            "status": "Online",
+        }
+        with patch(
+            "lxd_cluster.subprocess.run",
+            side_effect=[MagicMock(stdout=json.dumps(member)), MagicMock(stdout="")],
+        ) as run:
+            lxd_cluster.set_failure_domain("node1", "zone-2")
+
+        put = run.call_args_list[1].args[0]
+        assert put[:4] == ["lxc", "query", "-X", "PUT"]
+        assert put[-1] == "/1.0/cluster/members/node1"
+        assert json.loads(put[5]) == {
+            "config": {"scheduler.instance": "all"},
+            "description": "rack 4",
+            "groups": ["default", "gpu"],
+            "roles": ["control-plane"],
+            "failure_domain": "zone-2",
+        }
+
+    def test_set_failure_domain_keeps_the_legacy_database_role(self):
+        """Older LXD refuses a PUT that drops or adds "database", so it is written back as read."""
+        import lxd_cluster
+
+        member = {"groups": ["default"], "roles": ["database", "database-standby"]}
+        with patch(
+            "lxd_cluster.subprocess.run",
+            side_effect=[MagicMock(stdout=json.dumps(member)), MagicMock(stdout="")],
+        ) as run:
+            lxd_cluster.set_failure_domain("node1", "zone-2")
+
+        assert json.loads(run.call_args_list[1].args[0][5])["roles"] == ["database"]
+
+    def test_failed_query_raises(self):
+        import subprocess
+
+        import lxd_cluster
+
+        with (
+            patch(
+                "lxd_cluster.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, "lxc", stderr="Error: not clustered"),
+            ),
+            pytest.raises(lxd_cluster.LXDClusterError, match="not clustered"),
+        ):
+            lxd_cluster.members()
+
+
+class TestFailureDomains:
+    """How the charm uses this unit's zone and LXD failure domain."""
+
+    def _stub(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.reconcile.return_value = None
+        return stub
+
+    def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
+        from charm import MicroCloudCharm
+
+        stub._status_held = False
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._coordinator = MagicMock()
+        stub._reconcile_deploy.return_value = None
+        stub._reconcile_observe_only.return_value = None
+        stub._cos_related.return_value = False
+
+        def hold(status):
+            stub.unit.status = status
+            stub._status_held = True
+
+        stub._hold_status.side_effect = hold
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", side_effect=[initialized, True]),
+            patch("charm.lxd_cluster.is_clustered", return_value=lxd_clustered),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+    @pytest.mark.parametrize("initialized", [True, False])
+    def test_only_a_unit_clustered_when_the_hook_starts_sets_its_failure_domain(self, initialized):
+        """A join finishing in the background may not have brought LXD in yet."""
+        stub = self._stub()
+
+        self._reconcile(stub, initialized=initialized)
+
+        assert stub._failure_domains.reconcile.called is initialized
+
+    def test_waits_for_lxd_to_join_before_setting_the_failure_domain(self):
+        """MicroCloud reports a joiner clustered before the initiator has added its LXD."""
+        import ops
+
+        stub = self._stub()
+
+        self._reconcile(stub, lxd_clustered=False)
+
+        stub._failure_domains.reconcile.assert_not_called()
+        assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
+        stub._set_status.assert_not_called()
+
+    def test_unreadable_lxd_cluster_blocks(self):
+        import ops
+
+        import lxd_cluster
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub.unit.is_leader.return_value = False
+        stub._status_held = False
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._coordinator = MagicMock()
+        stub._reconcile_observe_only.return_value = None
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch(
+                "charm.lxd_cluster.is_clustered", side_effect=lxd_cluster.LXDClusterError("boom")
+            ),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
+        stub._failure_domains.reconcile.assert_not_called()

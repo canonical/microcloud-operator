@@ -59,10 +59,12 @@ import ops
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
+import lxd_cluster
 import microcloud
 import session
 import snap
 from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_membership
+from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
 from preseed import PreseedInputs, SystemEntry, render
@@ -99,6 +101,7 @@ class MicroCloudCharm(ops.CharmBase):
         self._stored.set_default(session_failures=0, worker_pid=0, worker_session="")
 
         self._coordinator = ClusterCoordinator(self)
+        self._failure_domains = FailureDomains()
         self._network = UnitNetwork(self.model, self.config)
         self._observability = Observability(self.config, self.app.name)
 
@@ -266,6 +269,21 @@ class MicroCloudCharm(ops.CharmBase):
             problem = self._reconcile_observe_only()
         else:
             problem = self._reconcile_deploy(initialized, pending)
+
+        # Only a unit that was clustered when this hook started, and only once
+        # its LXD has joined too. MicroCloud reports a joining unit as clustered
+        # as soon as it has joined MicroCloud itself, before the initiator adds
+        # its LXD. The leader clearing its join session wakes it up again.
+        if not problem and initialized:
+            try:
+                lxd_clustered = lxd_cluster.is_clustered()
+            except lxd_cluster.LXDClusterError as exc:
+                problem = f"Cannot read the LXD cluster: {exc}"
+            else:
+                if lxd_clustered:
+                    problem = self._failure_domains.reconcile()
+                else:
+                    self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
