@@ -89,3 +89,19 @@ def set_failure_domain(name: str, failure_domain: str) -> None:
     ]
     writable["failure_domain"] = failure_domain
     _query(path, "PUT", writable)
+
+
+def render_table(cluster: list[Member]) -> str:
+    """Render members as the table the status action prints."""
+    rows = [("NAME", "ROLES", "FAILURE DOMAIN", "ARCHITECTURE")]
+    rows += [
+        (member.name, ",".join(member.roles) or "-", member.failure_domain, member.architecture)
+        for member in sorted(cluster, key=lambda member: member.name)
+    ]
+    widths = [max(len(row[column]) for row in rows) for column in range(3)]
+    return "\n".join(
+        "  ".join(cell.ljust(width) for cell, width in zip(row[:3], widths, strict=True))
+        + "  "
+        + row[3]
+        for row in rows
+    )

@@ -688,12 +688,16 @@ class MicroCloudCharm(ops.CharmBase):
         }
         if initialized:
             try:
+                result["members"] = lxd_cluster.render_table(lxd_cluster.members())
+            except lxd_cluster.LXDClusterError as exc:
+                result["members-error"] = str(exc)
+            try:
                 members = microcloud.list_members()
-                result["members"] = json.dumps(
+                result["microcloud-members"] = json.dumps(
                     [{"name": m.name, "address": m.address, "status": m.status} for m in members]
                 )
             except microcloud.MicroCloudError as exc:
-                result["members-error"] = str(exc)
+                result["microcloud-members-error"] = str(exc)
         event.set_results(result)
 
     def _on_dump_metrics_config(self, event: ops.ActionEvent) -> None:

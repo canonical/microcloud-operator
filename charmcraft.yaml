@@ -302,8 +302,9 @@ config:
 actions:
   status:
     description: >
-      Print the detected charm mode and the current MicroCloud cluster
-      membership as seen by this unit.
+      Print the detected charm mode and the cluster members as seen by this
+      unit: a table of their names, database roles, failure domains and
+      architectures, and the MicroCloud membership.
 
   dump-metrics-config:
     description: >
