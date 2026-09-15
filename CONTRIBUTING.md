@@ -38,10 +38,15 @@ status actions on every unit. A separate model tests invalid configuration befor
 correction through `juju config`, and repeated configuration failure/recovery after bootstrap
 without changing cluster membership.
 
-These tests cover the current single-application charm. Fleet growth, bounded join batches,
-cross-application roles, and interrupted-join recovery need implementation before they can
-become passing acceptance tests. MicroCeph and MicroOVN health require a separate VM-backed
-suite with disks and suitable networking.
+A third model grows a two unit cluster by adding two units at once with `juju add-unit`.
+MicroCloud can only add systems to a cluster that runs MicroCeph, so that model enables MicroCeph
+without Ceph disks, which still fits in containers. Every model also checks that no join session,
+worker or passphrase is left behind once the cluster has converged.
+
+These tests cover the current single-application charm. Bounded join batches, cross-application
+roles, and interrupted-join recovery need implementation before they can become passing
+acceptance tests. MicroCeph storage and MicroOVN health require a separate VM-backed suite with
+disks and suitable networking.
 
 It needs a bootstrapped Juju controller on a LXD cloud and a charm built with `charmcraft pack`.
 [`concierge`](https://github.com/canonical/concierge) provisions both from the `concierge.yaml` in

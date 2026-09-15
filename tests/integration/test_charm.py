@@ -21,6 +21,7 @@ import pytest
 from tests.integration.helpers import (
     MICROCLOUD_CHARM,
     assert_membership,
+    assert_no_session_state,
     cluster_members,
     deploy_microcloud,
     member_addresses,
@@ -128,3 +129,8 @@ def test_status_action_on_every_unit(juju: jubilant.Juju, num_units: int) -> Non
             assert all(member["status"].upper() == "ONLINE" for member in members), members
     assert_membership(juju, num_units)
     assert member_addresses(juju) == before
+
+
+def test_no_session_state_left_behind(juju: jubilant.Juju) -> None:
+    """Forming the cluster leaves no join session, worker or passphrase behind."""
+    assert_no_session_state(juju)
