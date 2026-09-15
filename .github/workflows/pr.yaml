@@ -1,0 +1,30 @@
+name: PR
+
+on:
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - LICENSE
+      - .gitignore
+      - .jujuignore
+  push:
+    branches:
+      - main
+      - dev
+    paths-ignore:
+      - "**.md"
+      - LICENSE
+      - .gitignore
+      - .jujuignore
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  build-and-test:
+    uses: $/.github/workflows/build-and-test.yaml
+    permissions:
+      contents: read

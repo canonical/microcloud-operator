@@ -1,16 +1,135 @@
+name: microcloud
+title: MicroCloud
 type: charm
-bases:
-  - name: ubuntu
-    channel: "22.04"
+subordinate: false
+
+summary: Operate observability for an externally deployed MicroCloud cluster.
+
+description: |
+  The MicroCloud charm does NOT deploy or bootstrap a MicroCloud cluster.
+  MicroCloud (LXD, MicroCeph, MicroOVN) must already be deployed
+  out-of-band, with each MicroCloud member added to Juju via
+  "juju add-machine" and this charm then deployed across all of those
+  machines.
+
+  On each unit the charm requires MicroCloud to already be initialized: it
+  validates that this unit's own hostname is a MicroCloud member and blocks
+  if it is not. The charm never installs the MicroCloud component snaps but
+  it may install the ovn-exporter snap.
+
+  Observability (optional)
+  ------------------------
+  Metrics integration is only configured when a related
+  opentelemetry-collector subordinate is attached via the cos-agent relation.
+  When related, the charm ensures Prometheus-compatible endpoints exist for
+  LXD, MicroCeph, and MicroOVN and advertises them. MicroCeph's own logs are
+  also forwarded over this same relation (via its "ceph-logs" snap slot).
+  When the relation is removed, the metrics setup is torn down. A base
+  MicroCloud deployment performs no metrics setup.
+
+  Log forwarding for LXD is configured separately, over the "logging"
+  relation (loki_push_api interface). When related to a Loki-compatible
+  endpoint (e.g. opentelemetry-collector's receive-loki-logs endpoint), the
+  charm configures LXD's native Loki client (loki.api.url) to stream its
+  logs there directly. Since that endpoint is always provided by a
+  subordinate co-located on this same machine, the host is always forced to
+  127.0.0.1 (only the published scheme/port/path are kept) rather than
+  trusting the hostname/address published over the relation. When the
+  relation is removed, LXD's Loki streaming is disabled again.
+
+links:
+  source: https://github.com/canonical/charm-microcloud
+  issues: https://github.com/canonical/charm-microcloud/issues
+  documentation: https://canonical.com/microcloud/docs/latest/
+
+assumes:
+  - juju >= 3.6
+
+platforms:
+  ubuntu@24.04:amd64:
+  ubuntu@24.04:arm64:
+  ubuntu@26.04:amd64:
+  ubuntu@26.04:arm64:
 
 parts:
   charm:
+    source: .
+    plugin: uv
     build-packages:
-      - ca-certificates
-      - cargo
       - git
-      - libffi-dev
-      - libssl-dev
-      - pkg-config
-      - python3-dev
-      - rustc
+      - python3
+    build-snaps:
+      - astral-uv
+    override-build: |
+      # Fetch upstream dashboards before the uv plugin stages the charm files.
+      python3 tools/fetch-dashboards.py
+      craftctl default
+
+provides:
+  cos-agent:
+    interface: cos_agent
+    limit: 1
+
+requires:
+  logging:
+    interface: loki_push_api
+    limit: 1
+    optional: true
+
+config:
+  options:
+    # ------------------------------------------------------------------
+    # Observability options (used only when cos-agent is related)
+    # ------------------------------------------------------------------
+    scrape-interval:
+      type: string
+      default: "30s"
+      description: >
+        Prometheus-style scrape interval forwarded to the collector for all
+        scrape jobs (e.g. "30s", "1m").
+
+    ceph-mgr-prometheus-port:
+      type: int
+      default: 9283
+      description: >
+        Port on which the Ceph mgr Prometheus module listens on loopback.
+
+    ceph-rbd-stats-pools:
+      type: string
+      default: "lxd_remote"
+      description: >
+        Comma-separated list of RBD pools to collect per-image IO statistics
+        for (mgr/prometheus/rbd_stats_pools). Empty disables
+        per-image RBD stats, required by the bundled rbd-details and
+        rbd-overview dashboards.
+
+    ceph-enable-perf-metrics:
+      type: boolean
+      default: true
+      description: >
+        Include Ceph performance counters in the Prometheus mgr module
+        output (mgr/prometheus/exclude_perf_counters, inverted).
+
+    ovn-exporter-channel:
+      type: string
+      default: "latest/edge"
+      description: >
+        Snap Store channel for the ovn-exporter snap (observability only).
+
+    lxd-metrics-listen-port:
+      type: int
+      default: 8444
+      description: >
+        Port on which LXD's metrics listener binds on
+        loopback.
+
+actions:
+  status:
+    description: >
+      Print the current MicroCloud cluster membership and whether this
+      unit's own hostname is a MicroCloud member, as seen by this unit.
+
+  dump-metrics-config:
+    description: >
+      Print the cos-agent scrape configs this unit is advertising. Useful for
+      debugging observability integration.

@@ -1,9 +1,14 @@
 venv/
 build/
 *.charm
+.vscode/
 .tox/
-.coverage
+
 __pycache__/
 *.py[cod]
-.idea
-.vscode/
+
+# Dashboard subdirectories and their JSON files are created at charmcraft pack
+# time by tools/fetch-dashboards.py — do not commit them.
+src/dashboards/lxd/
+src/dashboards/microceph/
+src/dashboards/microovn/

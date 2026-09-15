@@ -1,659 +1,490 @@
-#!/usr/bin/env python3
+"""Main charm module for the microcloud charm.
 
-"""MicroCloud charm."""
+This charm does NOT deploy or bootstrap MicroCloud. MicroCloud (LXD,
+MicroCeph, MicroOVN) must already be deployed out-of-band, with each
+MicroCloud member added to Juju via "juju add-machine".
+
+Consistency check (every hook)
+-------------------------------
+    • MicroCloud must already be initialized on this node
+    • Each unit independently verifies that its own hostname is a
+      MicroCloud member (there is no peer relation, so a unit cannot know
+      about its siblings).
+
+Observability
+------------------------
+cos-agent-relation-joined / changed
+    • Ensure metrics endpoints exist (LXD metrics config, Ceph mgr module,
+      ovn-exporter snap) and publish scrape jobs + dashboards. MicroCeph's
+      own logs are forwarded over this same relation via its "ceph-logs"
+      snap slot.
+
+cos-agent-relation-broken
+    • Tear the metrics setup back down.
+
+logging-relation-joined / changed
+    • Point LXD's native Loki client (loki.api.url) at the related
+      Loki-compatible endpoint (e.g. opentelemetry-collector's
+      receive-loki-logs) so LXD streams its own logs there directly.
+      The host is always forced to 127.0.0.1 since that endpoint is
+      provided by a subordinate co-located on this same machine.
+
+logging-relation-broken
+    • Disable LXD's Loki streaming again.
+"""
 
 import json
 import logging
-import os
-import shutil
-import subprocess
-import tarfile
-import tempfile
-import time
-from typing import Dict, List, Union
+import re
+from typing import Any
 
-from charms.operator_libs_linux.v2.snap import SnapCache, SnapError, SnapState
-from charms.operator_libs_linux.v2.snap import install_local as snap_install_local
-from ops.charm import (
-    CharmBase,
-    ConfigChangedEvent,
-    InstallEvent,
-    RelationCreatedEvent,
-    RelationJoinedEvent,
-    StartEvent,
-    StopEvent,
-    UpdateStatusEvent,
+import ops
+from charms.grafana_agent.v0.cos_agent import COSAgentProvider
+from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
+
+import microcloud
+import snap
+from ceph import CephMgrError, CephMgrPrometheus
+from consistency import validate_membership
+from constants import CEPH_METRICS_PORT, LOCALHOST_ADDR, LXD_METRICS_PORT, OVN_METRICS_PORT
+from lxd import (
+    LXDConfigError,
+    LXDManager,
 )
-from ops.framework import StoredState
-from ops.main import main
-from ops.model import (
-    ActiveStatus,
-    BlockedStatus,
-    MaintenanceStatus,
-    ModelError,
-    WaitingStatus,
-)
+from ovn import OVNExporter, OVNExporterError
 
 logger = logging.getLogger(__name__)
 
+# Dashboard JSON directories — one per service.
+_DASHBOARD_DIRS = [
+    "./src/dashboards/lxd",
+    "./src/dashboards/microceph",
+    "./src/dashboards/microovn",
+]
+_ALERT_RULES_DIR = "./src/prometheus_alert_rules"
 
-class MaasMicroCloudCharm(CharmBase):
-    """MicroCloud charm class."""
 
-    _stored = StoredState()
+class MicroCloudCharm(ops.CharmBase):
+    """Validates and operates observability for a MicroCloud cluster deployed out-of-band."""
 
-    def __init__(self, *args):
-        """Initialize charm's variable."""
+    def __init__(self, *args: Any) -> None:
         super().__init__(*args)
 
-        # Initialize the persistent storage if needed
-        self._stored.set_default(
-            config={},
-            microcloud_binary_path="",
-            microcloud_snap_path="",
+        # Lazy-initialised observability helpers.
+        self._ceph: CephMgrPrometheus | None = None
+        self._ovn: OVNExporter | None = None
+        self._lxd: LXDManager | None = None
+
+        self._loki_consumer = LokiPushApiConsumer(
+            self, relation_name="logging", refresh_event=self.on.update_status
+        )
+        self.framework.observe(
+            self._loki_consumer.on.loki_push_api_endpoint_joined,
+            self._on_loki_push_api_endpoint_joined,
         )
 
-        # Main event handlers
-        self.framework.observe(self.on.install, self._on_charm_install)
-        self.framework.observe(self.on.config_changed, self._on_charm_config_changed)
-        self.framework.observe(self.on.start, self._on_charm_start)
+        self.framework.observe(self.on.install, self._on_install)
+        self.framework.observe(self.on.upgrade_charm, self._on_install)
+        self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.update_status, self._on_update_status)
-        self.framework.observe(self.on.stop, self._on_charm_stop)
+        self.framework.observe(self.on.stop, self._on_stop)
+        self.framework.observe(self.on.remove, self._on_remove)
 
-        # Relation event handlers
-        self.framework.observe(self.on.cluster_relation_created, self._on_cluster_relation_created)
-        self.framework.observe(self.on.cluster_relation_joined, self._on_cluster_relation_joined)
+        self.framework.observe(
+            self.on.cos_agent_relation_joined, self._on_cos_agent_relation_joined
+        )
+        self.framework.observe(
+            self.on.cos_agent_relation_changed, self._on_cos_agent_relation_joined
+        )
+        self.framework.observe(
+            self.on.cos_agent_relation_broken, self._on_cos_agent_relation_broken
+        )
 
-    @property
-    def peers(self):
-        """Fetch the cluster relation."""
-        return self.model.get_relation("cluster")
+        # Instantiated after the observers above so that ops (which dispatches
+        # observers in registration order) runs our reconciliation handlers
+        # first, ensuring self._ceph/self._ovn/self._lxd are populated before
+        # COSAgentProvider._on_refresh reads them via _build_scrape_configs.
+        self._cos_agent = COSAgentProvider(
+            self,
+            scrape_configs=self._build_scrape_configs,
+            dashboard_dirs=_DASHBOARD_DIRS,
+            metrics_rules_dir=_ALERT_RULES_DIR,
+            log_slots=self._log_slots(),
+            refresh_events=[
+                self.on.config_changed,
+                self.on.update_status,
+            ],
+        )
 
-    def get_peer_data_str(self, bag, key: str) -> str:
-        """Retrieve a str from the peer data bag."""
-        if not self.peers or not bag or not key:
-            return ""
+        self.framework.observe(
+            self.on.logging_relation_departed, self._on_loki_push_api_endpoint_departed
+        )
+        self.framework.observe(
+            self.on.logging_relation_broken, self._on_loki_push_api_endpoint_departed
+        )
 
-        value = self.peers.data[bag].get(key, "")
-        if isinstance(value, str):
-            return value
+        # Actions
+        self.framework.observe(self.on.status_action, self._on_status_action)
+        self.framework.observe(self.on.dump_metrics_config_action, self._on_dump_metrics_config)
 
-        logger.error(f"Invalid data pulled out from {bag.name}.get('{key}')")
-        return ""
+    def _make_helpers(self) -> None:
+        self._ceph = CephMgrPrometheus(
+            port=int(self.config.get("ceph-mgr-prometheus-port", CEPH_METRICS_PORT)),
+            rbd_stats_pools=self.config.get("ceph-rbd-stats-pools", "lxd_remote"),
+            enable_perf_metrics=self.config.get("ceph-enable-perf-metrics", True),
+        )
+        self._ovn = OVNExporter(
+            channel=self.config.get("ovn-exporter-channel", "latest/edge"),
+        )
+        self._lxd = LXDManager(
+            port=int(self.config.get("lxd-metrics-listen-port", LXD_METRICS_PORT))
+        )
 
-    def set_peer_data_str(self, bag, key: str, value: str) -> None:
-        """Put a str into the peer data bag if not there or different."""
-        if not self.peers or not bag or not key:
-            return
+    # ------------------------------------------------------------------
+    # Mode detection
+    # ------------------------------------------------------------------
 
-        old_value: str = self.get_peer_data_str(bag, key)
-        if old_value != value:
-            self.peers.data[bag][key] = value
+    def _cos_related(self) -> bool:
+        return bool(self.model.relations.get("cos-agent"))
 
-    def _on_charm_install(self, event: InstallEvent) -> None:
-        logger.info("Installing the MicroCloud charm")
-        # Confirm that the config is valid
-        if not self.config_is_valid():
-            return
+    def _log_slots(self) -> list[str]:
+        """Snap log slots to advertise over cos-agent.
 
-        # Install MicroCloud itself
-        try:
-            self.snap_install_microcloud()
-            logger.info("Microcloud installed successfully")
-        except RuntimeError:
-            logger.error("Failed to install MicroCloud")
-            event.defer()
-            return
+        The MicroCeph snap exposes its logs via a "ceph-logs" content-interface
+        slot, so we can forward them without any custom log-shipping logic.
+        MicroOVN does not (yet) expose an equivalent slot.
+        LXD uses Loki.
+        """
+        slots: list[str] = []
+        if snap.is_installed("microceph"):
+            slots.append("microceph:ceph-logs")
+        return slots
 
-        # Apply side-loaded resources attached at deploy time
-        self.resource_sideload()
+    def _on_install(self, event: ops.InstallEvent | ops.UpgradeCharmEvent) -> None:
+        self._reconcile()
 
-    def _on_cluster_relation_created(self, event: RelationCreatedEvent) -> None:
-        """We must wait for all units to be ready before initializing MicroCloud."""
-        self.set_peer_data_str(self.unit, "clustered", "False")
-        return
+    def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
+        self._reconcile()
 
-    def _on_charm_start(self, event: StartEvent) -> None:
-        logger.info("Starting the MicroCloud charm")
+    def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
+        self._reconcile()
 
-        if self.config_changed():
-            logger.debug("Pending config changes detected")
-            self._on_charm_config_changed(event)
+    def _on_stop(self, event: ops.StopEvent) -> None:
+        if self._cos_related():
+            self._teardown_observability(full_cleanup=False)
 
-        one_unit_clustered = False
-        for unit in self.peers.units:
-            if self.peers.data[unit].get("clustered") == "True":
-                one_unit_clustered = True
-                break
+    def _on_remove(self, event: ops.RemoveEvent) -> None:
+        # Never destroy the MicroCloud cluster itself; only clean up
+        # observability artifacts this charm created.
+        self._teardown_observability(full_cleanup=True)
 
-        if one_unit_clustered:
-            # check if this unit has been clustered by the init process
-            try:
-                subprocess.run(
-                    ["lxc", "cluster", "list"],
-                    check=True,
-                    timeout=600,
-                )
-                self.set_peer_data_str(self.unit, "clustered", "True")
-                self.unit_active("Healthy MicroCloud unit")
-                return
-            except subprocess.CalledProcessError:
-                self.unit_waiting("This unit has not joined the cluster yet")
-                event.defer()
-                return
-            except subprocess.TimeoutExpired:
-                self.unit_blocked("This unit timed out checking its clustered status")
-                return
+    def _on_cos_agent_relation_joined(self, event: ops.RelationEvent) -> None:
+        self._setup_observability()
+        self._reconcile()
 
-        new_peers = [
-            self.peers.data[unit].get("clustered") == "False" for unit in self.peers.units
-        ]
-        if (
-            self.unit.is_leader()
-            and self.get_peer_data_str(self.unit, "clustered") == "False"
-            and all(new_peers)
-            and self.app.planned_units() == len(self.peers.units) + 1
-        ):
-            try:
-                self.microcloud_init()
-                self.set_peer_data_str(
-                    self.unit, "clustered", "True"
-                )  # This unit is sure to be clustered
-                # TODO: we can't say for sure that the cluster contains self.app.planned_units()
-                # some nodes might have failed to join the cluster but the command result
-                # is still a code 0. A workaround would be to parse the number of lines
-                # of `lxc cluster list -f csv` on this node.
-                self.unit_active("MicroCloud successfully initialized")
-                return
-            except RuntimeError as e:
-                logger.error(f"Failed to initialize MicroCloud: {e}")
-                self.unit_blocked("Failed to initialize MicroCloud")
-                return
+    def _on_cos_agent_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
+        self._teardown_observability(full_cleanup=True)
+        self._reconcile()
 
-        time.sleep(10)  # Wait a bit before deferring the event
+    def _on_loki_push_api_endpoint_joined(self, event: ops.EventBase) -> None:
+        self._make_helpers()
+        self._lxd.ensure_loki_config(self._loki_consumer.loki_endpoints)
 
-        if self.unit.is_leader():
-            self.unit_waiting("Leader needs to wait for all units to be ready to bootstrap")
+    def _on_loki_push_api_endpoint_departed(self, event: ops.RelationEvent) -> None:
+        self._make_helpers()
+        if endpoints := self._loki_consumer.loki_endpoints:
+            self._lxd.ensure_loki_config(endpoints)
         else:
-            self.unit_waiting("Unit needs to wait for all units to be ready to bootstrap")
+            self._lxd.teardown_loki_config()
 
-        event.defer()
-        return
+    def _reconcile(self) -> None:
+        """Validate MicroCloud membership consistency, then set status."""
+        self._make_helpers()
 
-    def _on_update_status(self, event: UpdateStatusEvent) -> None:
-        """Regularly check if the unit is clustered."""
+        if not microcloud.is_initialized():
+            self.unit.status = ops.BlockedStatus("MicroCloud is not initialized on this node")
+            return
+
         try:
-            subprocess.run(
-                ["lxc", "cluster", "list"],
-                check=True,
-                timeout=600,
-            )
-            self.set_peer_data_str(self.unit, "clustered", "True")
-            self.unit_active("Healthy MicroCloud unit")
-        except subprocess.CalledProcessError:
-            self.unit_blocked("This unit has failed to join the cluster")
-            return
-        except subprocess.TimeoutExpired:
-            self.unit_blocked("This unit timed out checking its clustered status")
+            members = microcloud.list_members()
+        except microcloud.MicroCloudError as exc:
+            self.unit.status = ops.BlockedStatus(f"Cannot read MicroCloud members: {exc}")
             return
 
-    def _on_charm_config_changed(self, event: Union[ConfigChangedEvent, StartEvent]) -> None:
-        """React to configuration changes. (JuJu refresh)."""
-        logger.info("Updating charm config")
-
-        # Confirm that the config is valid
-        if not self.config_is_valid():
+        member_names = {m.name for m in members}
+        problem = validate_membership(microcloud.hostname(), member_names)
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
             return
 
-        # Get all the configs that changed
-        changed = self.config_changed()
-        if not changed:
-            logger.debug("No configuration changes to apply")
-            return
-        else:
-            if "microceph" in changed or "microovn" in changed:
-                logger.warning(
-                    "MicroCeph and MicroOVN can only be enabled / disabled at deploy time. Ignoring the changes"
-                )
-
-        # Apply all the configs that changed
-        try:
-            if (
-                "snap-channel-lxd" in changed
-                or "snap-channel-microcloud" in changed
-                or "snap-channel-microceph" in changed
-                or "snap-channel-microovn" in changed
-            ):
-                logger.info("Changes have been detected in the snap channels, updating the snaps")
-                self.snap_install_microcloud()
-        except RuntimeError:
-            msg = "Failed to apply some configuration change(s): %s" % ", ".join(changed)
-            self.unit_blocked(msg)
-            event.defer()
-            return
-
-    def _on_cluster_relation_joined(self, event: RelationJoinedEvent) -> None:
-        """Add a new node to the existing MicroCloud cluster."""
-        if (
-            self.unit.is_leader()
-            and self.get_peer_data_str(self.unit, "clustered") == "True"
-            and event.unit
-            != self.unit  # Don't add the leader to the cluster as it is already there
-        ):
-            try:
-                self.microcloud_add()
-                logger.info("New MicroCloud node successfully added")
-                return
-            except RuntimeError:
-                logger.error("Failed to add a new MicroCloud node")
+        if self._cos_related():
+            obs_problem = self._reconcile_observability()
+            if obs_problem:
+                self.unit.status = ops.BlockedStatus(obs_problem)
                 return
 
-    def _on_charm_stop(self, event: StopEvent) -> None:
-        """Effectively remove this node from the existing MicroCloud cluster."""
-        if self.get_peer_data_str(self.unit, "clustered") == "True":
+        self._set_status()
+
+    def _setup_observability(self) -> None:
+        self._make_helpers()
+
+    def _reconcile_observability(self) -> str | None:
+        """Idempotently ensure metrics endpoints exist. Returns problem or None."""
+        errors: list[str] = []
+
+        try:
+            self._lxd.ensure_metrics_config()
+        except LXDConfigError as exc:
+            errors.append(f"LXD metrics config: {exc}")
+
+        if snap.is_installed("microceph"):
             try:
-                self.microcloud_remove(os.uname().nodename)
-                logger.info("MicroCloud node successfully removed")
-            except RuntimeError:
-                logger.error("Failed to remove a MicroCloud node, retrying later")
+                self._ceph.ensure_enabled()
+            except CephMgrError as exc:
+                errors.append(f"Ceph mgr: {exc}")
 
-    def config_changed(self) -> Dict:
-        """Figure out what changed."""
-        new_config = self.config
-        old_config = self._stored.config
-        apply_config = {}
-        for k, v in new_config.items():
-            if k not in old_config:
-                apply_config[k] = v
-            elif v != old_config[k]:
-                apply_config[k] = v
-
-        return apply_config
-
-    def config_is_valid(self) -> bool:
-        """Validate the config."""
-        config_changed = self.config_changed()
-        logger.info(f"Validating config: {config_changed}")
-        return True
-
-    def microcloud_init(self) -> None:
-        """Apply initial configuration of MicroCloud."""
-        self.unit_maintenance("Initializing MicroCloud")
-
-        try:
-            microcloud_process_init = subprocess.run(
-                ["microcloud", "init", "--auto"],
-                capture_output=True,
-                check=True,
-                timeout=600,
-                text=True,
-            )
-
-            subprocess.run(
-                ["microceph", "enable", "rgw"],
-                check=True,
-                timeout=600,
-            )
-
-            logger.info(f"MicroCloud successfully initialized:\n{microcloud_process_init.stdout}")
-        except subprocess.CalledProcessError as e:
-            self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
-            raise RuntimeError
-        except subprocess.TimeoutExpired as e:
-            self.unit_blocked(f'Timeout exceeded while running "{e.cmd}"')
-            raise RuntimeError
-
-    def microcloud_add(self) -> None:
-        """Add a new node to MicroCloud."""
-        self.unit_maintenance("Adding node to MicroCloud")
-
-        try:
-            microcloud_process_add = subprocess.run(
-                ["microcloud", "add", "--auto"],
-                capture_output=True,
-                check=True,
-                timeout=600,
-                text=True,
-            )
-            logger.info(f"MicroCloud node(s) successfully added:\n{microcloud_process_add.stdout}")
-        except subprocess.CalledProcessError as e:
-            self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
-            raise RuntimeError
-        except subprocess.TimeoutExpired as e:
-            self.unit_blocked(f'Timeout exceeded while running "{e.cmd}"')
-            raise RuntimeError
-
-    def microcloud_remove(self, node_name_to_remove: str) -> None:
-        """Remove a node from MicroCloud."""
-        try:
-            # Check if instances are running on this node local storage
-            result = subprocess.run(
-                ["lxc", "list", "--all-projects", "--format=json"], capture_output=True, text=True
-            )
-            instances = json.loads(result.stdout)
-            for inst in instances:
-                if inst["location"] == node_name_to_remove:
-                    self.unit_blocked(
-                        "This Microcloud unit contains instances. You can't remove it."
-                    )
-                    return
-        except subprocess.CalledProcessError as e:
-            self.unit_blocked(
-                f"Failed to remove {node_name_to_remove} from the MicroCloud cluster: {e}"
-            )
-            raise RuntimeError
-        except subprocess.TimeoutExpired as e:
-            self.unit_blocked(f'Timeout exceeded while running "{e.cmd}"')
-            raise RuntimeError
-
-        self.unit_maintenance("Removing node from MicroCloud")
-
-        try:
-            # Let's remove the node from the LXD cluster as well because
-            # MicroCloud does not do it automatically for now.
-            # see here https://github.com/canonical/microcloud/issues/160
-            subprocess.run(
-                ["lxc", "cluster", "remove", node_name_to_remove],
-                capture_output=True,
-                check=True,
-                timeout=600,
-                text=True,
-            )
-
-            logger.info(
-                f"LXD cluster member successfully removed for the '{node_name_to_remove}' node"
-            )
-
-            # Same reason for MicroCeph: https://github.com/canonical/microcloud/issues/160
-            if self._stored.config["snap-channel-microceph"]:
-                subprocess.run(
-                    ["microceph", "cluster", "remove", node_name_to_remove],
-                    capture_output=True,
-                    check=True,
-                    timeout=600,
-                    text=True,
-                )
-
-                logger.info(
-                    f"MicroCeph cluster member successfully removed for the '{node_name_to_remove}' node"
-                )
-
-            # Same reason for microOVN: https://github.com/canonical/microcloud/issues/160
-            if self._stored.config["snap-channel-microovn"]:
-                subprocess.run(
-                    ["microovn", "cluster", "remove", node_name_to_remove],
-                    capture_output=True,
-                    check=True,
-                    timeout=600,
-                    text=True,
-                )
-
-                logger.info(
-                    f"MicroOVN cluster member successfully removed for the '{node_name_to_remove}' node"
-                )
-
-            # For now we don't check the status of ROLE. But in order to make it resilient,
-            # we'd need to introduce a ROLE check to make sure that the node is not
-            # in a PENDING state. see here
-            # https://github.com/canonical/microcloud/issues/161
-            subprocess.run(
-                ["microcloud", "cluster", "remove", node_name_to_remove],
-                capture_output=True,
-                check=True,
-                timeout=600,
-                text=True,
-            )
-
-            logger.info(
-                f"MicroCloud cluster member successfully removed for the '{node_name_to_remove}' node"
-            )
-
-        except subprocess.CalledProcessError as e:
-            self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
-            raise RuntimeError
-        except subprocess.TimeoutExpired as e:
-            self.unit_blocked(f'Timeout exceeded while running "{e.cmd}"')
-            raise RuntimeError
-
-    def snap_install_microcloud(self) -> None:
-        """Install MicroCloud from snap."""
-        try:
-            cache = SnapCache()
-            cohort = "+"
-            snapd = cache["snapd"]  # Always refresh snapd first
-            snapd.ensure(SnapState.Latest, channel="stable")  # version 2.60.4
-
-            microcloud = cache["microcloud"]
-            if not microcloud.present:
-                microcloud.ensure(
-                    SnapState.Latest,
-                    channel=self.config["snap-channel-microcloud"],
-                    cohort=cohort,
-                )
-
-            microceph_enabled = self.config["microceph"]
-            if microceph_enabled:
-                microceph = cache["microceph"]
-                if not microceph.present:
-                    microceph.ensure(
-                        SnapState.Latest,
-                        channel=self.config["snap-channel-microceph"],
-                        cohort=cohort,
-                    )
-
-                subprocess.run(
-                    ["rm", "-rf", "/etc/ceph"],
-                    check=True,
-                    timeout=600,
-                )
-                subprocess.run(
-                    ["ln", "-s", "/var/snap/microceph/current/conf/", "/etc/ceph"],
-                    check=True,
-                    timeout=600,
-                )
-
-            microovn_enabled = self.config["microovn"]
-            if microovn_enabled:
-                microovn = cache["microovn"]
-                if not microovn.present:
-                    microovn.ensure(
-                        SnapState.Latest,
-                        channel=self.config["snap-channel-microovn"],
-                        cohort=cohort,
-                    )
-
-            lxd = cache["lxd"]
-            if (
-                not lxd.present
-            ):  # This should already be installed but let's refresh it just in case
-                lxd.ensure(
-                    SnapState.Latest, channel=self.config["snap-channel-lxd"], cohort=cohort
-                )
-        except SnapError as e:
-            logger.error(
-                "An exception occurred when installing snap packages. Reason: %s", e.message
-            )
-            self.unit_blocked("An exception occurred when installing snap packages")
-            raise RuntimeError
-
-        # Done with the snap installation
-        self._stored.config["snap-channel-lxd"] = self.config["snap-channel-lxd"]
-        self._stored.config["snap-channel-microcloud"] = self.config["snap-channel-microcloud"]
-        self._stored.config["snap-channel-microceph"] = self.config["snap-channel-microceph"]
-        self._stored.config["snap-channel-microovn"] = self.config["snap-channel-microovn"]
-
-    def microcloud_reload(self) -> None:
-        """Reload the microcloud daemon."""
-        self.unit_maintenance("Reloading MicroCloud")
-        try:
-            # Avoid occasional race during startup where a reload could cause a failure
-            subprocess.run(
-                ["microcloud", "waitready", "--timeout=30"], capture_output=True, check=False
-            )
-
-            cache = SnapCache()
-            microcloud = cache["microcloud"]
-            if microcloud.present:
-                microcloud.restart(reload=True)
-
-        except subprocess.CalledProcessError as e:
-            self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
-            raise RuntimeError
-
-    def resource_sideload(self) -> None:
-        """Side-load resources."""
-        # Multi-arch support
-        arch: str = os.uname().machine
-        possible_archs: List[str] = [arch]
-        if arch == "x86_64":
-            possible_archs = ["x86_64", "amd64"]
-
-        # Microcloud snap
-        microcloud_snap_resource: str = ""
-        fname_suffix: str = ".snap"
-        try:
-            # Note: self._stored can only store simple data types (int/float/dict/list/etc)
-            microcloud_snap_resource = str(self.model.resources.fetch("microcloud-snap"))
-        except ModelError:
-            pass
-
-        tmp_dir: str = ""
-        if microcloud_snap_resource and tarfile.is_tarfile(microcloud_snap_resource):
-            logger.debug(f"{microcloud_snap_resource} is a tarball; unpacking")
-            tmp_dir = tempfile.mkdtemp()
-            tarball = tarfile.open(microcloud_snap_resource)
-            valid_names = {f"microcloud_{x}{fname_suffix}" for x in possible_archs}
-            for f in valid_names.intersection(tarball.getnames()):
-                tarball.extract(f, path=tmp_dir)
-                logger.debug(f"{f} was extracted from the tarball")
-                self._stored.microcloud_snap_path = f"{tmp_dir}/{f}"
-                break
-            else:
-                logger.debug("Missing arch specific snap from tarball")
-            tarball.close()
-        else:
-            self._stored.microcloud_snap_path = microcloud_snap_resource
-
-        if self._stored.microcloud_snap_path:
-            self.snap_sideload_microcloud()
-            if tmp_dir:
-                os.remove(self._stored.microcloud_snap_path)
-                os.rmdir(tmp_dir)
-
-        # MicroCloud binary
-        microcloud_binary_resource: str = ""
-        fname_suffix = ""
-        try:
-            # Note: self._stored can only store simple data types (int/float/dict/list/etc)
-            microcloud_binary_resource = str(self.model.resources.fetch("microcloud-binary"))
-        except ModelError:
-            pass
-
-        tmp_dir = ""
-        if microcloud_binary_resource and tarfile.is_tarfile(microcloud_binary_resource):
-            logger.debug(f"{microcloud_binary_resource} is a tarball; unpacking")
-            tmp_dir = tempfile.mkdtemp()
-            tarball = tarfile.open(microcloud_binary_resource)
-            valid_names = {f"microcloud_{x}{fname_suffix}" for x in possible_archs}
-            for f in valid_names.intersection(tarball.getnames()):
-                tarball.extract(f, path=tmp_dir)
-                logger.debug(f"{f} was extracted from the tarball")
-                self._stored.microcloud_binary_path = f"{tmp_dir}/{f}"
-                break
-            else:
-                logger.debug("Missing arch specific binary from tarball")
-            tarball.close()
-        else:
-            self._stored.microcloud_binary_path = microcloud_binary_resource
-
-        if self._stored.microcloud_binary_path:
-            self.snap_sideload_microcloud_binary()
-            if tmp_dir:
-                os.remove(self._stored.microcloud_binary_path)
-                os.rmdir(tmp_dir)
-
-    def snap_sideload_microcloud(self) -> None:
-        """Side-load MicroCloud snap resource."""
-        logger.debug("Applying MicroCloud snap side-load changes")
-
-        # A 0 byte file will unload the resource
-        if os.path.getsize(self._stored.microcloud_snap_path) == 0:
-            logger.debug("Reverting to MicroCloud snap from snap store")
-            channel: str = self._stored.config["snap-channel-microcloud"]
+        if snap.is_installed("microovn"):
             try:
-                cache = SnapCache()
-                microcloud = cache["microcloud"]
-                microcloud.ensure(SnapState.Latest, channel=channel)
-            except SnapError as e:
-                self.unit_blocked(f"Failed to refresh the MicroCloud snap: {e.message}")
-                raise RuntimeError
+                self._ovn.ensure_installed()
+            except OVNExporterError as exc:
+                errors.append(f"OVN exporter: {exc}")
 
-        else:
-            logger.debug("Side-loading MicroCloud snap")
-            try:
-                snap_install_local(self._stored.microcloud_snap_path, dangerous=True)
-            except SnapError as e:
-                self.unit_blocked(f"Failed to side-load MicroCloud snap: {e.message}")
-                raise RuntimeError
+        if errors:
+            return "; ".join(errors)
 
+        return None
+
+    def _teardown_observability(self, *, full_cleanup: bool) -> None:
+        self._make_helpers()
+
+        if not full_cleanup:
+            return
+
+        self._lxd.teardown_metrics_config()
+
+        if snap.is_installed("microceph"):
+            self._ceph.disable()
+
+        if snap.is_installed("microovn"):
             try:
-                # Since the side-loaded snap doesn't have an assertion, some things need
-                # to be done manually
-                subprocess.run(
-                    ["systemctl", "enable", "--now", "snap.microcloud.daemon.unix.socket"],
-                    capture_output=True,
-                    check=True,
-                    timeout=600,
+                self._ovn.remove()
+            except OVNExporterError as exc:
+                logger.warning("Cannot remove ovn-exporter during teardown: %s", exc)
+
+    def _set_status(self) -> None:
+        if self._cos_related():
+            problems: list[str] = []
+            if snap.is_installed("microovn"):
+                healthy, reason = self._ovn.is_healthy()
+                if not healthy:
+                    problems.append(reason)
+            if problems:
+                self.unit.status = ops.BlockedStatus("; ".join(problems))
+                return
+            self.unit.status = ops.ActiveStatus("Observability active")
+            return
+
+        self.unit.status = ops.ActiveStatus("Waiting for observability relation")
+
+    def _on_status_action(self, event: ops.ActionEvent) -> None:
+        initialized = microcloud.is_initialized()
+        result: dict[str, Any] = {
+            "initialized": initialized,
+        }
+        if initialized:
+            try:
+                members = microcloud.list_members()
+                result["members"] = json.dumps(
+                    [{"name": m.name, "address": m.address, "status": m.status} for m in members]
                 )
-            except subprocess.CalledProcessError as e:
-                self.unit_blocked(f'Failed to run "{e.cmd}": {e.stderr} ({e.returncode})')
-                raise RuntimeError
-            except subprocess.TimeoutExpired as e:
-                self.unit_blocked(f'Timeout exceeded while running "{e.cmd}"')
-                raise RuntimeError
+                member_names = {m.name for m in members}
+                problem = validate_membership(microcloud.hostname(), member_names)
+                result["consistent"] = problem is None
+                if problem:
+                    result["problem"] = problem
+            except microcloud.MicroCloudError as exc:
+                result["members-error"] = str(exc)
+        event.set_results(result)
 
-    def snap_sideload_microcloud_binary(self) -> None:
-        """Side-load MicroCloud binary resource."""
-        logger.debug("Applying MicroCloud binary side-load changes")
-        microcloud_debug: str = "/var/snap/microcloud/common/microcloud.debug"
+    def _on_dump_metrics_config(self, event: ops.ActionEvent) -> None:
+        self._make_helpers()
+        configs = self._build_scrape_configs()
+        event.set_results({"scrape-configs": json.dumps(configs, indent=2)})
 
-        # A 0 byte file will unload the resource
-        if os.path.getsize(self._stored.microcloud_binary_path) == 0:
-            logger.debug("Unloading side-loaded MicroCloud binary")
-            if os.path.exists(microcloud_debug):
-                os.remove(microcloud_debug)
-        else:
-            logger.debug("Side-loading MicroCloud binary")
-            # Avoid "Text file busy" error
-            if os.path.exists(microcloud_debug):
-                logger.debug("Removing old side-loaded LXD binary")
-                os.remove(microcloud_debug)
-            shutil.copyfile(self._stored.microcloud_binary_path, microcloud_debug)
-            os.chmod(microcloud_debug, 0o755)
+    def _build_scrape_configs(self) -> list[dict]:
+        if self._ceph is None or self._ovn is None:
+            self._make_helpers()
 
-        self.microcloud_reload()
+        configs: list[dict] = []
+        cluster = self._cluster_label()
+        member = self._member_label()
+        interval = self.config.get("scrape-interval", "30s")
 
-    def unit_active(self, msg: str = "") -> None:
-        """Set the unit's status to active and log the provided message, if any."""
-        self.unit.status = ActiveStatus()
-        if msg:
-            logger.debug(msg)
+        # LXD.
+        lxd_port = self.config.get("lxd-metrics-listen-port", LXD_METRICS_PORT)
+        lxd_target = f"{LOCALHOST_ADDR}:{lxd_port}"
+        configs.append(
+            {
+                # The base job name embeds the member name so that the
+                # Prometheus "job" label (which cos_agent's
+                # COSAgentProvider mangles into
+                # "{app_name}_{job_name}_{hash}") stays human-readable,
+                # instead of only differing per unit via an opaque hash
+                # suffix.
+                "job_name": f"microcloud-lxd-{member}",
+                "scrape_interval": interval,
+                "metrics_path": "/1.0/metrics",
+                "scheme": "https",
+                "tls_config": {
+                    "insecure_skip_verify": True,
+                },
+                # The LXD metrics endpoint tags per-host metrics with their
+                # own "instance" label identifying the owning host.
+                # honor_labels keeps that label as-is instead of renaming
+                # it to "exported_instance" and overwriting "instance" with
+                # the scrape target address, which is identical
+                # (127.0.0.1:<port>) on every unit and would collapse
+                # per-host panels/variables in the bundled dashboard.
+                "honor_labels": True,
+                "static_configs": [
+                    {
+                        "targets": [lxd_target],
+                        "labels": {
+                            "microcloud_service": "lxd",
+                            "microcloud_member": member,
+                            "microcloud_cluster": cluster,
+                        },
+                    }
+                ],
+                "metric_relabel_configs": [
+                    {
+                        # Metrics without their own per-host "instance"
+                        # label still fall back to the scrape target
+                        # address, which is meaningless and identical
+                        # across units. Replace it with this unit's member
+                        # name so it stays unique and matches
+                        # microcloud_member.
+                        "source_labels": ["instance"],
+                        "regex": re.escape(lxd_target),
+                        "target_label": "instance",
+                        "action": "replace",
+                        "replacement": member,
+                    },
+                ],
+            }
+        )
 
-    def unit_blocked(self, msg: str) -> None:
-        """Set the unit's status to blocked and log the provided message."""
-        self.unit.status = BlockedStatus(msg)
-        logger.error(msg)
+        # MicroCeph.
+        if snap.is_installed("microceph") and self._ceph.is_mgr_active():
+            ceph_port = self.config.get("ceph-mgr-prometheus-port", CEPH_METRICS_PORT)
+            ceph_target = f"{LOCALHOST_ADDR}:{ceph_port}"
+            configs.append(
+                {
+                    # The base job name embeds the member name so that the
+                    # Prometheus "job" label (which cos_agent's
+                    # COSAgentProvider mangles into
+                    # "{app_name}_{job_name}_{hash}") stays human-readable,
+                    # instead of only differing per unit via an opaque hash
+                    # suffix.
+                    "job_name": f"microcloud-microceph-{member}",
+                    "scrape_interval": interval,
+                    "metrics_path": "/metrics",
+                    # The Ceph mgr exporter tags per-host metrics (e.g.
+                    # ceph_disk_occupation) with their own "instance" label
+                    # identifying the owning host. honor_labels keeps that
+                    # label as-is instead of renaming it to
+                    # "exported_instance" and overwriting "instance" with the
+                    # scrape target address, which is identical
+                    # (127.0.0.1:<port>) on every unit and would collapse
+                    # per-host panels/variables in the bundled dashboards.
+                    "honor_labels": True,
+                    "static_configs": [
+                        {
+                            "targets": [ceph_target],
+                            "labels": {
+                                "microcloud_service": "microceph",
+                                "microcloud_member": member,
+                                "microcloud_cluster": cluster,
+                            },
+                        }
+                    ],
+                    "metric_relabel_configs": [
+                        {
+                            # Metrics without their own per-host "instance"
+                            # label (e.g. cluster-wide summaries) still fall
+                            # back to the scrape target address, which is
+                            # meaningless and identical across units.
+                            # Replace it with this unit's member name so it
+                            # stays unique and matches microcloud_member.
+                            "source_labels": ["instance"],
+                            "regex": re.escape(ceph_target),
+                            "target_label": "instance",
+                            "action": "replace",
+                            "replacement": member,
+                        },
+                    ],
+                }
+            )
 
-    def unit_maintenance(self, msg: str) -> None:
-        """Set the unit's status to maintenance and log the provided message."""
-        self.unit.status = MaintenanceStatus(msg)
-        logger.info(msg)
+        # MicroOVN.
+        if snap.is_installed("microovn"):
+            ovn_target = f"{LOCALHOST_ADDR}:{OVN_METRICS_PORT}"
+            configs.append(
+                {
+                    # The base job name embeds the member name so that the
+                    # Prometheus "job" label (which cos_agent's
+                    # COSAgentProvider mangles into
+                    # "{app_name}_{job_name}_{hash}") stays human-readable,
+                    # instead of only differing per unit via an opaque hash
+                    # suffix.
+                    "job_name": f"microcloud-microovn-{member}",
+                    "scrape_interval": interval,
+                    "metrics_path": "/metrics",
+                    # The OVN exporter tags per-host metrics with their own
+                    # "instance" label identifying the owning host.
+                    # honor_labels keeps that label as-is instead of
+                    # renaming it to "exported_instance" and overwriting
+                    # "instance" with the scrape target address, which is
+                    # identical (127.0.0.1:<port>) on every unit and would
+                    # collapse per-host panels/variables in the bundled
+                    # dashboards.
+                    "honor_labels": True,
+                    "static_configs": [
+                        {
+                            "targets": [ovn_target],
+                            "labels": {
+                                "microcloud_service": "microovn",
+                                "microcloud_member": member,
+                                "microcloud_cluster": cluster,
+                            },
+                        }
+                    ],
+                    "metric_relabel_configs": [
+                        {
+                            # Metrics without their own per-host "instance"
+                            # label (e.g. cluster-wide summaries) still
+                            # fall back to the scrape target address, which
+                            # is meaningless and identical across units.
+                            # Replace it with this unit's member name so it
+                            # stays unique and matches microcloud_member.
+                            "source_labels": ["instance"],
+                            "regex": re.escape(ovn_target),
+                            "target_label": "instance",
+                            "action": "replace",
+                            "replacement": member,
+                        },
+                    ],
+                }
+            )
 
-    def unit_waiting(self, msg: str) -> None:
-        """Set the unit's status to waiting and log the provided message."""
-        self.unit.status = WaitingStatus(msg)
-        logger.info(msg)
+        return configs
+
+    def _cluster_label(self) -> str:
+        return self.app.name
+
+    def _member_label(self) -> str:
+        return microcloud.hostname()
 
 
 if __name__ == "__main__":
-    main(MaasMicroCloudCharm)
+    ops.main(MicroCloudCharm)
