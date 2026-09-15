@@ -2256,6 +2256,8 @@ class TestGrowCharm:
         stub._cos_related.return_value = False
         stub._reconcile_observe_only.return_value = None
         stub._reconcile_deploy.return_value = None
+        stub._reconcile_failure_domain.return_value = (None, False)
+        stub._reconcile_role_spread.return_value = None
         stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
             stub, initialized
         )
@@ -2401,7 +2403,7 @@ def _member(name, domain="zone-1", roles=(), status="Online", arch="x86_64"):
 
 
 class TestLxdCluster:
-    """LXD cluster members and their failure domains."""
+    """LXD cluster members, failure domains and database role spread."""
 
     def test_members_parses_the_cluster_member_list(self):
         import lxd_cluster
@@ -2428,6 +2430,7 @@ class TestLxdCluster:
             "/1.0/cluster/members?recursion=1",
         ]
         assert member.name == "node1"
+        assert member.is_voter
 
     @pytest.mark.parametrize(
         ("payload", "clustered"), [({"enabled": True}, True), ({"enabled": False}, False)]
@@ -2499,6 +2502,98 @@ class TestLxdCluster:
         ):
             lxd_cluster.members()
 
+    def test_voters_are_spread(self):
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader", "database-voter"]),
+            _member("node2", "zone-2", ["database-voter"]),
+            _member("node3", "zone-3", ["database-voter"]),
+            _member("node4", "zone-1", ["database-standby"]),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) is None
+
+    def test_voters_could_cover_more_domains(self):
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader", "database-voter"]),
+            _member("node2", "zone-1", ["database-voter"]),
+            _member("node3", "zone-2", ["database-voter"]),
+            _member("node4", "zone-3", ["database-standby"]),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) == (2, 3)
+
+    def test_no_spread_without_a_member_lxd_may_promote(self):
+        """Once control-plane is in use, LXD only promotes control-plane members."""
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader", "control-plane"]),
+            _member("node2", "zone-1", ["database-voter", "control-plane"]),
+            _member("node3", "zone-1", ["database-voter", "control-plane"]),
+            _member("node4", "zone-2", ["database-standby"]),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) is None
+
+    def test_spread_into_a_domain_with_a_control_plane_candidate(self):
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader", "control-plane"]),
+            _member("node2", "zone-1", ["database-voter", "control-plane"]),
+            _member("node3", "zone-1", ["database-voter", "control-plane"]),
+            _member("node4", "zone-2", ["database-standby", "control-plane"]),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) == (1, 2)
+
+    def test_spread_only_counts_domains_with_a_member_lxd_may_promote(self):
+        """Two candidates in one domain add one domain, not every domain there is."""
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader", "control-plane"]),
+            _member("node2", "zone-1", ["database-voter", "control-plane"]),
+            _member("node3", "zone-1", ["database-voter", "control-plane"]),
+            _member("node4", "zone-2", ["database-standby", "control-plane"]),
+            _member("node5", "zone-2", ["database-standby", "control-plane"]),
+            _member("node6", "zone-3", ["database-standby"]),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) == (1, 2)
+
+    def test_offline_candidates_cannot_be_promoted(self):
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader"]),
+            _member("node2", "zone-1", ["database-voter"]),
+            _member("node3", "zone-2", ["database-voter"]),
+            _member("node4", "zone-3", ["database-standby"], status="Evacuated"),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) is None
+
+    def test_spread_is_capped_by_the_voters_there_are(self):
+        """Three voters cannot cover four domains."""
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader"]),
+            _member("node2", "zone-2", ["database-voter"]),
+            _member("node3", "zone-3", ["database-voter"]),
+            _member("node4", "zone-4", ["database-standby"]),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) is None
+
+    def test_offline_members_do_not_count(self):
+        import lxd_cluster
+
+        cluster = [
+            _member("node1", "zone-1", ["database-leader"]),
+            _member("node2", "zone-1", ["database-voter"]),
+            _member("node3", "zone-2", ["database-standby"], status="Offline"),
+        ]
+        assert lxd_cluster.unspread_voters(cluster) is None
+
 
 class TestFailureDomains:
     """Carrying each unit's zone through to its LXD failure domain."""
@@ -2566,46 +2661,115 @@ class TestFailureDomains:
                 "charm.lxd_cluster.set_failure_domain", side_effect=set_side_effect
             ) as set_failure_domain,
         ):
-            problem = MicroCloudCharm._reconcile_failure_domain(stub)
-        return problem, set_failure_domain
+            problem, changed = MicroCloudCharm._reconcile_failure_domain(stub)
+        return problem, changed, set_failure_domain
 
     def test_sets_the_failure_domain_to_the_zone(self):
-        problem, set_failure_domain = self._set(self._stub(), [_member("node1", "default")])
+        problem, changed, set_failure_domain = self._set(
+            self._stub(), [_member("node1", "default")]
+        )
 
-        assert problem is None
+        assert (problem, changed) == (None, True)
         set_failure_domain.assert_called_once_with("node1", "zone-1")
 
     def test_leaves_a_matching_failure_domain_alone(self):
-        problem, set_failure_domain = self._set(self._stub(), [_member("node1", "zone-1")])
+        problem, changed, set_failure_domain = self._set(
+            self._stub(), [_member("node1", "zone-1")]
+        )
 
-        assert problem is None
+        assert (problem, changed) == (None, False)
         set_failure_domain.assert_not_called()
 
     @pytest.mark.parametrize("require_zone", [True, False])
     def test_leaves_the_failure_domain_alone_without_a_zone(self, require_zone):
         """A clustered unit without a zone joined outside Juju, or zones are opted out of."""
-        problem, set_failure_domain = self._set(
+        problem, changed, set_failure_domain = self._set(
             self._stub(zone="", require_zone=require_zone), [_member("node1", "rack-a")]
         )
 
-        assert problem is None
+        assert (problem, changed) == (None, False)
         set_failure_domain.assert_not_called()
 
     def test_blocks_when_not_an_lxd_member(self):
-        problem, _ = self._set(self._stub(), [_member("node2")])
+        problem, _, _ = self._set(self._stub(), [_member("node2")])
 
         assert problem == "node1 is not an LXD cluster member"
 
     def test_blocks_when_lxd_refuses(self):
         import lxd_cluster
 
-        problem, _ = self._set(
+        problem, _, _ = self._set(
             self._stub(),
             [_member("node1", "default")],
             set_side_effect=lxd_cluster.LXDClusterError("denied"),
         )
 
         assert problem == "Cannot set the failure domain of node1 to 'zone-1': denied"
+
+    _UNSPREAD = [
+        ("node1", "zone-1", ["database-leader"]),
+        ("node2", "zone-1", ["database-voter"]),
+        ("node3", "zone-2", ["database-voter"]),
+        ("node4", "zone-3", ["database-standby"]),
+    ]
+    _SPREAD = [
+        ("node1", "zone-1", ["database-leader"]),
+        ("node2", "zone-1", ["database-standby"]),
+        ("node3", "zone-2", ["database-voter"]),
+        ("node4", "zone-3", ["database-voter"]),
+    ]
+
+    def _spread(self, *snapshots, wait=True):
+        from charm import MicroCloudCharm
+
+        clock = iter(range(0, 1000, 5))
+        with (
+            patch(
+                "charm.lxd_cluster.members",
+                side_effect=[[_member(*m) for m in snapshot] for snapshot in snapshots],
+            ) as members,
+            patch("charm.time.monotonic", side_effect=lambda: next(clock)),
+            patch("charm.time.sleep") as sleep,
+        ):
+            waiting = MicroCloudCharm._reconcile_role_spread(self._stub(), wait=wait)
+        return waiting, members, sleep
+
+    def test_spread_roles_need_no_wait(self):
+        waiting, members, sleep = self._spread(self._SPREAD)
+
+        assert waiting is None
+        assert members.call_count == 1
+        sleep.assert_not_called()
+
+    def test_waits_in_the_hook_for_lxd_to_spread_roles(self):
+        """LXD spreads voters on its own shortly after failure domains change."""
+        waiting, members, sleep = self._spread(self._UNSPREAD, self._UNSPREAD, self._SPREAD)
+
+        assert waiting is None
+        assert members.call_count == 3
+        assert sleep.call_count == 2
+
+    def test_reports_waiting_once_the_hook_has_waited_long_enough(self):
+        waiting, members, _ = self._spread(*[self._UNSPREAD] * 20)
+
+        assert waiting == "Spreading database roles across failure domains (2 of 3)"
+        assert members.call_count < 20
+
+    def test_only_checks_once_unless_the_failure_domain_just_changed(self):
+        """Waiting in every hook would hold the machine's hook lock for nothing."""
+        waiting, members, sleep = self._spread(*[self._UNSPREAD] * 20, wait=False)
+
+        assert waiting == "Spreading database roles across failure domains (2 of 3)"
+        assert members.call_count == 1
+        sleep.assert_not_called()
+
+    def test_unreadable_cluster_does_not_hold_status(self):
+        import lxd_cluster
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        with patch("charm.lxd_cluster.members", side_effect=lxd_cluster.LXDClusterError("boom")):
+            assert MicroCloudCharm._reconcile_role_spread(stub, wait=True) is None
 
     def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
         from charm import MicroCloudCharm
@@ -2615,7 +2779,8 @@ class TestFailureDomains:
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
-        stub._reconcile_failure_domain.return_value = None
+        stub._reconcile_failure_domain.return_value = (None, True)
+        stub._reconcile_role_spread.return_value = None
         stub._cos_related.return_value = False
 
         def hold(status):
@@ -2638,6 +2803,8 @@ class TestFailureDomains:
         self._reconcile(stub, initialized=initialized)
 
         assert stub._reconcile_failure_domain.called is initialized
+        if initialized:
+            stub._reconcile_role_spread.assert_called_once_with(wait=True)
 
     def test_waits_for_lxd_to_join_before_setting_the_failure_domain(self):
         """MicroCloud reports a joiner clustered before the initiator has added its LXD."""
@@ -2648,6 +2815,7 @@ class TestFailureDomains:
         self._reconcile(stub, lxd_clustered=False)
 
         stub._reconcile_failure_domain.assert_not_called()
+        stub._reconcile_role_spread.assert_not_called()
         assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
         stub._set_status.assert_not_called()
 
@@ -2657,12 +2825,7 @@ class TestFailureDomains:
         import lxd_cluster
         from charm import MicroCloudCharm
 
-        stub = self._stub()
-        stub.unit.is_leader.return_value = False
-        stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
-        stub._coordinator = MagicMock()
-        stub._reconcile_observe_only.return_value = None
+        stub = self._spreading_stub()
         with (
             patch("charm.microcloud.hostname", return_value="node1"),
             patch("charm.microcloud.is_initialized", return_value=True),
@@ -2674,3 +2837,54 @@ class TestFailureDomains:
 
         assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
         stub._reconcile_failure_domain.assert_not_called()
+
+    def test_reconcile_waits_while_roles_spread(self):
+        import ops
+
+        from charm import MicroCloudCharm
+
+        stub = self._spreading_stub()
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch("charm.lxd_cluster.is_clustered", return_value=True),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        assert stub.unit.status == ops.WaitingStatus("Spreading database roles (1 of 2)")
+        stub._reconcile_role_spread.assert_called_once_with(wait=False)
+        stub._set_status.assert_not_called()
+
+    def test_held_status_wins_over_spreading_roles(self):
+        """A join session in progress says more than the roles still spreading."""
+        from charm import MicroCloudCharm
+
+        stub = self._spreading_stub()
+        held = object()
+
+        def observe():
+            stub.unit.status = held
+            stub._status_held = True
+
+        stub._reconcile_observe_only.side_effect = observe
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch("charm.lxd_cluster.is_clustered", return_value=True),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        assert stub.unit.status is held
+        stub._set_status.assert_not_called()
+
+    def _spreading_stub(self):
+        stub = self._stub()
+        stub.unit.is_leader.return_value = False
+        stub._status_held = False
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._coordinator = MagicMock()
+        stub._reconcile_observe_only.return_value = None
+        stub._reconcile_failure_domain.return_value = (None, False)
+        stub._reconcile_role_spread.return_value = "Spreading database roles (1 of 2)"
+        stub._cos_related.return_value = False
+        return stub

@@ -4,13 +4,18 @@
 """LXD cluster members, their failure domains and database roles.
 
 MicroCloud cannot set a member's failure domain when it forms or grows the
-cluster, so the charm sets it afterwards through the local LXD API.
+cluster, so the charm sets it afterwards through the local LXD API, and LXD
+then spreads database voters across the failure domains.
 """
 
 import json
 import subprocess
 from dataclasses import dataclass, field
 
+# Roles that make a member a database voter. LXD reports "database-voter" on
+# current releases; "database" is the name older ones used.
+_VOTER_ROLES = {"database-voter", "database-leader", "database"}
+_CONTROL_PLANE_ROLE = "control-plane"
 # Roles LXD assigns and preserves itself on current releases, and refuses to
 # have added back once a member has lost them. Older releases skip them too,
 # but insist "database" matches the member's, so that one is kept.
@@ -30,6 +35,10 @@ class Member:
     failure_domain: str
     architecture: str
     roles: list[str] = field(default_factory=list)
+
+    @property
+    def is_voter(self) -> bool:
+        return bool(_VOTER_ROLES.intersection(self.roles))
 
 
 def _query(path: str, method: str = "GET", data: dict | None = None) -> object:
@@ -89,3 +98,39 @@ def set_failure_domain(name: str, failure_domain: str) -> None:
     ]
     writable["failure_domain"] = failure_domain
     _query(path, "PUT", writable)
+
+
+def unspread_voters(cluster: list[Member]) -> tuple[int, int] | None:
+    """Return (domains with voters, domains LXD can spread voters to) if it will spread them.
+
+    Mirrors LXD's own rule for spreading voters: online voters cover fewer
+    failure domains than there are online failure domains, and fewer than
+    there are online voters, and some member it may promote sits in a
+    failure domain without a voter. It only promotes online members that
+    are not voters yet and, once any member has the control-plane role,
+    only members with that role. The domains it can spread to are therefore
+    those with voters plus those with a member it may promote, and never
+    more than there are voters. Returns None when LXD has nothing it can
+    spread.
+    """
+    online = [member for member in cluster if member.status == "Online"]
+    voters = [member for member in online if member.is_voter]
+    domains = {member.failure_domain for member in online}
+    with_voters = {member.failure_domain for member in voters}
+    if len(with_voters) >= min(len(domains), len(voters)):
+        return None
+
+    control_plane = any(_CONTROL_PLANE_ROLE in member.roles for member in cluster)
+    candidates = [
+        member
+        for member in online
+        if not member.is_voter
+        and member.failure_domain not in with_voters
+        and (not control_plane or _CONTROL_PLANE_ROLE in member.roles)
+    ]
+    reachable = min(
+        len(voters), len(with_voters | {member.failure_domain for member in candidates})
+    )
+    if len(with_voters) >= reachable:
+        return None
+    return len(with_voters), reachable

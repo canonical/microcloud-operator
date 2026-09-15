@@ -82,6 +82,11 @@ _DASHBOARD_DIRS = [
 ]
 _ALERT_RULES_DIR = "./src/prometheus_alert_rules"
 
+# How long a hook waits for LXD to spread database roles across newly set
+# failure domains, and how often it checks.
+_SPREAD_WAIT = 60
+_SPREAD_POLL = 5
+
 # LXD metrics address — dedicated loopback listener, always TLS.
 _LXD_METRICS_ADDRESS = "127.0.0.1:8444"
 
@@ -322,6 +327,7 @@ class MicroCloudCharm(ops.CharmBase):
         # its LXD has joined too. MicroCloud reports a joining unit as clustered
         # as soon as it has joined MicroCloud itself, before the initiator adds
         # its LXD. The leader clearing its join session wakes it up again.
+        spreading = None
         if not problem and initialized:
             try:
                 lxd_clustered = lxd_cluster.is_clustered()
@@ -329,7 +335,9 @@ class MicroCloudCharm(ops.CharmBase):
                 problem = f"Cannot read the LXD cluster: {exc}"
             else:
                 if lxd_clustered:
-                    problem = self._reconcile_failure_domain()
+                    problem, changed = self._reconcile_failure_domain()
+                    if not problem:
+                        spreading = self._reconcile_role_spread(wait=changed)
                 else:
                     self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
 
@@ -343,8 +351,14 @@ class MicroCloudCharm(ops.CharmBase):
                 self.unit.status = ops.BlockedStatus(obs_problem)
                 return
 
-        if not self._status_held:
-            self._set_status(initialized=microcloud.is_initialized())
+        if self._status_held:
+            return
+
+        if spreading:
+            self.unit.status = ops.WaitingStatus(spreading)
+            return
+
+        self._set_status(initialized=microcloud.is_initialized())
 
     def _hold_status(self, status: ops.StatusBase) -> None:
         """Report a transitional status that reconciliation must not overwrite."""
@@ -689,8 +703,8 @@ class MicroCloudCharm(ops.CharmBase):
         """Return True if this unit has no zone although one is required."""
         return not self._zone() and bool(self.config.get("require-zone", True))
 
-    def _reconcile_failure_domain(self) -> str | None:
-        """Set this unit's LXD failure domain to its zone. Returns problem or None.
+    def _reconcile_failure_domain(self) -> tuple[str | None, bool]:
+        """Set this unit's LXD failure domain to its zone.
 
         The name is carried through unchanged, so the zone an operator reads
         in the substrate is the failure domain they read in LXD. Each unit
@@ -699,23 +713,51 @@ class MicroCloudCharm(ops.CharmBase):
 
         A clustered unit without a zone keeps whatever failure domain it has:
         units only join with a zone, so the substrate has opted out of zones.
+
+        Returns (problem or None, whether the failure domain was changed).
         """
         hostname = microcloud.hostname()
         zone = self._zone()
         if not zone:
-            return None
+            return None, False
 
         try:
             member = next((m for m in lxd_cluster.members() if m.name == hostname), None)
             if member is None:
-                return f"{hostname} is not an LXD cluster member"
+                return f"{hostname} is not an LXD cluster member", False
             if member.failure_domain == zone:
-                return None
+                return None, False
             logger.info("Setting the failure domain of %s to %s", hostname, zone)
             lxd_cluster.set_failure_domain(hostname, zone)
         except lxd_cluster.LXDClusterError as exc:
-            return f"Cannot set the failure domain of {hostname} to {zone!r}: {exc}"
-        return None
+            return f"Cannot set the failure domain of {hostname} to {zone!r}: {exc}", False
+        return None, True
+
+    def _reconcile_role_spread(self, *, wait: bool) -> str | None:
+        """Wait for database roles to spread across failure domains. Returns a wait or None.
+
+        Members join before the charm has set their failure domains, so LXD
+        first hands out database roles without them. It spreads voters
+        across failure domains on its own shortly after they change. The
+        hook that has just changed this unit's failure domain gives it a
+        little time rather than report active too early; any other hook
+        only checks.
+        """
+        deadline = time.monotonic() + (_SPREAD_WAIT if wait else 0)
+        while True:
+            try:
+                unspread = lxd_cluster.unspread_voters(lxd_cluster.members())
+            except lxd_cluster.LXDClusterError as exc:
+                logger.warning("Cannot check database roles across failure domains: %s", exc)
+                return None
+            if unspread is None:
+                return None
+            if time.monotonic() >= deadline:
+                break
+            time.sleep(_SPREAD_POLL)
+
+        spread, possible = unspread
+        return f"Spreading database roles across failure domains ({spread} of {possible})"
 
     # ---- Observe-only mode ----
 
