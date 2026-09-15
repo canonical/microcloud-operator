@@ -185,6 +185,15 @@ config:
     # ------------------------------------------------------------------
     # Cluster bootstrap / session (deployment mode only)
     # ------------------------------------------------------------------
+    require-zone:
+      type: boolean
+      default: true
+      description: >
+        Require every unit's machine to report a zone, which becomes the
+        unit's LXD failure domain. A unit without one blocks rather than
+        joining the cluster. Only disable this on substrates with no zones;
+        units without a zone then keep LXD's default failure domain.
+
     session-timeout:
       type: int
       default: 300

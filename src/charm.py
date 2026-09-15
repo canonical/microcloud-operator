@@ -51,6 +51,7 @@ logging-relation-broken
 
 import json
 import logging
+import os
 import re
 import subprocess
 import time
@@ -364,6 +365,12 @@ class MicroCloudCharm(ops.CharmBase):
         # are already in place, and refreshing them now would upgrade this
         # one member ahead of the rest of the cluster.
         if not initialized:
+            # The zone becomes this unit's failure domain once it joins, so a
+            # unit without one must not join at all: it is more likely
+            # incompletely provisioned than legitimately zone-less.
+            if self._zone_missing():
+                return f"{microcloud.hostname()} has no zone; cannot set its failure domain"
+
             channels = {
                 "lxd": self.config.get("snap-channel-lxd", "6/stable"),
                 "microceph": self.config.get("snap-channel-microceph", ""),
@@ -655,6 +662,16 @@ class MicroCloudCharm(ops.CharmBase):
         each becomes a separate Ceph OSD on this system.
         """
         return [str(storage.location) for storage in self.model.storages["ceph"]]
+
+    # ---- Failure domains ----
+
+    def _zone(self) -> str:
+        """Return the zone Juju reports for this unit's machine, or ""."""
+        return os.environ.get("JUJU_AVAILABILITY_ZONE", "").strip()
+
+    def _zone_missing(self) -> bool:
+        """Return True if this unit has no zone although one is required."""
+        return not self._zone() and bool(self.config.get("require-zone", True))
 
     # ---- Observe-only mode ----
 

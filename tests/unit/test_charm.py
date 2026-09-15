@@ -2215,6 +2215,7 @@ class TestGrowCharm:
         coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
         stub._lead_session.return_value = None
         stub._join_session.return_value = None
+        stub._zone_missing.return_value = False
 
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
@@ -2383,3 +2384,65 @@ class TestSessionWorkerHelpers:
             "abc", "doc", "microcloud/0", Path("/charm"), retry_until=5.0, replacing=42
         )
         assert (stub._stored.worker_pid, stub._stored.worker_session) == (99, "abc")
+
+
+# ---------------------------------------------------------------------------
+# Failure domains
+# ---------------------------------------------------------------------------
+
+
+class TestFailureDomains:
+    """Requiring a zone, which becomes each unit's LXD failure domain."""
+
+    def _stub(self, *, require_zone=True, zone="zone-1"):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"require-zone": require_zone}
+        stub._zone.return_value = zone
+        stub._zone_missing.side_effect = lambda: MicroCloudCharm._zone_missing(stub)
+        return stub
+
+    def test_zone_comes_from_the_hook_environment(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        with patch.dict("os.environ", {"JUJU_AVAILABILITY_ZONE": " zone-1 "}):
+            assert MicroCloudCharm._zone(stub) == "zone-1"
+        with patch.dict("os.environ", {}, clear=True):
+            assert MicroCloudCharm._zone(stub) == ""
+
+    def test_zone_missing_honours_the_opt_out(self):
+        from charm import MicroCloudCharm
+
+        assert MicroCloudCharm._zone_missing(self._stub(zone="")) is True
+        assert MicroCloudCharm._zone_missing(self._stub(zone="", require_zone=False)) is False
+        assert MicroCloudCharm._zone_missing(self._stub()) is False
+
+    def test_deploy_blocks_without_a_zone_before_installing_anything(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub(zone="")
+        with (
+            patch("charm.snap.ensure_snaps") as ensure_snaps,
+            patch("charm.microcloud.hostname", return_value="node1"),
+        ):
+            problem = MicroCloudCharm._reconcile_deploy(stub, False, [])
+
+        assert problem == "node1 has no zone; cannot set its failure domain"
+        ensure_snaps.assert_not_called()
+
+    def test_clustered_leader_without_a_zone_still_runs_join_sessions(self):
+        """The zone only gates this unit joining; it is already a member."""
+        from charm import MicroCloudCharm
+
+        stub = self._stub(zone="")
+        with (
+            patch("charm.snap.ensure_snaps") as ensure_snaps,
+            patch("charm.microcloud.waitready", return_value=False),
+        ):
+            problem = MicroCloudCharm._reconcile_deploy(stub, True, [])
+
+        assert problem is None
+        ensure_snaps.assert_not_called()
+        stub._hold_status.assert_called_once()
