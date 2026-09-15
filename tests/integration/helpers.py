@@ -125,9 +125,9 @@ def cluster_members(juju: jubilant.Juju, unit: str | None = None) -> list[dict[s
     """Return the MicroCloud members reported by the "status" action."""
     results = run_action(juju, "status", unit)
     assert as_bool(results["initialized"]), f"MicroCloud is not initialized: {results}"
-    assert "members-error" not in results, results.get("members-error")
-    assert "members" in results, f"status action reported no members: {results}"
-    return json.loads(results["members"])
+    assert "microcloud-members-error" not in results, results.get("microcloud-members-error")
+    assert "microcloud-members" in results, f"status action reported no members: {results}"
+    return json.loads(results["microcloud-members"])
 
 
 def unit_hostnames(juju: jubilant.Juju) -> dict[str, str]:

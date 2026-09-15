@@ -2594,6 +2594,24 @@ class TestLxdCluster:
         ]
         assert lxd_cluster.unspread_voters(cluster) is None
 
+    def test_render_table(self):
+        import lxd_cluster
+
+        table = lxd_cluster.render_table(
+            [
+                _member("node-02", "zone-2", ["database-voter", "control-plane"]),
+                _member("node-01", "zone-1", ["database-leader", "control-plane"]),
+                _member("node-10", "zone-3", [], arch="aarch64"),
+            ]
+        )
+
+        assert table.splitlines() == [
+            "NAME     ROLES                          FAILURE DOMAIN  ARCHITECTURE",
+            "node-01  database-leader,control-plane  zone-1          x86_64",
+            "node-02  database-voter,control-plane   zone-2          x86_64",
+            "node-10  -                              zone-3          aarch64",
+        ]
+
 
 class TestFailureDomains:
     """Carrying each unit's zone through to its LXD failure domain."""
@@ -2888,3 +2906,20 @@ class TestFailureDomains:
         stub._reconcile_role_spread.return_value = "Spreading database roles (1 of 2)"
         stub._cos_related.return_value = False
         return stub
+
+    def test_status_action_renders_the_member_table(self):
+        from charm import MicroCloudCharm
+        from microcloud import Member
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        event = MagicMock()
+        with (
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch("charm.lxd_cluster.members", return_value=[_member("node1", "zone-1")]),
+            patch("charm.microcloud.list_members", return_value=[Member("node1", "10.0.0.1")]),
+        ):
+            MicroCloudCharm._on_status_action(stub, event)
+
+        results = event.set_results.call_args.args[0]
+        assert results["members"].splitlines()[1].split() == ["node1", "-", "zone-1", "x86_64"]
+        assert json.loads(results["microcloud-members"])[0]["name"] == "node1"
