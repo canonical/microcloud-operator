@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -53,185 +53,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 from ceph_mgr import CephMgrPrometheus
 from failure_domains import FailureDomains
 from network import UnitNetwork
+from observability import Observability
 from ovn_exporter import OVNExporter
-
-# ---------------------------------------------------------------------------
-# _lxc_config_set helper
-# ---------------------------------------------------------------------------
-
-
-class TestLxcConfigSet:
-    def test_calls_lxc_config_set(self):
-        from charm import _lxc_config_set
-
-        with patch("charm.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            _lxc_config_set("core.metrics_address", "127.0.0.1:8444")
-            mock_run.assert_called_once_with(
-                ["lxc", "config", "set", "core.metrics_address", "127.0.0.1:8444"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-
-    def test_raises_on_failure(self):
-        import subprocess
-
-        from charm import LXDConfigError, _lxc_config_set
-
-        with patch(
-            "charm.subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "lxc", stderr="permission denied"),
-        ):
-            with pytest.raises(LXDConfigError, match="Cannot set LXD config"):
-                _lxc_config_set("core.metrics_address", "127.0.0.1:8444")
-
-
-# ---------------------------------------------------------------------------
-# _log_slots
-# ---------------------------------------------------------------------------
-
-
-class TestLogSlots:
-    def _make_charm_stub(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        return stub
-
-    def test_includes_microceph_slot_when_installed(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"):
-            assert MicroCloudCharm._log_slots(stub) == ["microceph:ceph-logs"]
-
-    def test_omits_microceph_slot_when_not_installed(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm.snap.is_installed", return_value=False):
-            assert MicroCloudCharm._log_slots(stub) == []
-
-
-# ---------------------------------------------------------------------------
-# _ensure_lxd_metrics_config
-# ---------------------------------------------------------------------------
-
-
-class TestEnsureLxdMetricsConfig:
-    def _make_charm_stub(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        return stub
-
-    def test_sets_metrics_address_and_disables_auth(self):
-        from charm import _LXD_METRICS_ADDRESS, MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set") as mock_set:
-            MicroCloudCharm._ensure_lxd_metrics_config(stub)
-            assert mock_set.call_args_list == [
-                call("core.metrics_address", _LXD_METRICS_ADDRESS),
-                call("core.metrics_authentication", "false"),
-            ]
-
-    def test_propagates_lxd_config_error(self):
-        from charm import LXDConfigError, MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")):
-            with pytest.raises(LXDConfigError, match="lxd not running"):
-                MicroCloudCharm._ensure_lxd_metrics_config(stub)
-
-
-# ---------------------------------------------------------------------------
-# _ensure_lxd_loki_config / _teardown_lxd_loki_config
-# ---------------------------------------------------------------------------
-
-
-class TestLxdLokiConfig:
-    def _make_charm_stub(self, loki_endpoints=None):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._loki_consumer = MagicMock()
-        stub._loki_consumer.loki_endpoints = loki_endpoints or []
-        return stub
-
-    def test_does_nothing_when_no_endpoints_published_yet(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(loki_endpoints=[])
-        with patch("charm._lxc_config_set") as mock_set:
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_not_called()
-
-    def test_sets_loki_api_url_stripping_push_suffix(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(
-            loki_endpoints=[{"url": "http://otelcol:3500/loki/api/v1/push"}]
-        )
-        with (
-            patch("charm._lxd_has_api_extension", return_value=True),
-            patch("charm._lxc_config_set") as mock_set,
-        ):
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_called_once_with("loki.api.url", "http://otelcol:3500")
-
-    def test_skips_when_loki_api_extension_missing(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(
-            loki_endpoints=[{"url": "http://otelcol:3500/loki/api/v1/push"}]
-        )
-        with (
-            patch("charm._lxd_has_api_extension", return_value=False),
-            patch("charm._lxc_config_set") as mock_set,
-        ):
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_not_called()
-
-    def test_swallows_lxd_config_error(self):
-        from charm import LXDConfigError, MicroCloudCharm
-
-        stub = self._make_charm_stub(loki_endpoints=[{"url": "http://otelcol:3500"}])
-        with (
-            patch("charm._lxd_has_api_extension", return_value=True),
-            patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")),
-        ):
-            # Should not raise.
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-
-    def test_ignores_endpoint_missing_url(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(loki_endpoints=[{}])
-        with (
-            patch("charm._lxd_has_api_extension", return_value=True),
-            patch("charm._lxc_config_set") as mock_set,
-        ):
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_not_called()
-
-    def test_teardown_clears_loki_api_url(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set") as mock_set:
-            MicroCloudCharm._teardown_lxd_loki_config(stub)
-            mock_set.assert_called_once_with("loki.api.url", "")
-
-    def test_teardown_swallows_lxd_config_error(self):
-        from charm import LXDConfigError, MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")):
-            # Should not raise.
-            MicroCloudCharm._teardown_lxd_loki_config(stub)
-
 
 # ---------------------------------------------------------------------------
 # logging (Loki) relation handlers
@@ -242,60 +65,24 @@ class TestLokiRelationHandlers:
     def _make_charm_stub(self):
         from charm import MicroCloudCharm
 
-        return MagicMock(spec=MicroCloudCharm)
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._observability = MagicMock(spec=Observability)
+        stub._loki_consumer = MagicMock()
+        return stub
 
-    def test_joined_calls_ensure_lxd_loki_config(self):
+    def test_joined_points_lxd_at_the_published_endpoints(self):
         from charm import MicroCloudCharm
 
         stub = self._make_charm_stub()
         MicroCloudCharm._on_loki_push_api_endpoint_joined(stub, MagicMock())
-        stub._ensure_lxd_loki_config.assert_called_once()
+        stub._observability.ensure_loki.assert_called_once_with(stub._loki_consumer.loki_endpoints)
 
-    def test_departed_calls_teardown_lxd_loki_config(self):
+    def test_departed_stops_lxd_streaming_logs(self):
         from charm import MicroCloudCharm
 
         stub = self._make_charm_stub()
         MicroCloudCharm._on_loki_push_api_endpoint_departed(stub, MagicMock())
-        stub._teardown_lxd_loki_config.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# _lxd_has_api_extension
-# ---------------------------------------------------------------------------
-
-
-class TestLxdHasApiExtension:
-    def test_true_when_extension_present(self):
-        from charm import _lxd_has_api_extension
-
-        result = MagicMock(stdout=json.dumps({"api_extensions": ["loki", "other"]}))
-        with patch("charm.subprocess.run", return_value=result):
-            assert _lxd_has_api_extension("loki") is True
-
-    def test_false_when_extension_absent(self):
-        from charm import _lxd_has_api_extension
-
-        result = MagicMock(stdout=json.dumps({"api_extensions": ["other"]}))
-        with patch("charm.subprocess.run", return_value=result):
-            assert _lxd_has_api_extension("loki") is False
-
-    def test_false_on_subprocess_error(self):
-        import subprocess
-
-        from charm import _lxd_has_api_extension
-
-        with patch(
-            "charm.subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "lxc"),
-        ):
-            assert _lxd_has_api_extension("loki") is False
-
-    def test_false_on_invalid_json(self):
-        from charm import _lxd_has_api_extension
-
-        result = MagicMock(stdout="not json")
-        with patch("charm.subprocess.run", return_value=result):
-            assert _lxd_has_api_extension("loki") is False
+        stub._observability.teardown_loki.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -455,191 +242,6 @@ class TestOVNExporter:
             with patch("ovn_exporter._run") as mock_run:
                 ovn.remove()
                 mock_run.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Scrape config generation (via charm._build_scrape_configs)
-# ---------------------------------------------------------------------------
-
-
-class TestScrapeConfigs:
-    """Test the scrape config generation logic without a full Harness."""
-
-    def _make_charm_stub(self, config: dict, unit_name: str = "microcloud/0"):
-        """Create a minimal stub that exercises _build_scrape_configs."""
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._ceph = None
-        stub._ovn = None
-        stub.config = config
-        stub.app.name = "microcloud"
-        stub.unit.name = unit_name
-        stub._build_scrape_configs = lambda: MicroCloudCharm._build_scrape_configs(stub)
-        stub._cluster_label = lambda: MicroCloudCharm._cluster_label(stub)
-        stub._member_label = lambda: MicroCloudCharm._member_label(stub)
-        return stub
-
-    def test_all_services_enabled(self, tmp_path):
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-
-        stub._ceph = CephMgrPrometheus(port=9283)
-        stub._ovn = OVNExporter()
-
-        with (
-            patch.object(stub._ceph, "is_mgr_active", return_value=True),
-            patch("charm.snap.is_installed", return_value=True),
-            patch("microcloud.socket.gethostname", return_value="node1"),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        job_names = [c["job_name"] for c in configs]
-        assert "microcloud-lxd" in job_names
-        assert "microcloud-microceph" in job_names
-        assert "microcloud-microovn" in job_names
-
-    def test_microceph_job_honors_intrinsic_instance_labels(self):
-        """Ceph mgr's own per-host "instance" labels (e.g. ceph_disk_occupation)
-
-        must survive scraping untouched, otherwise Prometheus renames them to
-        "exported_instance" and overwrites "instance" with the scrape target
-        address, which is identical on every unit and collapses per-host
-        panels/variables in the bundled dashboards.
-        """
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-            }
-        )
-        stub._ceph = CephMgrPrometheus(port=9283)
-        stub._ovn = OVNExporter()
-
-        with (
-            patch.object(stub._ceph, "is_mgr_active", return_value=True),
-            patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"),
-            patch("microcloud.socket.gethostname", return_value="node1"),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        ceph_job = next(c for c in configs if c["job_name"] == "microcloud-microceph")
-        assert ceph_job["honor_labels"] is True
-
-    def test_microceph_job_relabels_fallback_instance_to_member(self):
-        """Metrics lacking their own "instance" label fall back to the scrape
-
-        target (127.0.0.1:<port>), which is meaningless and identical across
-        units; it must be rewritten to this unit's member name.
-        """
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-            }
-        )
-        stub._ceph = CephMgrPrometheus(port=9283)
-        stub._ovn = OVNExporter()
-
-        with (
-            patch.object(stub._ceph, "is_mgr_active", return_value=True),
-            patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"),
-            patch("microcloud.socket.gethostname", return_value="node1"),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-            expected_member = stub._member_label()
-
-        ceph_job = next(c for c in configs if c["job_name"] == "microcloud-microceph")
-        relabel = ceph_job["metric_relabel_configs"][0]
-        assert relabel["source_labels"] == ["instance"]
-        assert relabel["regex"] == "127\\.0\\.0\\.1:9283"
-        assert relabel["replacement"] == expected_member
-
-    def test_lxd_job_uses_https_with_ca_file(self):
-        """LXD scrape job must use https scheme and trust the cluster cert via ca_file.
-
-        core.metrics_authentication=false removes the need for a client cert,
-        but the metrics endpoint always speaks TLS — the scrape job must use
-        https and supply ca_file so the collector can verify the self-signed
-        LXD cluster certificate.
-        """
-        from charm import _LXD_METRICS_ADDRESS, MicroCloudCharm
-
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-        stub._ceph = CephMgrPrometheus()
-        stub._ovn = OVNExporter()
-
-        with (
-            patch("charm.snap.is_installed", return_value=False),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        lxd_job = next(c for c in configs if c["job_name"] == "microcloud-lxd")
-        assert lxd_job["scheme"] == "https", "LXD scrape job must use https"
-        assert lxd_job["static_configs"][0]["targets"] == [_LXD_METRICS_ADDRESS]
-
-        tls = lxd_job.get("tls_config", {})
-        assert tls, "LXD scrape job must have tls_config"
-        assert "cert_file" not in tls, "No client cert required — metrics_authentication=false"
-        assert "key_file" not in tls, "No client key required — metrics_authentication=false"
-
-    def test_lxd_always_enabled_when_no_other_snaps(self):
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-        stub._ceph = CephMgrPrometheus()
-        stub._ovn = OVNExporter()
-
-        with (
-            patch("charm.snap.is_installed", return_value=False),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        job_names = [c["job_name"] for c in configs]
-        assert job_names == ["microcloud-lxd"]
-
-    def test_cluster_label_falls_back_to_app_name(self):
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-        stub._ceph = CephMgrPrometheus()
-        stub._ovn = OVNExporter()
-
-        from charm import MicroCloudCharm
-
-        assert MicroCloudCharm._cluster_label(stub) == "microcloud"
 
 
 # ---------------------------------------------------------------------------

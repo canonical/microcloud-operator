@@ -51,8 +51,6 @@ logging-relation-broken
 
 import json
 import logging
-import re
-import subprocess
 import time
 import uuid
 from typing import Any
@@ -65,25 +63,13 @@ import lxd_cluster
 import microcloud
 import session
 import snap
-from ceph_mgr import CephMgrError, CephMgrPrometheus
 from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_membership
 from failure_domains import FailureDomains
 from network import UnitNetwork
-from ovn_exporter import OVNExporter, OVNExporterError
+from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
 from preseed import PreseedInputs, SystemEntry, render
 
 logger = logging.getLogger(__name__)
-
-# Dashboard JSON directories — one per service.
-_DASHBOARD_DIRS = [
-    "./src/dashboards/lxd",
-    "./src/dashboards/microceph",
-    "./src/dashboards/microovn",
-]
-_ALERT_RULES_DIR = "./src/prometheus_alert_rules"
-
-# LXD metrics address — dedicated loopback listener, always TLS.
-_LXD_METRICS_ADDRESS = "127.0.0.1:8444"
 
 # How long past its session timeout a join session is assumed to have ended,
 # for a new leader deciding whether it may open another.
@@ -92,10 +78,6 @@ _SESSION_GRACE = 120
 # How many join sessions in a row may fail before the leader stops opening
 # the next one straight away and blocks, retrying only on later hooks.
 _SESSION_RETRIES = 3
-
-
-class LXDConfigError(Exception):
-    """Raised when an LXD configuration operation fails."""
 
 
 class JoinSessionEndedEvent(ops.EventBase):
@@ -118,13 +100,10 @@ class MicroCloudCharm(ops.CharmBase):
         super().__init__(*args)
         self._stored.set_default(session_failures=0, worker_pid=0, worker_session="")
 
-        # Lazy-initialised observability helpers.
-        self._ceph: CephMgrPrometheus | None = None
-        self._ovn: OVNExporter | None = None
-
         self._coordinator = ClusterCoordinator(self)
         self._failure_domains = FailureDomains(self.config)
         self._network = UnitNetwork(self.model, self.config)
+        self._observability = Observability(self.config, self.app.name)
 
         # Set once the deploy path reports a transitional status of its own,
         # so the generic status at the end of reconciliation does not
@@ -133,10 +112,10 @@ class MicroCloudCharm(ops.CharmBase):
 
         self._cos_agent = COSAgentProvider(
             self,
-            scrape_configs=self._build_scrape_configs,
-            dashboard_dirs=_DASHBOARD_DIRS,
-            metrics_rules_dir=_ALERT_RULES_DIR,
-            log_slots=self._log_slots(),
+            scrape_configs=self._observability.scrape_configs,
+            dashboard_dirs=DASHBOARD_DIRS,
+            metrics_rules_dir=ALERT_RULES_DIR,
+            log_slots=self._observability.log_slots(),
             refresh_events=[
                 self.on.config_changed,
                 self.on.update_status,
@@ -185,37 +164,11 @@ class MicroCloudCharm(ops.CharmBase):
         self.framework.observe(self.on.dump_metrics_config_action, self._on_dump_metrics_config)
 
     # ------------------------------------------------------------------
-    # Helpers factory
-    # ------------------------------------------------------------------
-
-    def _make_helpers(self) -> None:
-        self._ceph = CephMgrPrometheus(
-            port=int(self.config.get("ceph-mgr-prometheus-port", 9283)),
-            rbd_stats_pools=self.config.get("ceph-rbd-stats-pools", ""),
-            enable_perf_metrics=self.config.get("ceph-enable-perf-metrics", False),
-        )
-        self._ovn = OVNExporter(
-            channel=self.config.get("ovn-exporter-channel", "latest/edge"),
-        )
-
-    # ------------------------------------------------------------------
     # Mode detection
     # ------------------------------------------------------------------
 
     def _cos_related(self) -> bool:
         return bool(self.model.relations.get("cos-agent"))
-
-    def _log_slots(self) -> list[str]:
-        """Snap log slots to advertise over cos-agent.
-
-        The microceph snap exposes its logs via a "ceph-logs" content-interface
-        slot, so we can forward them without any custom log-shipping logic.
-        LXD and microovn do not (yet) expose an equivalent slot.
-        """
-        slots: list[str] = []
-        if snap.is_installed("microceph"):
-            slots.append("microceph:ceph-logs")
-        return slots
 
     # ------------------------------------------------------------------
     # Core hook handlers
@@ -238,23 +191,22 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _on_stop(self, event: ops.StopEvent) -> None:
         if self._cos_related():
-            self._teardown_observability(full_cleanup=False)
+            self._observability.teardown(full_cleanup=False)
 
     def _on_remove(self, event: ops.RemoveEvent) -> None:
         # Never destroy the MicroCloud cluster itself; only clean up
         # observability artifacts this charm created.
-        self._teardown_observability(full_cleanup=True)
+        self._observability.teardown(full_cleanup=True)
 
     # ------------------------------------------------------------------
     # cos-agent handlers
     # ------------------------------------------------------------------
 
     def _on_cos_agent_relation_joined(self, event: ops.RelationEvent) -> None:
-        self._setup_observability()
         self._reconcile()
 
     def _on_cos_agent_relation_broken(self, event: ops.RelationBrokenEvent) -> None:
-        self._teardown_observability(full_cleanup=True)
+        self._observability.teardown(full_cleanup=True)
         self._reconcile()
 
     # ------------------------------------------------------------------
@@ -262,10 +214,10 @@ class MicroCloudCharm(ops.CharmBase):
     # ------------------------------------------------------------------
 
     def _on_loki_push_api_endpoint_joined(self, event: ops.EventBase) -> None:
-        self._ensure_lxd_loki_config()
+        self._observability.ensure_loki(self._loki_consumer.loki_endpoints)
 
     def _on_loki_push_api_endpoint_departed(self, event: ops.RelationEvent) -> None:
-        self._teardown_lxd_loki_config()
+        self._observability.teardown_loki()
 
     # ------------------------------------------------------------------
     # Reconciliation
@@ -273,8 +225,6 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _reconcile(self) -> None:
         """Drive deployment or observe-only mode, then set status."""
-        self._make_helpers()
-
         ovn_uplink_interface, problem = self._network.ovn_uplink_interface()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -343,10 +293,11 @@ class MicroCloudCharm(ops.CharmBase):
             return
 
         if self._cos_related():
-            obs_problem = self._reconcile_observability()
+            obs_problem = self._observability.reconcile()
             if obs_problem:
                 self.unit.status = ops.BlockedStatus(obs_problem)
                 return
+            self._cos_agent_refresh()
 
         if self._status_held:
             return
@@ -718,96 +669,8 @@ class MicroCloudCharm(ops.CharmBase):
     # Observability
     # ------------------------------------------------------------------
 
-    def _setup_observability(self) -> None:
-        self._make_helpers()
-
-    def _reconcile_observability(self) -> str | None:
-        """Idempotently ensure metrics endpoints exist. Returns problem or None."""
-        errors: list[str] = []
-
-        try:
-            self._ensure_lxd_metrics_config()
-        except LXDConfigError as exc:
-            errors.append(f"LXD metrics config: {exc}")
-
-        if snap.is_installed("microceph"):
-            try:
-                self._ceph.ensure_enabled()
-            except CephMgrError as exc:
-                errors.append(f"Ceph mgr: {exc}")
-
-        if snap.is_installed("microovn"):
-            try:
-                self._ovn.ensure_installed()
-            except OVNExporterError as exc:
-                errors.append(f"OVN exporter: {exc}")
-
-        if errors:
-            return "; ".join(errors)
-
-        self._cos_agent_refresh()
-        return None
-
-    def _teardown_observability(self, *, full_cleanup: bool) -> None:
-        self._make_helpers()
-        try:
-            _lxc_config_set("core.metrics_address", "")
-            _lxc_config_set("core.metrics_authentication", "true")
-        except LXDConfigError as exc:
-            logger.warning("Cannot reset LXD metrics config during teardown: %s", exc)
-
-        if full_cleanup and snap.is_installed("microovn"):
-            try:
-                self._ovn.remove()
-            except OVNExporterError as exc:
-                logger.warning("Cannot remove ovn-exporter during teardown: %s", exc)
-
     def _cos_agent_refresh(self) -> None:
         self._cos_agent._on_refresh(None)
-
-    def _ensure_lxd_metrics_config(self) -> None:
-        """Set core.metrics_address and core.metrics_authentication on LXD."""
-        _lxc_config_set("core.metrics_address", _LXD_METRICS_ADDRESS)
-        _lxc_config_set("core.metrics_authentication", "false")
-
-    def _ensure_lxd_loki_config(self) -> None:
-        """Point LXD's native Loki client at the related Loki push endpoint."""
-        endpoints = self._loki_consumer.loki_endpoints
-        if not endpoints:
-            logger.debug("logging relation joined but no Loki endpoint published yet")
-            return
-
-        url = endpoints[0].get("url", "")
-        if not url:
-            logger.warning("Loki endpoint data is missing a url")
-            return
-
-        # LXD expects only the base API URL (protocol + host + optional port),
-        # not the full push path.
-        if url.endswith("/loki/api/v1/push"):
-            url = url[: -len("/loki/api/v1/push")]
-
-        if not _lxd_has_api_extension("loki"):
-            logger.error("LXD is missing the loki API extension; cannot stream logs to %s", url)
-            return
-
-        try:
-            _lxc_config_set("loki.api.url", url)
-        except LXDConfigError as exc:
-            logger.warning("Cannot set LXD loki.api.url: %s", exc)
-            return
-
-        logger.info("LXD is now streaming logs to Loki at %s", url)
-
-    def _teardown_lxd_loki_config(self) -> None:
-        """Stop LXD from streaming logs to Loki."""
-        try:
-            _lxc_config_set("loki.api.url", "")
-        except LXDConfigError as exc:
-            logger.warning("Cannot reset LXD loki.api.url during teardown: %s", exc)
-            return
-
-        logger.info("LXD is no longer streaming logs to Loki")
 
     # ------------------------------------------------------------------
     # Status
@@ -819,11 +682,7 @@ class MicroCloudCharm(ops.CharmBase):
             return
 
         if self._cos_related():
-            problems: list[str] = []
-            if snap.is_installed("microovn"):
-                healthy, reason = self._ovn.is_healthy()
-                if not healthy:
-                    problems.append(reason)
+            problems = self._observability.health_problems()
             if problems:
                 self.unit.status = ops.BlockedStatus("; ".join(problems))
                 return
@@ -857,140 +716,8 @@ class MicroCloudCharm(ops.CharmBase):
         event.set_results(result)
 
     def _on_dump_metrics_config(self, event: ops.ActionEvent) -> None:
-        self._make_helpers()
-        configs = self._build_scrape_configs()
+        configs = self._observability.scrape_configs()
         event.set_results({"scrape-configs": json.dumps(configs, indent=2)})
-
-    # ------------------------------------------------------------------
-    # Scrape config builder (called by COSAgentProvider)
-    # ------------------------------------------------------------------
-
-    def _build_scrape_configs(self) -> list[dict]:
-        if self._ceph is None or self._ovn is None:
-            self._make_helpers()
-
-        configs: list[dict] = []
-        cluster = self._cluster_label()
-        member = self._member_label()
-        interval = self.config.get("scrape-interval", "30s")
-
-        # ---- LXD ----
-        configs.append(
-            {
-                "job_name": "microcloud-lxd",
-                "scrape_interval": interval,
-                "metrics_path": "/1.0/metrics",
-                "scheme": "https",
-                "tls_config": {
-                    "insecure_skip_verify": True,
-                },
-                "static_configs": [
-                    {
-                        "targets": [_LXD_METRICS_ADDRESS],
-                        "labels": {
-                            "microcloud_service": "lxd",
-                            "microcloud_member": member,
-                            "microcloud_cluster": cluster,
-                        },
-                    }
-                ],
-            }
-        )
-
-        # ---- MicroCeph ----
-        if snap.is_installed("microceph") and self._ceph.is_mgr_active():
-            ceph_port = self.config.get("ceph-mgr-prometheus-port", 9283)
-            ceph_target = f"127.0.0.1:{ceph_port}"
-            configs.append(
-                {
-                    "job_name": "microcloud-microceph",
-                    "scrape_interval": interval,
-                    "metrics_path": "/metrics",
-                    # The Ceph mgr exporter tags per-host metrics (e.g.
-                    # ceph_disk_occupation) with their own "instance" label
-                    # identifying the owning host. honor_labels keeps that
-                    # label as-is instead of renaming it to
-                    # "exported_instance" and overwriting "instance" with the
-                    # scrape target address, which is identical
-                    # (127.0.0.1:<port>) on every unit and would collapse
-                    # per-host panels/variables in the bundled dashboards.
-                    "honor_labels": True,
-                    "static_configs": [
-                        {
-                            "targets": [ceph_target],
-                            "labels": {
-                                "microcloud_service": "microceph",
-                                "microcloud_member": member,
-                                "microcloud_cluster": cluster,
-                            },
-                        }
-                    ],
-                    "metric_relabel_configs": [
-                        {
-                            # Metrics without their own per-host "instance"
-                            # label (e.g. cluster-wide summaries) still fall
-                            # back to the scrape target address, which is
-                            # meaningless and identical across units.
-                            # Replace it with this unit's member name so it
-                            # stays unique and matches microcloud_member.
-                            "source_labels": ["instance"],
-                            "regex": re.escape(ceph_target),
-                            "target_label": "instance",
-                            "action": "replace",
-                            "replacement": member,
-                        },
-                    ],
-                }
-            )
-
-        # ---- MicroOVN ----
-        if snap.is_installed("microovn"):
-            ovn_port = self.config.get("ovn-exporter-listen-port", 9310)
-            configs.append(
-                {
-                    "job_name": "microcloud-microovn",
-                    "scrape_interval": interval,
-                    "metrics_path": "/metrics",
-                    "static_configs": [
-                        {
-                            "targets": [f"127.0.0.1:{ovn_port}"],
-                            "labels": {
-                                "microcloud_service": "microovn",
-                                "microcloud_member": member,
-                                "microcloud_cluster": cluster,
-                            },
-                        }
-                    ],
-                }
-            )
-
-        return configs
-
-    # ------------------------------------------------------------------
-    # Label / address helpers
-    # ------------------------------------------------------------------
-
-    def _cluster_label(self) -> str:
-        return self.app.name
-
-    def _member_label(self) -> str:
-        try:
-            result = subprocess.run(
-                ["lxc", "query", "/1.0/cluster/members"],
-                capture_output=True,
-                text=True,
-                check=True,
-                timeout=5,
-            )
-            members = json.loads(result.stdout)
-            host = microcloud.hostname()
-            for member_url in members:
-                name = member_url.rstrip("/").split("/")[-1]
-                if host.startswith(name) or name.startswith(host):
-                    return name
-        except Exception:  # noqa: BLE001
-            pass
-        return microcloud.hostname()
 
 
 def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
@@ -1020,39 +747,6 @@ def _last_line(output: str) -> str:
     """Return the last non-empty line of command output, for a status message."""
     lines = [line.strip() for line in output.splitlines() if line.strip()]
     return lines[-1] if lines else "no output"
-
-
-def _lxc_config_set(key: str, value: str) -> None:
-    """Run `lxc config set <key> <value>`.  Raise LXDConfigError on failure."""
-    try:
-        subprocess.run(
-            ["lxc", "config", "set", key, value],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except subprocess.CalledProcessError as exc:
-        raise LXDConfigError(
-            f"Cannot set LXD config {key}={value!r} (rc={exc.returncode}): {exc.stderr.strip()}"
-        ) from exc
-
-
-def _lxd_has_api_extension(name: str) -> bool:
-    """Return True if the running LXD advertises the given API extension."""
-    try:
-        result = subprocess.run(
-            ["lxc", "query", "/1.0"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=5,
-        )
-        info = json.loads(result.stdout)
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, json.JSONDecodeError) as exc:
-        logger.warning("Cannot query LXD API extensions: %s", exc)
-        return False
-
-    return name in info.get("api_extensions", [])
 
 
 if __name__ == "__main__":
