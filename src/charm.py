@@ -58,7 +58,6 @@ import uuid
 from typing import Any
 
 import ops
-import yaml
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
@@ -69,6 +68,7 @@ import snap
 from ceph_mgr import CephMgrError, CephMgrPrometheus
 from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_membership
 from failure_domains import FailureDomains
+from network import UnitNetwork
 from ovn_exporter import OVNExporter, OVNExporterError
 from preseed import PreseedInputs, SystemEntry, render
 
@@ -124,6 +124,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         self._coordinator = ClusterCoordinator(self)
         self._failure_domains = FailureDomains(self.config)
+        self._network = UnitNetwork(self.model, self.config)
 
         # Set once the deploy path reports a transitional status of its own,
         # so the generic status at the end of reconciliation does not
@@ -274,7 +275,7 @@ class MicroCloudCharm(ops.CharmBase):
         """Drive deployment or observe-only mode, then set status."""
         self._make_helpers()
 
-        ovn_uplink_interface, problem = self._ovn_uplink_interface()
+        ovn_uplink_interface, problem = self._network.ovn_uplink_interface()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
             return
@@ -284,9 +285,9 @@ class MicroCloudCharm(ops.CharmBase):
         # Publish our identity for peers as early as possible.
         self._coordinator.publish_identity(
             microcloud.hostname(),
-            self._bind_address(),
+            self._network.bind_address(),
             ovn_uplink_interface=ovn_uplink_interface,
-            ovn_underlay_ip=self._space_bind_address("ovn-underlay"),
+            ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
             storage_local_path=self._storage_local_path(),
             storage_ceph_paths=self._storage_ceph_paths(),
             initialized=initialized,
@@ -433,7 +434,7 @@ class MicroCloudCharm(ops.CharmBase):
         self, initialized: bool, pending: list[PeerSystem], passphrase: str
     ) -> str | None:
         """Leader side: follow the published join session, or open the next one."""
-        address = self._bind_address()
+        address = self._network.bind_address()
         current = self._coordinator.session()
         failure = ""
 
@@ -571,7 +572,7 @@ class MicroCloudCharm(ops.CharmBase):
             return None
 
         # A leader that lost leadership mid-session is still its initiator.
-        if current.address == self._bind_address():
+        if current.address == self._network.bind_address():
             self._hold_status(
                 ops.WaitingStatus("Waiting for the join session this unit opened to end")
             )
@@ -653,10 +654,10 @@ class MicroCloudCharm(ops.CharmBase):
             # default-space fallback for an unbound extra-binding would
             # still resolve to *some* subnet and produce an invalid
             # preseed.
-            ceph_public_network=self._space_network_cidr("ceph-public")
+            ceph_public_network=self._network.space_network_cidr("ceph-public")
             if with_ceph_storage
             else "",
-            ceph_internal_network=self._space_network_cidr("ceph-internal")
+            ceph_internal_network=self._network.space_network_cidr("ceph-internal")
             if with_ceph_storage
             else "",
             with_ovn=bool(self.config.get("snap-channel-microovn", "")),
@@ -990,95 +991,6 @@ class MicroCloudCharm(ops.CharmBase):
         except Exception:  # noqa: BLE001
             pass
         return microcloud.hostname()
-
-    def _bind_address(self) -> str:
-        """Return this unit's bind address for the peer relation."""
-        return self._space_bind_address("cluster")
-
-    def _binding_network(self, binding_name: str) -> ops.Network | None:
-        """Return the Network for the given endpoint, or None if unavailable.
-
-        Both ``get_binding()`` and accessing its ``.network`` property can
-        raise "ModelError: no network config found for binding ..." when the
-        endpoint has no usable network info at all (e.g. an extra-binding
-        left unbound with no default space fallback), so both must be
-        guarded by the same try/except.
-        """
-        try:
-            binding = self.model.get_binding(binding_name)
-            if not binding:
-                return None
-            return binding.network
-        except ops.ModelError:
-            return None
-
-    def _space_bind_address(self, binding_name: str) -> str:
-        """Return this unit's bind address for the given endpoint, if any.
-
-        Since "network-get" is evaluated per-unit, binding an endpoint (e.g.
-        the "ovn-underlay" extra-binding) to a Juju space naturally yields a
-        different address per machine, unlike a single shared config value.
-        Returns "" if the endpoint has no usable address (e.g. left unbound).
-        """
-        network = self._binding_network(binding_name)
-        if not network or not network.bind_address:
-            return ""
-        return str(network.bind_address)
-
-    def _space_network_cidr(self, binding_name: str) -> str:
-        """Return the CIDR of the subnet bound to the given extra-binding, if any.
-
-        Lets operators point Ceph's public/internal network at a Juju space
-        (via "juju deploy --bind") instead of hard-coding a CIDR. Returns ""
-        if the endpoint has no usable subnet (e.g. left unbound).
-        """
-        network = self._binding_network(binding_name)
-        if not network or not network.interfaces:
-            return ""
-        subnet = network.interfaces[0].subnet
-        return str(subnet) if subnet else ""
-
-    def _ovn_uplink_interface(self) -> tuple[str, str | None]:
-        """Resolve this unit's OVN uplink interface name.
-
-        "ovn-uplink-interface" config is either a single interface name
-        applied to every unit, or a YAML/JSON mapping of hostname to
-        interface name (for hardware where the NIC name differs per
-        machine). When it is a mapping, every unit must have an entry: a
-        unit missing from the mapping cannot safely guess an interface
-        name, so it must block rather than bootstrap without one (or
-        silently omit the OVN uplink and produce a broken cluster).
-
-        There is deliberately no extra-binding fallback here: Juju spaces
-        only track addressed interfaces, but the OVN uplink NIC is
-        normally a bare, L2-only interface with no IP, so "network-get"
-        can never resolve it.
-
-        Returns (interface, problem). "problem" is a human-readable status
-        string if reconciliation should block; "interface" is only
-        meaningful when "problem" is None.
-        """
-        raw = str(self.config.get("ovn-uplink-interface", "")).strip()
-        if not raw:
-            return "", None
-
-        try:
-            parsed = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            return "", f"Cannot parse ovn-uplink-interface: {exc}"
-
-        if not isinstance(parsed, dict):
-            return raw, None
-
-        hostname = microcloud.hostname()
-        interface = parsed.get(hostname)
-        if not interface:
-            known = sorted(str(key) for key in parsed)
-            return "", (
-                f"ovn-uplink-interface is missing an entry for hostname {hostname!r}; "
-                f"known entries: {known}"
-            )
-        return str(interface), None
 
 
 def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:

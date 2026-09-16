@@ -52,6 +52,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from ceph_mgr import CephMgrPrometheus
 from failure_domains import FailureDomains
+from network import UnitNetwork
 from ovn_exporter import OVNExporter
 
 # ---------------------------------------------------------------------------
@@ -829,169 +830,6 @@ class TestMembershipValidation:
 
 
 # ---------------------------------------------------------------------------
-# _binding_network (shared get_binding + .network access, both error-guarded)
-# ---------------------------------------------------------------------------
-
-
-class TestBindingNetwork:
-    def test_returns_network_from_binding(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        binding = MagicMock()
-        binding.network = network
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.return_value = binding
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is network
-        stub.model.get_binding.assert_called_once_with("ovn-uplink")
-
-    def test_returns_none_when_get_binding_raises(self):
-        import ops
-
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.side_effect = ops.ModelError("no such binding")
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
-
-    def test_returns_none_when_network_access_raises(self):
-        """Regression test: juju raises "no network config found for binding"
-        lazily, when accessing binding.network -- not when calling
-        get_binding() itself -- so both must be guarded by the same
-        try/except or an unbound extra-binding crashes the install hook."""
-        import ops
-
-        from charm import MicroCloudCharm
-
-        binding = MagicMock()
-        type(binding).network = property(
-            lambda self: (_ for _ in ()).throw(
-                ops.ModelError('no network config found for binding "ovn-uplink"')
-            )
-        )
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.return_value = binding
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
-
-    def test_returns_none_when_binding_falsy(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.return_value = None
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
-
-
-# ---------------------------------------------------------------------------
-# _space_network_cidr (Juju space binding -> Ceph public/internal network)
-# ---------------------------------------------------------------------------
-
-
-class TestSpaceNetworkCidr:
-    def test_returns_cidr_from_bound_subnet(self):
-        import ipaddress
-
-        from charm import MicroCloudCharm
-
-        interface = MagicMock()
-        interface.subnet = ipaddress.ip_network("10.42.0.0/24")
-        network = MagicMock()
-        network.interfaces = [interface]
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_network_cidr(stub, "ceph-public") == "10.42.0.0/24"
-        stub._binding_network.assert_called_once_with("ceph-public")
-
-    def test_returns_empty_when_no_interfaces(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        network.interfaces = []
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_network_cidr(stub, "ceph-internal") == ""
-
-    def test_returns_empty_when_network_unavailable(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = None
-
-        assert MicroCloudCharm._space_network_cidr(stub, "ceph-public") == ""
-
-
-# ---------------------------------------------------------------------------
-# _ovn_uplink_interface (config-derived, per-unit OVN uplink interface name)
-# ---------------------------------------------------------------------------
-
-
-class TestOvnUplinkInterface:
-    def test_empty_config_omits_uplink(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": ""}
-
-        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == ""
-        assert problem is None
-
-    def test_plain_string_applies_to_every_unit(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": "eth1"}
-
-        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == "eth1"
-        assert problem is None
-
-    def test_mapping_resolves_own_hostname(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": "node1: eth1\nnode2: enp5s0\n"}
-
-        with patch("charm.microcloud.hostname", return_value="node2"):
-            interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == "enp5s0"
-        assert problem is None
-
-    def test_mapping_missing_hostname_blocks(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": '{"node1": "eth1", "node2": "enp5s0"}'}
-
-        with patch("charm.microcloud.hostname", return_value="node3"):
-            interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == ""
-        assert problem is not None
-        assert "node3" in problem
-        assert "node1" in problem
-        assert "node2" in problem
-
-    def test_invalid_yaml_blocks(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": "{unbalanced: ["}
-
-        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == ""
-        assert problem is not None
-
-
-# ---------------------------------------------------------------------------
 # ClusterCoordinator: per-unit OVN uplink interface / underlay IP
 # ---------------------------------------------------------------------------
 
@@ -1088,53 +926,6 @@ peers:
 
 
 # ---------------------------------------------------------------------------
-# _space_bind_address (Juju space binding -> per-unit address, e.g. OVN underlay)
-# ---------------------------------------------------------------------------
-
-
-class TestSpaceBindAddress:
-    def test_returns_address_from_binding(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        network.bind_address = "10.42.0.5"
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == "10.42.0.5"
-        stub._binding_network.assert_called_once_with("ovn-underlay")
-
-    def test_returns_empty_when_no_bind_address(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        network.bind_address = None
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == ""
-
-    def test_returns_empty_when_network_unavailable(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = None
-
-        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == ""
-
-    def test_bind_address_delegates_to_cluster_binding(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._space_bind_address.return_value = "10.0.0.1"
-
-        assert MicroCloudCharm._bind_address(stub) == "10.0.0.1"
-        stub._space_bind_address.assert_called_once_with("cluster")
-
-
-# ---------------------------------------------------------------------------
 # _preseed_inputs (ceph public/internal network only derived with Ceph disks)
 # ---------------------------------------------------------------------------
 
@@ -1145,7 +936,8 @@ class TestPreseedInputs:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub.config = config
-        stub._space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
         return stub
 
     def test_ceph_networks_omitted_without_ceph_storage_disks(self):
@@ -1164,7 +956,7 @@ class TestPreseedInputs:
         # fallback for an endpoint that was never explicitly --bind-ed),
         # the network must not be looked up at all without Ceph disks -
         # "microcloud preseed" would otherwise reject the whole document.
-        stub._space_network_cidr.assert_not_called()
+        stub._network.space_network_cidr.assert_not_called()
 
     def test_ceph_networks_derived_with_ceph_storage_disks(self):
         from charm import MicroCloudCharm
@@ -1319,7 +1111,8 @@ class TestHeldStatus:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
 
@@ -1340,7 +1133,8 @@ class TestHeldStatus:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
@@ -1720,7 +1514,9 @@ class TestGrowCharm:
         stub._status_held = False
         stub._stored = SimpleNamespace(session_failures=0)
         stub._worker_running.return_value = False
-        stub._bind_address.return_value = "10.0.0.1"
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.bind_address.return_value = "10.0.0.1"
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._preseed_inputs.side_effect = lambda address, passphrase, entries: (
             address,
             passphrase,
@@ -2100,7 +1896,7 @@ class TestGrowCharm:
 
     def _joiner(self, systems=(), current=None):
         stub = self._stub(leader=False, systems=systems, current=current)
-        stub._bind_address.return_value = "10.0.0.2"
+        stub._network.bind_address.return_value = "10.0.0.2"
         return stub
 
     def test_joiner_waits_without_a_session(self):
@@ -2254,7 +2050,6 @@ class TestGrowCharm:
         from charm import MicroCloudCharm
         from microcloud import Member
 
-        stub._ovn_uplink_interface.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._reconcile_observe_only.return_value = None
         stub._reconcile_deploy.return_value = None
@@ -2339,7 +2134,6 @@ class TestGrowCharm:
 
         stub = self._stub(leader=True)
         self._lagging_coordinator(stub, [self._system("node1", "10.0.0.2")])
-        stub._ovn_uplink_interface.return_value = ("", None)
         stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
             stub, initialized
         )
@@ -2661,7 +2455,8 @@ class TestFailureDomains:
         from charm import MicroCloudCharm
 
         stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
@@ -2765,7 +2560,8 @@ class TestFailureDomains:
         stub = self._stub(changed=False, spreading="Spreading database roles (1 of 2)")
         stub.unit.is_leader.return_value = False
         stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_observe_only.return_value = None
         stub._cos_related.return_value = False
