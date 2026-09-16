@@ -159,6 +159,17 @@ jobs:
           sudo snap refresh --hold
           sudo systemctl mask --now unattended-upgrades.service || true
 
+      - name: Free disk space
+        # Hosted runners start with only about 14 GB free, and LXD's dir pool
+        # keeps a full copy of every unit's root filesystem, so the larger
+        # models run out of disk and take the runner down with them. The
+        # suite uses none of these preinstalled toolchains.
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache /usr/local/share/boost
+          df -h /
+
       - name: Provision Juju and LXD
         # concierge reads concierge.yaml from the working directory. The same
         # file is used for local runs, so CI and a developer machine provision

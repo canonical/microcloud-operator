@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import shlex
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +24,11 @@ LXD_ONLY_CONFIG: dict[str, str] = {
     "snap-channel-microovn": "",
 }
 
-# Forming the cluster pulls the microcloud and lxd snaps on every unit and runs
-# the initiator/joiner handshake, which is well past jubilant's default wait.
-DEPLOY_TIMEOUT_IN_SECONDS = 40 * 60
+# Forming or growing the cluster pulls the snaps on every new unit and runs a
+# join session, well past jubilant's default wait. The slowest step on CI takes
+# under ten minutes; anything much longer is stuck, and waiting for the full
+# job timeout only hides why.
+DEPLOY_TIMEOUT_IN_SECONDS = 20 * 60
 
 
 def deploy_microcloud(
@@ -46,6 +50,19 @@ def deploy_microcloud(
     )
 
 
+def machine_error(status: jubilant.Status) -> bool:
+    """Return True if Juju failed to create a machine.
+
+    A unit on such a machine only ever reads "waiting for machine", so
+    without this a wait runs its full timeout before failing. Running out of
+    disk for a new container is the usual cause.
+    """
+    return any(
+        machine.machine_status.current == "provisioning error"
+        for machine in status.machines.values()
+    )
+
+
 def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
     """Wait for convergence, allowing an old blocked status during recovery."""
     juju.wait(
@@ -54,6 +71,7 @@ def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
         # so without this the wait runs the full timeout before failing.
         error=lambda status: (
             jubilant.any_error(status, MICROCLOUD_CHARM)
+            or machine_error(status)
             or (not recovering and jubilant.any_blocked(status, MICROCLOUD_CHARM))
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
@@ -160,3 +178,95 @@ def assert_membership(juju: jubilant.Juju, expected_count: int) -> None:
     assert len(lxd_members) == expected_count, lxd_members
     assert {member["server_name"] for member in lxd_members} == set(hostnames.values())
     assert all(member["status"] == "Online" for member in lxd_members), lxd_members
+
+
+def wait_units_active(juju: jubilant.Juju, count: int) -> None:
+    """Wait until the application has ``count`` units, all of them active.
+
+    Checking the count as well matters right after "juju add-unit": until the
+    new units show up, the existing ones already read as all active.
+    """
+
+    def converged(status: jubilant.Status) -> bool:
+        app = status.apps.get(MICROCLOUD_CHARM)
+        return (
+            app is not None
+            and len(app.units) == count
+            and jubilant.all_active(status, MICROCLOUD_CHARM)
+        )
+
+    juju.wait(
+        converged,
+        error=lambda status: (
+            jubilant.any_error(status, MICROCLOUD_CHARM)
+            or machine_error(status)
+            or jubilant.any_blocked(status, MICROCLOUD_CHARM)
+        ),
+        timeout=DEPLOY_TIMEOUT_IN_SECONDS,
+        delay=10,
+    )
+
+
+def microceph_members(juju: jubilant.Juju) -> set[str]:
+    """Return the member names "microceph status" reports on the leader.
+
+    Each member is summarised on a line of its own::
+
+        MicroCeph deployment summary:
+        - juju-5cdc9f-0 (10.42.254.71)
+          Services: mds, mgr, mon
+          Disks: 0
+    """
+    output = ssh(juju, leader_unit(juju), "sudo microceph status")
+    return {line.split()[1] for line in output.splitlines() if line.startswith("- ")}
+
+
+def cluster_app_data(juju: jubilant.Juju) -> dict[str, str]:
+    """Return the application data the units share on their peer relation."""
+    unit = leader_unit(juju)
+    info = json.loads(juju.cli("show-unit", unit, "--format", "json"))[unit]
+    for relation in info.get("relation-info", []):
+        if relation["endpoint"] == "cluster":
+            return relation.get("application-data", {})
+    raise AssertionError(f"{unit} has no cluster relation: {info}")
+
+
+def session_passphrase(juju: jubilant.Juju) -> str:
+    """Return the join session passphrase the leader keeps in a Juju secret."""
+    secret_id = cluster_app_data(juju)["session-passphrase-secret-id"]
+    secret = json.loads(juju.cli("show-secret", secret_id, "--reveal", "--format", "json"))
+    [details] = secret.values()
+    content = details["content"]
+    return (content.get("Data") or content.get("data"))["passphrase"]
+
+
+def assert_no_session_state(juju: jubilant.Juju) -> None:
+    """Check that no join session is left behind once the cluster converged.
+
+    No session is still published for the units, no worker is still running
+    on any of them, and the passphrase the preseed carries was never written
+    to the charm's state or temporary files.
+    """
+    assert "join-session" not in cluster_app_data(juju), cluster_app_data(juju)
+
+    # A worker exits right after the hook it fires, which may have only just
+    # set the unit active.
+    deadline = time.monotonic() + 60
+    while True:
+        workers = {
+            unit: ssh(juju, unit, "pgrep -fa '[j]oin_session.py' || true").strip()
+            for unit in unit_names(juju)
+        }
+        if not any(workers.values()) or time.monotonic() > deadline:
+            break
+        time.sleep(5)
+    assert not any(workers.values()), workers
+
+    pattern = shlex.quote(session_passphrase(juju))
+    for unit in unit_names(juju):
+        found = ssh(
+            juju,
+            unit,
+            f"sudo grep -rlF -e {pattern} /var/lib/charm-microcloud /tmp 2>/dev/null || true",
+        )
+        assert not found.strip(), (unit, found)

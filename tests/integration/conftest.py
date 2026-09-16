@@ -7,10 +7,16 @@ built charm and at the machine shape it needs.
 
 from __future__ import annotations
 
+import logging
+import shutil
+from collections.abc import Iterator
 from pathlib import Path
 
+import jubilant
 import pytest
 import yaml
+
+logger = logging.getLogger(__name__)
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -75,3 +81,24 @@ def num_units(request: pytest.FixtureRequest) -> int:
 def charm_name() -> str:
     metadata = yaml.safe_load(Path("charmcraft.yaml").read_text())
     return metadata["name"]
+
+
+@pytest.fixture(scope="module", autouse=True)
+def report_resources(request: pytest.FixtureRequest, juju: jubilant.Juju) -> Iterator[None]:
+    """Log free disk and the model's machines once each module is done.
+
+    A runner that runs out of disk or memory dies without uploading any logs,
+    so record where each module left it while the live log still streams.
+    """
+    yield
+    usage = shutil.disk_usage("/")
+    logger.info(
+        "After %s: %.1f GiB of %.1f GiB disk free",
+        request.module.__name__,
+        usage.free / 2**30,
+        usage.total / 2**30,
+    )
+    try:
+        logger.info("Model status:\n%s", juju.cli("status"))
+    except Exception as exc:
+        logger.warning("Cannot read the model status: %s", exc)

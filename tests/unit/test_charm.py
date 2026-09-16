@@ -9,7 +9,7 @@ import json
 # during unit tests — the library is tested separately.
 import sys
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
 import pytest
@@ -748,6 +748,12 @@ class TestPreseed:
         doc = build_preseed(self._inputs())
         assert "storage" not in doc["systems"][0]
 
+    def test_lookup_timeout_included_when_set(self):
+        from preseed import build_preseed
+
+        assert "lookup_timeout" not in build_preseed(self._inputs())
+        assert build_preseed(self._inputs(lookup_timeout=300))["lookup_timeout"] == 300
+
     def test_render_produces_yaml(self):
         import yaml
 
@@ -1080,68 +1086,6 @@ peers:
             harness.cleanup()
 
 
-class TestAnyPeerAcked:
-    def _harness(self):
-        import ops.testing
-
-        harness = ops.testing.Harness(
-            ops.testing.CharmBase,
-            meta="""
-name: test-charm
-peers:
-  cluster:
-    interface: microcloud-peer
-""",
-        )
-        harness.begin()
-        return harness
-
-    def test_single_node_has_no_peers_to_ack(self):
-        """A lone leader has no joiners at all, so it must not wait forever."""
-        from cluster import ClusterCoordinator
-
-        harness = self._harness()
-        try:
-            coordinator = ClusterCoordinator(harness.charm)
-            harness.add_relation("cluster", "test-charm")
-
-            assert coordinator.any_peer_acked() is True
-        finally:
-            harness.cleanup()
-
-    def test_multi_node_waits_until_a_peer_acks(self):
-        from cluster import ClusterCoordinator
-
-        harness = self._harness()
-        try:
-            coordinator = ClusterCoordinator(harness.charm)
-            rel_id = harness.add_relation("cluster", "test-charm")
-            harness.add_relation_unit(rel_id, "test-charm/1")
-
-            assert coordinator.any_peer_acked() is False
-
-            harness.update_relation_data(
-                rel_id,
-                "test-charm/1",
-                {"microcloud-initiator-ack": "true"},
-            )
-
-            assert coordinator.any_peer_acked() is True
-        finally:
-            harness.cleanup()
-
-    def test_no_relation_returns_false(self):
-        from cluster import ClusterCoordinator
-
-        harness = self._harness()
-        try:
-            coordinator = ClusterCoordinator(harness.charm)
-
-            assert coordinator.any_peer_acked() is False
-        finally:
-            harness.cleanup()
-
-
 # ---------------------------------------------------------------------------
 # _space_bind_address (Juju space binding -> per-unit address, e.g. OVN underlay)
 # ---------------------------------------------------------------------------
@@ -1361,3 +1305,1081 @@ class TestMicroCloudWrappers:
         ):
             with pytest.raises(microcloud.MicroCloudError):
                 microcloud.list_members()
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+
+class TestHeldStatus:
+    def test_held_status_is_not_overwritten(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._status_held = False
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._cos_related.return_value = False
+        stub._coordinator = MagicMock()
+
+        def deploy(*args):
+            stub._status_held = True
+
+        stub._reconcile_deploy.side_effect = deploy
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=False),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        stub._set_status.assert_not_called()
+
+    def test_status_set_when_nothing_is_held(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._status_held = False
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._cos_related.return_value = False
+        stub._coordinator = MagicMock()
+        stub._reconcile_deploy.return_value = None
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=False),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        stub._set_status.assert_called_once_with(initialized=False)
+
+
+# ---------------------------------------------------------------------------
+# Join sessions
+# ---------------------------------------------------------------------------
+
+
+class TestSessionCoordinator:
+    """The join session the leader publishes on the peer relation."""
+
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+peers:
+  cluster:
+    interface: microcloud-peer
+""",
+        )
+        harness.set_leader(True)
+        harness.begin()
+        return harness
+
+    def test_session_round_trips(self):
+        from cluster import ClusterCoordinator, JoinSession
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            harness.add_relation("cluster", "test-charm")
+            assert coordinator.session() is None
+
+            opened = JoinSession(
+                id="abc", address="10.0.0.1", systems=["node1", "node2"], deadline=123.0
+            )
+            coordinator.publish_session(opened)
+            assert coordinator.session() == opened
+
+            coordinator.publish_session(None)
+            assert coordinator.session() is None
+        finally:
+            harness.cleanup()
+
+    def test_only_the_leader_publishes_a_session(self):
+        from cluster import ClusterCoordinator, JoinSession
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            harness.add_relation("cluster", "test-charm")
+            harness.set_leader(False)
+
+            coordinator.publish_session(JoinSession("abc", "10.0.0.1", ["node1"], 1.0))
+
+            assert coordinator.session() is None
+        finally:
+            harness.cleanup()
+
+    def test_malformed_session_is_ignored(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            harness.update_relation_data(rel_id, "test-charm", {"join-session": '{"id": 1}'})
+
+            assert coordinator.session() is None
+        finally:
+            harness.cleanup()
+
+
+class TestSession:
+    """Starting and following join session workers."""
+
+    @pytest.fixture(autouse=True)
+    def _state_dir(self, tmp_path):
+        with patch("session.STATE_DIR", tmp_path):
+            yield tmp_path
+
+    def test_start_hands_the_document_to_a_detached_worker(self, _state_dir):
+        import subprocess
+
+        import session
+
+        worker = MagicMock(pid=42)
+        with (
+            patch("session.subprocess.Popen", return_value=worker) as popen,
+            patch("session.stop") as stop,
+            patch.dict("os.environ", {"JUJU_CONTEXT_ID": "microcloud/0-hook-1", "PATH": "/bin"}),
+        ):
+            pid = session.start(
+                "abc",
+                "passphrase: secret\n",
+                "microcloud/0",
+                Path("/charm"),
+                retry_until=123.5,
+                replacing=7,
+            )
+
+        assert pid == 42
+        stop.assert_called_once_with(7)
+        assert popen.call_args.args[0] == [
+            "/usr/bin/python3",
+            "/charm/src/join_session.py",
+            "abc",
+            str(_state_dir / "session.json"),
+            "123.5",
+            "microcloud/0",
+            "/charm",
+        ]
+
+        kwargs = popen.call_args.kwargs
+        assert kwargs["stdin"] == subprocess.PIPE
+        # The hook's own output must not be inherited, or Juju waits on it.
+        assert kwargs["stdout"] not in (None, subprocess.PIPE)
+        assert kwargs["start_new_session"] is True
+        # juju-exec refuses to run from what looks like a hook context.
+        assert "JUJU_CONTEXT_ID" not in kwargs["env"]
+        assert kwargs["env"]["PATH"] == "/bin"
+
+        worker.stdin.write.assert_called_once_with("passphrase: secret\n")
+        worker.stdin.close.assert_called_once()
+        assert "secret" not in "".join(p.read_text() for p in _state_dir.iterdir())
+
+    def test_start_failure_raises(self):
+        import session
+
+        with (
+            patch("session.subprocess.Popen", side_effect=OSError("no python3")),
+            pytest.raises(session.SessionError),
+        ):
+            session.start("abc", "doc", "microcloud/0", Path("/charm"))
+
+    def test_result_waits_for_the_worker(self, _state_dir):
+        import session
+
+        assert session.result("abc") is None
+
+        (_state_dir / "session.json").write_text(
+            json.dumps({"id": "abc", "rc": 1, "output": "Error: boom\n"})
+        )
+        assert session.result("abc") == (1, "Error: boom\n")
+
+    def test_result_ignores_another_session(self, _state_dir):
+        import session
+
+        (_state_dir / "session.json").write_text(json.dumps({"id": "abc", "rc": 0}))
+
+        assert session.result("def") is None
+
+    def test_clear_forgets_the_result(self, _state_dir):
+        import session
+
+        (_state_dir / "session.json").write_text(json.dumps({"id": "abc", "rc": 0}))
+
+        session.clear()
+
+        assert session.result("abc") is None
+
+    def test_is_running_only_matches_a_worker(self):
+        import session
+
+        assert session.is_running(0) is False
+        with patch(
+            "session.Path.read_bytes", return_value=b"/usr/bin/python3\0x/join_session.py\0"
+        ):
+            assert session.is_running(42) is True
+        # A reused PID belongs to something else.
+        with patch("session.Path.read_bytes", return_value=b"/usr/sbin/sshd\0"):
+            assert session.is_running(42) is False
+        with patch("session.Path.read_bytes", side_effect=FileNotFoundError):
+            assert session.is_running(42) is False
+
+    def test_stop_terminates_only_a_running_worker(self):
+        import signal
+
+        import session
+
+        with patch("session.is_running", return_value=True), patch("session.os.killpg") as kill:
+            session.stop(42)
+        kill.assert_called_once_with(42, signal.SIGTERM)
+
+        with patch("session.is_running", return_value=False), patch("session.os.killpg") as kill:
+            session.stop(42)
+        kill.assert_not_called()
+
+
+class TestJoinSessionWorker:
+    """The background worker itself."""
+
+    def _run(self, tmp_path, attempts, now):
+        import join_session
+
+        results = [MagicMock(returncode=rc, stdout=out, stderr="") for rc, out in attempts]
+        result_file = tmp_path / "session.json"
+        with (
+            patch("join_session.subprocess.run", side_effect=results) as run,
+            patch("join_session.time.time", side_effect=now),
+            patch("join_session.time.sleep") as sleep,
+        ):
+            rc = join_session.run("abc", "doc", str(result_file), retry_until=100.0)
+        return rc, json.loads(result_file.read_text()), run, sleep
+
+    def test_retries_until_the_session_opens(self, tmp_path):
+        rc, data, run, sleep = self._run(
+            tmp_path,
+            attempts=[(1, "No active session\n"), (1, "No active session\n"), (0, "joined\n")],
+            now=[10.0, 20.0, 30.0],
+        )
+
+        assert rc == 0
+        assert data == {
+            "id": "abc",
+            "rc": 0,
+            "output": "No active session\nNo active session\njoined\n",
+        }
+        assert run.call_count == 3
+        assert all(c.kwargs["input"] == "doc" for c in run.call_args_list)
+        assert run.call_args.args[0] == ["microcloud", "preseed"]
+        assert sleep.call_count == 2
+
+    def test_gives_up_at_the_deadline(self, tmp_path):
+        rc, data, run, _ = self._run(
+            tmp_path,
+            attempts=[(1, "No active session\n"), (1, "No active session\n")],
+            now=[50.0, 150.0],
+        )
+
+        assert rc == 1
+        assert data["rc"] == 1
+        assert run.call_count == 2
+
+    def test_dispatches_join_session_ended(self):
+        import join_session
+
+        with patch("join_session.subprocess.run") as run:
+            join_session.dispatch("microcloud/0", "/charm")
+
+        run.assert_called_once_with(
+            [
+                "/usr/bin/juju-exec",
+                "-u",
+                "microcloud/0",
+                "JUJU_DISPATCH_PATH=hooks/join_session_ended /charm/dispatch",
+            ],
+            check=False,
+        )
+
+
+class TestGrowCoordinator:
+    """Peer relation state the leader uses to tell forming from growing."""
+
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+peers:
+  cluster:
+    interface: microcloud-peer
+""",
+        )
+        harness.set_leader(True)
+        harness.begin()
+        return harness
+
+    def _publish(self, harness, rel_id, unit, name, address, initialized):
+        harness.add_relation_unit(rel_id, unit)
+        harness.update_relation_data(
+            rel_id,
+            unit,
+            {
+                "microcloud-name": name,
+                "microcloud-address": address,
+                "microcloud-initialized": "true" if initialized else "false",
+            },
+        )
+
+    def test_pending_systems_excludes_clustered_units(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", True)
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", False)
+
+            assert {s.name for s in coordinator.pending_systems()} == {"node2"}
+        finally:
+            harness.cleanup()
+
+    def test_membership_overrides_lagging_flags(self):
+        """A unit that has just joined still publishes "false" until its next hook."""
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", False)
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", False)
+
+            pending = coordinator.pending_systems({"node0", "node1"})
+            assert {s.name for s in pending} == {"node2"}
+        finally:
+            harness.cleanup()
+
+    def test_all_ready_for_pending_units_ignores_members(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            # A member of a cluster formed outside Juju, which never reports ready.
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", True)
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", False)
+            pending = [system for system in coordinator.all_systems() if system.name == "node2"]
+
+            assert coordinator.all_ready(pending) is False
+
+            harness.update_relation_data(rel_id, "test-charm/2", {"microcloud-ready": "true"})
+            assert coordinator.all_ready(pending) is True
+        finally:
+            harness.cleanup()
+
+    def test_any_initialized(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            self._publish(harness, rel_id, "test-charm/1", "node1", "10.0.0.1", False)
+            assert coordinator.any_initialized() is False
+
+            self._publish(harness, rel_id, "test-charm/2", "node2", "10.0.0.2", True)
+            assert coordinator.any_initialized() is True
+        finally:
+            harness.cleanup()
+
+
+class TestGrowCharm:
+    """Forming and growing the cluster through join sessions."""
+
+    @staticmethod
+    def _system(name, address, initialized=False):
+        from cluster import PeerSystem
+
+        return PeerSystem(name=name, address=address, initialized=initialized)
+
+    def _stub(self, *, leader, systems=(), current=None):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.is_leader.return_value = leader
+        stub.unit.name = "microcloud/0"
+        stub.charm_dir = Path("/charm")
+        stub.config = {"session-timeout": 300}
+        stub._status_held = False
+        stub._stored = SimpleNamespace(session_failures=0)
+        stub._worker_running.return_value = False
+        stub._bind_address.return_value = "10.0.0.1"
+        stub._preseed_inputs.side_effect = lambda address, passphrase, entries: (
+            address,
+            passphrase,
+            [entry.name for entry in entries],
+        )
+        stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
+        coordinator = stub._coordinator = MagicMock()
+        coordinator.all_systems.return_value = list(systems)
+        coordinator.all_ready.return_value = True
+        coordinator.any_initialized.return_value = False
+        coordinator.session.return_value = current
+        return stub
+
+    def _lead(
+        self,
+        stub,
+        *,
+        initialized,
+        pending,
+        running=False,
+        outcome=None,
+        now=1000.0,
+        ceph=True,
+        pending_after=None,
+    ):
+        """Run ``_lead_session``.
+
+        ``pending_after`` is the membership read again once a session has
+        ended, which defaults to ``pending``.
+        """
+        from charm import MicroCloudCharm
+
+        stub._pending_systems.return_value = pending if pending_after is None else pending_after
+        with (
+            patch("charm.snap.is_installed", return_value=ceph),
+            patch("charm.render", side_effect=lambda inputs: inputs),
+            patch("charm.session.result", return_value=outcome),
+            patch("charm.session.clear") as clear,
+            patch("charm.time.time", return_value=now),
+            patch("charm.microcloud.hostname", return_value="node0"),
+            patch("charm.microcloud.is_initialized", return_value=initialized),
+        ):
+            stub._worker_running.return_value = running
+            problem = MicroCloudCharm._lead_session(stub, initialized, pending, "secret")
+        return problem, stub._start_worker, clear
+
+    # ---- _lead_session: opening a session ----
+
+    def test_unclustered_leader_forms_the_cluster_with_every_unit(self):
+        import ops
+
+        systems = [self._system("node0", "10.0.0.1"), self._system("node1", "10.0.0.2")]
+        stub = self._stub(leader=True, systems=systems)
+
+        problem, start, _ = self._lead(stub, initialized=False, pending=systems)
+
+        assert problem is None
+        session_id, document = start.call_args.args
+        assert document == ("10.0.0.1", "secret", ["node0", "node1"])
+
+        opened = stub._coordinator.publish_session.call_args.args[0]
+        assert opened.id == session_id
+        assert opened.address == "10.0.0.1"
+        assert opened.systems == ["node0", "node1"]
+        assert opened.deadline > 1000.0 + 300
+        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
+        assert "Forming" in stub.unit.status.message
+
+    def test_leader_still_reports_forming_once_it_has_joined(self):
+        """The leader is clustered well before the joiners it lists have finished."""
+        from cluster import JoinSession
+
+        current = JoinSession("abc", "10.0.0.1", ["node0", "node1"], 2000.0)
+        stub = self._stub(leader=True, current=current)
+
+        self._lead(stub, initialized=True, pending=[], running=True)
+
+        assert "Forming" in stub.unit.status.message
+
+    def test_clustered_leader_lists_only_pending_units(self):
+        """Leaving the initiator out of "systems" is what makes it an add."""
+        node0 = self._system("node0", "10.0.0.1", initialized=True)
+        node1 = self._system("node1", "10.0.0.2")
+        stub = self._stub(leader=True, systems=[node0, node1])
+
+        problem, start, _ = self._lead(stub, initialized=True, pending=[node1])
+
+        assert problem is None
+        assert start.call_args.args[1] == ("10.0.0.1", "secret", ["node1"])
+        assert stub._coordinator.publish_session.call_args.args[0].systems == ["node1"]
+        assert "Joining 1 unit(s)" in stub.unit.status.message
+
+    def test_clustered_leader_without_microceph_blocks_instead_of_adding(self):
+        """MicroCloud's preseed panics adding systems to a cluster without MicroCeph."""
+        stub = self._stub(leader=True)
+
+        problem, start, _ = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], ceph=False
+        )
+
+        assert problem is not None
+        assert "MicroCeph" in problem
+        assert "1 unit(s)" in problem
+        start.assert_not_called()
+        stub._coordinator.publish_session.assert_not_called()
+
+    def test_forming_a_cluster_does_not_need_microceph(self):
+        systems = [self._system("node0", "10.0.0.1"), self._system("node1", "10.0.0.2")]
+        stub = self._stub(leader=True, systems=systems)
+
+        problem, start, _ = self._lead(stub, initialized=False, pending=systems, ceph=False)
+
+        assert problem is None
+        start.assert_called_once()
+
+    def test_clustered_leader_only_waits_for_joining_units_to_be_ready(self):
+        """Members of a cluster formed outside Juju never report ready."""
+        pending = [self._system("node1", "10.0.0.2")]
+        stub = self._stub(leader=True)
+
+        self._lead(stub, initialized=True, pending=pending)
+
+        stub._coordinator.all_ready.assert_called_once_with(pending)
+
+    def test_leader_waits_for_every_unit_to_be_ready(self):
+        import ops
+
+        stub = self._stub(leader=True)
+        stub._coordinator.all_ready.return_value = False
+
+        problem, start, _ = self._lead(
+            stub, initialized=False, pending=[self._system("node0", "10.0.0.1")]
+        )
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(stub.unit.status, ops.WaitingStatus)
+
+    def test_unclustered_leader_does_not_take_over_an_existing_cluster(self):
+        """It would bootstrap a second cluster rather than add to the first."""
+        stub = self._stub(leader=True)
+        stub._coordinator.any_initialized.return_value = True
+
+        problem, start, _ = self._lead(
+            stub, initialized=False, pending=[self._system("node0", "10.0.0.1")]
+        )
+
+        assert problem is not None
+        assert "node0" in problem
+        start.assert_not_called()
+
+    def test_failure_to_start_the_session_blocks(self):
+        import session
+
+        stub = self._stub(leader=True)
+
+        from charm import MicroCloudCharm
+
+        with (
+            patch("charm.snap.is_installed", return_value=True),
+            patch("charm.render", side_effect=lambda inputs: inputs),
+        ):
+            stub._start_worker.side_effect = session.SessionError("no worker")
+            problem = MicroCloudCharm._lead_session(
+                stub, True, [self._system("node1", "10.0.0.2")], "secret"
+            )
+
+        assert problem == "no worker"
+        stub._coordinator.publish_session.assert_not_called()
+
+    def test_nothing_to_do_without_pending_units(self):
+        stub = self._stub(leader=True)
+
+        problem, start, _ = self._lead(stub, initialized=True, pending=[])
+
+        assert problem is None
+        start.assert_not_called()
+        stub._hold_status.assert_not_called()
+
+    # ---- _lead_session: following a published session ----
+
+    def _current(self, address="10.0.0.1", deadline=2000.0):
+        from cluster import JoinSession
+
+        return JoinSession(id="abc", address=address, systems=["node1"], deadline=deadline)
+
+    def test_session_in_progress_is_left_alone(self):
+        import ops
+
+        stub = self._stub(leader=True, current=self._current())
+
+        problem, start, clear = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], running=True
+        )
+
+        assert problem is None
+        start.assert_not_called()
+        clear.assert_not_called()
+        stub._coordinator.publish_session.assert_not_called()
+        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
+
+    def test_result_counts_even_while_the_worker_is_still_running(self):
+        """The hook the worker fires once it is done runs while the worker waits on it."""
+        stub = self._stub(leader=True, current=self._current())
+
+        problem, start, clear = self._lead(
+            stub, initialized=True, pending=[], running=True, outcome=(0, "")
+        )
+
+        assert problem is None
+        clear.assert_called_once()
+        stub._coordinator.publish_session.assert_called_once_with(None)
+
+    def test_successful_session_is_cleared_and_the_next_one_opened(self):
+        node2 = self._system("node2", "10.0.0.3")
+        stub = self._stub(leader=True, current=self._current())
+
+        problem, start, clear = self._lead(
+            stub, initialized=True, pending=[node2], outcome=(0, "MicroCloud is ready\n")
+        )
+
+        assert problem is None
+        clear.assert_called_once()
+        assert stub._coordinator.publish_session.call_args_list[0].args == (None,)
+        assert start.call_args.args[1] == ("10.0.0.1", "secret", ["node2"])
+
+    def test_membership_is_read_again_once_a_session_ends(self):
+        """The session's result can land after this hook read the membership."""
+        stub = self._stub(leader=True, current=self._current())
+
+        problem, start, clear = self._lead(
+            stub,
+            initialized=True,
+            pending=[self._system("node1", "10.0.0.2")],
+            outcome=(0, "MicroCloud is ready\n"),
+            pending_after=[],
+        )
+
+        assert problem is None
+        clear.assert_called_once()
+        stub._pending_systems.assert_called_once_with(True)
+        stub._coordinator.publish_session.assert_called_once_with(None)
+        start.assert_not_called()
+
+    def test_unreadable_membership_after_a_session_blocks(self):
+        import microcloud
+
+        stub = self._stub(leader=True, current=self._current())
+        stub._pending_systems.side_effect = microcloud.MicroCloudError("boom")
+
+        problem, start, _ = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], outcome=(0, "")
+        )
+
+        assert problem == "Cannot read MicroCloud members: boom"
+        start.assert_not_called()
+
+    _REACHED_OUT = 'Searching for joining systems\nError: System "node1" hasn\'t reached out\n'
+
+    def test_failed_session_is_retried_from_the_same_hook(self):
+        """Nothing else wakes the leader once it has cleared its session."""
+        import ops
+
+        stub = self._stub(leader=True, current=self._current())
+
+        problem, start, clear = self._lead(
+            stub,
+            initialized=True,
+            pending=[self._system("node1", "10.0.0.2")],
+            outcome=(1, self._REACHED_OUT),
+        )
+
+        assert problem is None
+        clear.assert_called_once()
+        assert stub._coordinator.publish_session.call_args_list[0].args == (None,)
+        start.assert_called_once()
+        assert stub._stored.session_failures == 1
+        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
+        assert "hasn't reached out" in stub.unit.status.message
+
+    def test_sessions_that_keep_failing_block(self):
+        stub = self._stub(leader=True, current=self._current())
+        stub._stored.session_failures = 2
+
+        problem, start, clear = self._lead(
+            stub,
+            initialized=True,
+            pending=[self._system("node1", "10.0.0.2")],
+            outcome=(1, self._REACHED_OUT),
+        )
+
+        assert problem == 'Join session failed: Error: System "node1" hasn\'t reached out'
+        clear.assert_called_once()
+        stub._coordinator.publish_session.assert_called_once_with(None)
+        start.assert_not_called()
+
+    def test_successful_session_resets_the_failure_count(self):
+        stub = self._stub(leader=True, current=self._current())
+        stub._stored.session_failures = 2
+
+        self._lead(stub, initialized=True, pending=[], outcome=(0, ""))
+
+        assert stub._stored.session_failures == 0
+
+    def test_new_leader_ignores_its_own_attempt_at_a_previous_leaders_session(self):
+        """Its local result and worker are from dialling in, not from the session itself."""
+        import ops
+
+        stub = self._stub(leader=True, current=self._current(address="10.0.0.9", deadline=2000.0))
+
+        problem, start, clear = self._lead(
+            stub,
+            initialized=True,
+            pending=[self._system("node2", "10.0.0.3")],
+            running=False,
+            outcome=(0, "Successfully joined"),
+            now=1000.0,
+        )
+
+        assert problem is None
+        start.assert_not_called()
+        clear.assert_not_called()
+        stub._coordinator.publish_session.assert_not_called()
+        assert isinstance(stub.unit.status, ops.WaitingStatus)
+
+    def test_waits_for_a_previous_leaders_session_to_end(self):
+        import ops
+
+        stub = self._stub(leader=True, current=self._current(address="10.0.0.9", deadline=2000.0))
+
+        problem, start, clear = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], now=1000.0
+        )
+
+        assert problem is None
+        start.assert_not_called()
+        clear.assert_not_called()
+        assert isinstance(stub.unit.status, ops.WaitingStatus)
+
+    def test_takes_over_once_a_previous_leaders_session_has_ended(self):
+        stub = self._stub(leader=True, current=self._current(address="10.0.0.9", deadline=2000.0))
+
+        problem, start, _ = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], now=2001.0
+        )
+
+        assert problem is None
+        assert stub._coordinator.publish_session.call_args_list[0].args == (None,)
+        opened = stub._coordinator.publish_session.call_args_list[1].args[0]
+        assert opened.address == "10.0.0.1"
+        start.assert_called_once()
+
+    def test_own_session_that_vanished_is_replaced(self):
+        """E.g. the leader rebooted mid-session and lost it without a result."""
+        stub = self._stub(leader=True, current=self._current())
+
+        problem, start, _ = self._lead(
+            stub, initialized=True, pending=[self._system("node1", "10.0.0.2")]
+        )
+
+        assert problem is None
+        start.assert_called_once()
+
+    # ---- _join_session ----
+
+    def _join(self, stub, *, hostname="node1", running=False, outcome=None):
+        from charm import MicroCloudCharm
+
+        with (
+            patch("charm.render", side_effect=lambda inputs: inputs),
+            patch("charm.microcloud.hostname", return_value=hostname),
+            patch("charm.session.result", return_value=outcome),
+        ):
+            stub._worker_running.return_value = running
+            problem = MicroCloudCharm._join_session(stub, "secret")
+        return problem, stub._start_worker
+
+    def _joiner(self, systems=(), current=None):
+        stub = self._stub(leader=False, systems=systems, current=current)
+        stub._bind_address.return_value = "10.0.0.2"
+        return stub
+
+    def test_joiner_waits_without_a_session(self):
+        import ops
+
+        stub = self._joiner()
+
+        problem, start = self._join(stub)
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(stub.unit.status, ops.WaitingStatus)
+
+    def test_joiner_not_listed_waits_for_the_next_session(self):
+        stub = self._joiner(current=self._current())
+
+        problem, start = self._join(stub, hostname="node7")
+
+        assert problem is None
+        start.assert_not_called()
+        assert "next join session" in stub.unit.status.message
+
+    def test_former_leader_does_not_dial_its_own_session(self):
+        """A leader that lost leadership mid-session is still that session's initiator."""
+        stub = self._joiner(current=self._current(address="10.0.0.2"))
+
+        problem, start = self._join(stub)
+
+        assert problem is None
+        start.assert_not_called()
+        assert "this unit opened" in stub.unit.status.message
+
+    def test_joiner_dials_in_the_background_with_exactly_the_listed_systems(self):
+        import ops
+
+        from cluster import JoinSession
+
+        systems = [
+            self._system("node0", "10.0.0.1", initialized=True),
+            self._system("node1", "10.0.0.2"),
+            self._system("node2", "10.0.0.3"),
+        ]
+        current = JoinSession("abc", "10.0.0.1", ["node1", "node2"], 2000.0)
+        stub = self._joiner(systems=systems, current=current)
+
+        problem, start = self._join(stub)
+
+        assert problem is None
+        start.assert_called_once_with(
+            "abc", ("10.0.0.1", "secret", ["node1", "node2"]), retry_until=2000.0
+        )
+        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
+
+    def test_joiner_follows_its_attempt_without_restarting_it(self):
+        import ops
+
+        stub = self._joiner(current=self._current())
+
+        problem, start = self._join(stub, running=True)
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
+
+    def test_joiner_reports_a_successful_attempt_while_services_finish_joining(self):
+        import ops
+
+        stub = self._joiner(current=self._current())
+
+        problem, start = self._join(stub, outcome=(0, "Successfully joined\n"))
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
+        assert "Joined" in stub.unit.status.message
+
+    def test_joiner_waits_for_the_next_session_after_a_failed_attempt(self):
+        """The attempt already retried until the deadline; the leader opens the next session."""
+        import ops
+
+        stub = self._joiner(current=self._current())
+
+        problem, start = self._join(stub, outcome=(1, "Error: No active session\n"))
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(stub.unit.status, ops.WaitingStatus)
+        assert "Error: No active session" in stub.unit.status.message
+
+    def test_joiner_blocks_when_the_attempt_cannot_start(self):
+        import session
+        from charm import MicroCloudCharm
+
+        stub = self._joiner(current=self._current())
+        with (
+            patch("charm.render", side_effect=lambda inputs: inputs),
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.session.result", return_value=None),
+        ):
+            stub._start_worker.side_effect = session.SessionError("no worker")
+            problem = MicroCloudCharm._join_session(stub, "secret")
+
+        assert problem == "no worker"
+
+    # ---- _reconcile_deploy ----
+
+    def _deploy(self, stub, *, initialized, pending):
+        from charm import MicroCloudCharm
+
+        coordinator = stub._coordinator
+        coordinator.all_identities_published.return_value = True
+        coordinator.ensure_passphrase.return_value = "secret"
+        coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
+        stub._lead_session.return_value = None
+        stub._join_session.return_value = None
+
+        with (
+            patch("charm.snap.ensure_snaps") as ensure_snaps,
+            patch("charm.microcloud.waitready", return_value=True),
+        ):
+            problem = MicroCloudCharm._reconcile_deploy(stub, initialized, pending)
+        return problem, ensure_snaps
+
+    def test_clustered_leader_does_not_refresh_snaps(self):
+        """Refreshing here would upgrade the leader ahead of the rest of the cluster."""
+        stub = self._stub(leader=True)
+        pending = [self._system("node1", "10.0.0.2")]
+
+        problem, ensure_snaps = self._deploy(stub, initialized=True, pending=pending)
+
+        assert problem is None
+        ensure_snaps.assert_not_called()
+        stub._lead_session.assert_called_once_with(True, pending, "secret")
+
+    def test_unclustered_joiner_installs_snaps_and_joins(self):
+        stub = self._stub(leader=False)
+
+        problem, ensure_snaps = self._deploy(stub, initialized=False, pending=[])
+
+        assert problem is None
+        ensure_snaps.assert_called_once()
+        stub._coordinator.publish_ready.assert_called_once()
+        stub._join_session.assert_called_once_with("secret")
+        stub._lead_session.assert_not_called()
+
+    # ---- _reconcile ----
+
+    def _reconcile(self, stub, *, initialized, members):
+        from charm import MicroCloudCharm
+        from microcloud import Member
+
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._cos_related.return_value = False
+        stub._reconcile_observe_only.return_value = None
+        stub._reconcile_deploy.return_value = None
+        stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
+            stub, initialized
+        )
+
+        with (
+            patch("charm.microcloud.hostname", return_value="node0"),
+            patch("charm.microcloud.is_initialized", return_value=initialized),
+            patch(
+                "charm.microcloud.list_members",
+                return_value=[Member(name, "") for name in members],
+            ) as list_members,
+        ):
+            MicroCloudCharm._reconcile(stub)
+        return list_members
+
+    def _lagging_coordinator(self, stub, systems, current=None):
+        """Coordinator whose published flags all still read "not clustered"."""
+        from cluster import ClusterCoordinator
+
+        def pending_systems(members=None):
+            if members is None:
+                return list(systems)
+            return [system for system in systems if system.name not in members]
+
+        stub._coordinator = MagicMock(spec=ClusterCoordinator)
+        stub._coordinator.pending_systems.side_effect = pending_systems
+        stub._coordinator.session.return_value = current
+
+    def test_clustered_leader_observes_once_every_unit_is_a_member(self):
+        """Lagging flags right after a bootstrap must not start a new session."""
+        systems = [self._system("node1", "10.0.0.2"), self._system("node2", "10.0.0.3")]
+        stub = self._stub(leader=True)
+        self._lagging_coordinator(stub, systems)
+
+        self._reconcile(stub, initialized=True, members=["node0", "node1", "node2"])
+
+        stub._reconcile_observe_only.assert_called_once()
+        stub._reconcile_deploy.assert_not_called()
+
+    def test_clustered_leader_initiates_for_units_missing_from_membership(self):
+        node1 = self._system("node1", "10.0.0.2")
+        node2 = self._system("node2", "10.0.0.3")
+        stub = self._stub(leader=True)
+        self._lagging_coordinator(stub, [node1, node2])
+
+        self._reconcile(stub, initialized=True, members=["node0", "node1"])
+
+        stub._reconcile_deploy.assert_called_once_with(True, [node2])
+        stub._reconcile_observe_only.assert_not_called()
+
+    def test_clustered_leader_follows_its_session_to_the_end(self):
+        """Every unit is a member, but the published session still needs clearing."""
+        stub = self._stub(leader=True)
+        self._lagging_coordinator(stub, [], current=self._current())
+
+        self._reconcile(stub, initialized=True, members=["node0", "node1"])
+
+        stub._reconcile_deploy.assert_called_once_with(True, [])
+
+    def test_clustered_non_leader_observes_without_reading_membership(self):
+        stub = self._stub(leader=False)
+        self._lagging_coordinator(stub, [self._system("node1", "10.0.0.2")])
+
+        list_members = self._reconcile(stub, initialized=True, members=[])
+
+        list_members.assert_not_called()
+        stub._reconcile_observe_only.assert_called_once()
+        stub._reconcile_deploy.assert_not_called()
+
+    def test_unreadable_membership_blocks(self):
+        import ops
+
+        import microcloud
+        from charm import MicroCloudCharm
+
+        stub = self._stub(leader=True)
+        self._lagging_coordinator(stub, [self._system("node1", "10.0.0.2")])
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
+            stub, initialized
+        )
+
+        with (
+            patch("charm.microcloud.hostname", return_value="node0"),
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch(
+                "charm.microcloud.list_members",
+                side_effect=microcloud.MicroCloudError("boom"),
+            ),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        assert isinstance(stub.unit.status, ops.BlockedStatus)
+        stub._reconcile_deploy.assert_not_called()
+        stub._reconcile_observe_only.assert_not_called()
+
+
+class TestSessionWorkerHelpers:
+    """The charm's bookkeeping for its one join session worker."""
+
+    def _stub(self, pid=0, session_id=""):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.name = "microcloud/0"
+        stub.charm_dir = Path("/charm")
+        stub._stored = SimpleNamespace(worker_pid=pid, worker_session=session_id)
+        return stub
+
+    def test_worker_for_another_session_is_not_running(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub(pid=42, session_id="old")
+        with patch("charm.session.is_running", return_value=True):
+            assert MicroCloudCharm._worker_running(stub, "abc") is False
+            assert MicroCloudCharm._worker_running(stub, "old") is True
+
+    def test_start_worker_replaces_the_previous_one(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub(pid=42, session_id="old")
+        with patch("charm.session.start", return_value=99) as start:
+            MicroCloudCharm._start_worker(stub, "abc", "doc", retry_until=5.0)
+
+        start.assert_called_once_with(
+            "abc", "doc", "microcloud/0", Path("/charm"), retry_until=5.0, replacing=42
+        )
+        assert (stub._stored.worker_pid, stub._stored.worker_session) == (99, "abc")
