@@ -51,6 +51,7 @@ sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from ceph_mgr import CephMgrPrometheus
+from failure_domains import FailureDomains
 from ovn_exporter import OVNExporter
 
 # ---------------------------------------------------------------------------
@@ -2215,7 +2216,8 @@ class TestGrowCharm:
         coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
         stub._lead_session.return_value = None
         stub._join_session.return_value = None
-        stub._zone_missing.return_value = False
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.zone_missing.return_value = False
 
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
@@ -2256,8 +2258,9 @@ class TestGrowCharm:
         stub._cos_related.return_value = False
         stub._reconcile_observe_only.return_value = None
         stub._reconcile_deploy.return_value = None
-        stub._reconcile_failure_domain.return_value = (None, False)
-        stub._reconcile_role_spread.return_value = None
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.reconcile.return_value = (None, False)
+        stub._failure_domains.wait_for_spread.return_value = None
         stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
             stub, initialized
         )
@@ -2614,37 +2617,22 @@ class TestLxdCluster:
 
 
 class TestFailureDomains:
-    """Carrying each unit's zone through to its LXD failure domain."""
+    """How the charm uses this unit's zone and LXD failure domain."""
 
-    def _stub(self, *, require_zone=True, zone="zone-1"):
+    def _stub(self, *, zone_missing=False, changed=True, spreading=None):
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"require-zone": require_zone}
-        stub._zone.return_value = zone
-        stub._zone_missing.side_effect = lambda: MicroCloudCharm._zone_missing(stub)
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.zone_missing.return_value = zone_missing
+        stub._failure_domains.reconcile.return_value = (None, changed)
+        stub._failure_domains.wait_for_spread.return_value = spreading
         return stub
-
-    def test_zone_comes_from_the_hook_environment(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        with patch.dict("os.environ", {"JUJU_AVAILABILITY_ZONE": " zone-1 "}):
-            assert MicroCloudCharm._zone(stub) == "zone-1"
-        with patch.dict("os.environ", {}, clear=True):
-            assert MicroCloudCharm._zone(stub) == ""
-
-    def test_zone_missing_honours_the_opt_out(self):
-        from charm import MicroCloudCharm
-
-        assert MicroCloudCharm._zone_missing(self._stub(zone="")) is True
-        assert MicroCloudCharm._zone_missing(self._stub(zone="", require_zone=False)) is False
-        assert MicroCloudCharm._zone_missing(self._stub()) is False
 
     def test_deploy_blocks_without_a_zone_before_installing_anything(self):
         from charm import MicroCloudCharm
 
-        stub = self._stub(zone="")
+        stub = self._stub(zone_missing=True)
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
             patch("charm.microcloud.hostname", return_value="node1"),
@@ -2658,7 +2646,7 @@ class TestFailureDomains:
         """The zone only gates this unit joining; it is already a member."""
         from charm import MicroCloudCharm
 
-        stub = self._stub(zone="")
+        stub = self._stub(zone_missing=True)
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
             patch("charm.microcloud.waitready", return_value=False),
@@ -2669,126 +2657,6 @@ class TestFailureDomains:
         ensure_snaps.assert_not_called()
         stub._hold_status.assert_called_once()
 
-    def _set(self, stub, members, set_side_effect=None):
-        from charm import MicroCloudCharm
-
-        with (
-            patch("charm.microcloud.hostname", return_value="node1"),
-            patch("charm.lxd_cluster.members", return_value=members),
-            patch(
-                "charm.lxd_cluster.set_failure_domain", side_effect=set_side_effect
-            ) as set_failure_domain,
-        ):
-            problem, changed = MicroCloudCharm._reconcile_failure_domain(stub)
-        return problem, changed, set_failure_domain
-
-    def test_sets_the_failure_domain_to_the_zone(self):
-        problem, changed, set_failure_domain = self._set(
-            self._stub(), [_member("node1", "default")]
-        )
-
-        assert (problem, changed) == (None, True)
-        set_failure_domain.assert_called_once_with("node1", "zone-1")
-
-    def test_leaves_a_matching_failure_domain_alone(self):
-        problem, changed, set_failure_domain = self._set(
-            self._stub(), [_member("node1", "zone-1")]
-        )
-
-        assert (problem, changed) == (None, False)
-        set_failure_domain.assert_not_called()
-
-    @pytest.mark.parametrize("require_zone", [True, False])
-    def test_leaves_the_failure_domain_alone_without_a_zone(self, require_zone):
-        """A clustered unit without a zone joined outside Juju, or zones are opted out of."""
-        problem, changed, set_failure_domain = self._set(
-            self._stub(zone="", require_zone=require_zone), [_member("node1", "rack-a")]
-        )
-
-        assert (problem, changed) == (None, False)
-        set_failure_domain.assert_not_called()
-
-    def test_blocks_when_not_an_lxd_member(self):
-        problem, _, _ = self._set(self._stub(), [_member("node2")])
-
-        assert problem == "node1 is not an LXD cluster member"
-
-    def test_blocks_when_lxd_refuses(self):
-        import lxd_cluster
-
-        problem, _, _ = self._set(
-            self._stub(),
-            [_member("node1", "default")],
-            set_side_effect=lxd_cluster.LXDClusterError("denied"),
-        )
-
-        assert problem == "Cannot set the failure domain of node1 to 'zone-1': denied"
-
-    _UNSPREAD = [
-        ("node1", "zone-1", ["database-leader"]),
-        ("node2", "zone-1", ["database-voter"]),
-        ("node3", "zone-2", ["database-voter"]),
-        ("node4", "zone-3", ["database-standby"]),
-    ]
-    _SPREAD = [
-        ("node1", "zone-1", ["database-leader"]),
-        ("node2", "zone-1", ["database-standby"]),
-        ("node3", "zone-2", ["database-voter"]),
-        ("node4", "zone-3", ["database-voter"]),
-    ]
-
-    def _spread(self, *snapshots, wait=True):
-        from charm import MicroCloudCharm
-
-        clock = iter(range(0, 1000, 5))
-        with (
-            patch(
-                "charm.lxd_cluster.members",
-                side_effect=[[_member(*m) for m in snapshot] for snapshot in snapshots],
-            ) as members,
-            patch("charm.time.monotonic", side_effect=lambda: next(clock)),
-            patch("charm.time.sleep") as sleep,
-        ):
-            waiting = MicroCloudCharm._reconcile_role_spread(self._stub(), wait=wait)
-        return waiting, members, sleep
-
-    def test_spread_roles_need_no_wait(self):
-        waiting, members, sleep = self._spread(self._SPREAD)
-
-        assert waiting is None
-        assert members.call_count == 1
-        sleep.assert_not_called()
-
-    def test_waits_in_the_hook_for_lxd_to_spread_roles(self):
-        """LXD spreads voters on its own shortly after failure domains change."""
-        waiting, members, sleep = self._spread(self._UNSPREAD, self._UNSPREAD, self._SPREAD)
-
-        assert waiting is None
-        assert members.call_count == 3
-        assert sleep.call_count == 2
-
-    def test_reports_waiting_once_the_hook_has_waited_long_enough(self):
-        waiting, members, _ = self._spread(*[self._UNSPREAD] * 20)
-
-        assert waiting == "Spreading database roles across failure domains (2 of 3)"
-        assert members.call_count < 20
-
-    def test_only_checks_once_unless_the_failure_domain_just_changed(self):
-        """Waiting in every hook would hold the machine's hook lock for nothing."""
-        waiting, members, sleep = self._spread(*[self._UNSPREAD] * 20, wait=False)
-
-        assert waiting == "Spreading database roles across failure domains (2 of 3)"
-        assert members.call_count == 1
-        sleep.assert_not_called()
-
-    def test_unreadable_cluster_does_not_hold_status(self):
-        import lxd_cluster
-        from charm import MicroCloudCharm
-
-        stub = self._stub()
-        with patch("charm.lxd_cluster.members", side_effect=lxd_cluster.LXDClusterError("boom")):
-            assert MicroCloudCharm._reconcile_role_spread(stub, wait=True) is None
-
     def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
         from charm import MicroCloudCharm
 
@@ -2797,8 +2665,6 @@ class TestFailureDomains:
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
-        stub._reconcile_failure_domain.return_value = (None, True)
-        stub._reconcile_role_spread.return_value = None
         stub._cos_related.return_value = False
 
         def hold(status):
@@ -2820,9 +2686,9 @@ class TestFailureDomains:
 
         self._reconcile(stub, initialized=initialized)
 
-        assert stub._reconcile_failure_domain.called is initialized
+        assert stub._failure_domains.reconcile.called is initialized
         if initialized:
-            stub._reconcile_role_spread.assert_called_once_with(wait=True)
+            stub._failure_domains.wait_for_spread.assert_called_once_with(wait=True)
 
     def test_waits_for_lxd_to_join_before_setting_the_failure_domain(self):
         """MicroCloud reports a joiner clustered before the initiator has added its LXD."""
@@ -2832,8 +2698,8 @@ class TestFailureDomains:
 
         self._reconcile(stub, lxd_clustered=False)
 
-        stub._reconcile_failure_domain.assert_not_called()
-        stub._reconcile_role_spread.assert_not_called()
+        stub._failure_domains.reconcile.assert_not_called()
+        stub._failure_domains.wait_for_spread.assert_not_called()
         assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
         stub._set_status.assert_not_called()
 
@@ -2854,7 +2720,7 @@ class TestFailureDomains:
             MicroCloudCharm._reconcile(stub)
 
         assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
-        stub._reconcile_failure_domain.assert_not_called()
+        stub._failure_domains.reconcile.assert_not_called()
 
     def test_reconcile_waits_while_roles_spread(self):
         import ops
@@ -2870,7 +2736,7 @@ class TestFailureDomains:
             MicroCloudCharm._reconcile(stub)
 
         assert stub.unit.status == ops.WaitingStatus("Spreading database roles (1 of 2)")
-        stub._reconcile_role_spread.assert_called_once_with(wait=False)
+        stub._failure_domains.wait_for_spread.assert_called_once_with(wait=False)
         stub._set_status.assert_not_called()
 
     def test_held_status_wins_over_spreading_roles(self):
@@ -2896,14 +2762,12 @@ class TestFailureDomains:
         stub._set_status.assert_not_called()
 
     def _spreading_stub(self):
-        stub = self._stub()
+        stub = self._stub(changed=False, spreading="Spreading database roles (1 of 2)")
         stub.unit.is_leader.return_value = False
         stub._status_held = False
         stub._ovn_uplink_interface.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_observe_only.return_value = None
-        stub._reconcile_failure_domain.return_value = (None, False)
-        stub._reconcile_role_spread.return_value = "Spreading database roles (1 of 2)"
         stub._cos_related.return_value = False
         return stub
 
