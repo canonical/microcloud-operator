@@ -10,7 +10,7 @@ import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -51,185 +51,10 @@ sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 from ceph_mgr import CephMgrPrometheus
+from failure_domains import FailureDomains
+from network import UnitNetwork
+from observability import Observability
 from ovn_exporter import OVNExporter
-
-# ---------------------------------------------------------------------------
-# _lxc_config_set helper
-# ---------------------------------------------------------------------------
-
-
-class TestLxcConfigSet:
-    def test_calls_lxc_config_set(self):
-        from charm import _lxc_config_set
-
-        with patch("charm.subprocess.run") as mock_run:
-            mock_run.return_value = MagicMock(returncode=0)
-            _lxc_config_set("core.metrics_address", "127.0.0.1:8444")
-            mock_run.assert_called_once_with(
-                ["lxc", "config", "set", "core.metrics_address", "127.0.0.1:8444"],
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-
-    def test_raises_on_failure(self):
-        import subprocess
-
-        from charm import LXDConfigError, _lxc_config_set
-
-        with patch(
-            "charm.subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "lxc", stderr="permission denied"),
-        ):
-            with pytest.raises(LXDConfigError, match="Cannot set LXD config"):
-                _lxc_config_set("core.metrics_address", "127.0.0.1:8444")
-
-
-# ---------------------------------------------------------------------------
-# _log_slots
-# ---------------------------------------------------------------------------
-
-
-class TestLogSlots:
-    def _make_charm_stub(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        return stub
-
-    def test_includes_microceph_slot_when_installed(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"):
-            assert MicroCloudCharm._log_slots(stub) == ["microceph:ceph-logs"]
-
-    def test_omits_microceph_slot_when_not_installed(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm.snap.is_installed", return_value=False):
-            assert MicroCloudCharm._log_slots(stub) == []
-
-
-# ---------------------------------------------------------------------------
-# _ensure_lxd_metrics_config
-# ---------------------------------------------------------------------------
-
-
-class TestEnsureLxdMetricsConfig:
-    def _make_charm_stub(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        return stub
-
-    def test_sets_metrics_address_and_disables_auth(self):
-        from charm import _LXD_METRICS_ADDRESS, MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set") as mock_set:
-            MicroCloudCharm._ensure_lxd_metrics_config(stub)
-            assert mock_set.call_args_list == [
-                call("core.metrics_address", _LXD_METRICS_ADDRESS),
-                call("core.metrics_authentication", "false"),
-            ]
-
-    def test_propagates_lxd_config_error(self):
-        from charm import LXDConfigError, MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")):
-            with pytest.raises(LXDConfigError, match="lxd not running"):
-                MicroCloudCharm._ensure_lxd_metrics_config(stub)
-
-
-# ---------------------------------------------------------------------------
-# _ensure_lxd_loki_config / _teardown_lxd_loki_config
-# ---------------------------------------------------------------------------
-
-
-class TestLxdLokiConfig:
-    def _make_charm_stub(self, loki_endpoints=None):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._loki_consumer = MagicMock()
-        stub._loki_consumer.loki_endpoints = loki_endpoints or []
-        return stub
-
-    def test_does_nothing_when_no_endpoints_published_yet(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(loki_endpoints=[])
-        with patch("charm._lxc_config_set") as mock_set:
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_not_called()
-
-    def test_sets_loki_api_url_stripping_push_suffix(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(
-            loki_endpoints=[{"url": "http://otelcol:3500/loki/api/v1/push"}]
-        )
-        with (
-            patch("charm._lxd_has_api_extension", return_value=True),
-            patch("charm._lxc_config_set") as mock_set,
-        ):
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_called_once_with("loki.api.url", "http://otelcol:3500")
-
-    def test_skips_when_loki_api_extension_missing(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(
-            loki_endpoints=[{"url": "http://otelcol:3500/loki/api/v1/push"}]
-        )
-        with (
-            patch("charm._lxd_has_api_extension", return_value=False),
-            patch("charm._lxc_config_set") as mock_set,
-        ):
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_not_called()
-
-    def test_swallows_lxd_config_error(self):
-        from charm import LXDConfigError, MicroCloudCharm
-
-        stub = self._make_charm_stub(loki_endpoints=[{"url": "http://otelcol:3500"}])
-        with (
-            patch("charm._lxd_has_api_extension", return_value=True),
-            patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")),
-        ):
-            # Should not raise.
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-
-    def test_ignores_endpoint_missing_url(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub(loki_endpoints=[{}])
-        with (
-            patch("charm._lxd_has_api_extension", return_value=True),
-            patch("charm._lxc_config_set") as mock_set,
-        ):
-            MicroCloudCharm._ensure_lxd_loki_config(stub)
-            mock_set.assert_not_called()
-
-    def test_teardown_clears_loki_api_url(self):
-        from charm import MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set") as mock_set:
-            MicroCloudCharm._teardown_lxd_loki_config(stub)
-            mock_set.assert_called_once_with("loki.api.url", "")
-
-    def test_teardown_swallows_lxd_config_error(self):
-        from charm import LXDConfigError, MicroCloudCharm
-
-        stub = self._make_charm_stub()
-        with patch("charm._lxc_config_set", side_effect=LXDConfigError("lxd not running")):
-            # Should not raise.
-            MicroCloudCharm._teardown_lxd_loki_config(stub)
-
 
 # ---------------------------------------------------------------------------
 # logging (Loki) relation handlers
@@ -240,60 +65,24 @@ class TestLokiRelationHandlers:
     def _make_charm_stub(self):
         from charm import MicroCloudCharm
 
-        return MagicMock(spec=MicroCloudCharm)
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._observability = MagicMock(spec=Observability)
+        stub._loki_consumer = MagicMock()
+        return stub
 
-    def test_joined_calls_ensure_lxd_loki_config(self):
+    def test_joined_points_lxd_at_the_published_endpoints(self):
         from charm import MicroCloudCharm
 
         stub = self._make_charm_stub()
         MicroCloudCharm._on_loki_push_api_endpoint_joined(stub, MagicMock())
-        stub._ensure_lxd_loki_config.assert_called_once()
+        stub._observability.ensure_loki.assert_called_once_with(stub._loki_consumer.loki_endpoints)
 
-    def test_departed_calls_teardown_lxd_loki_config(self):
+    def test_departed_stops_lxd_streaming_logs(self):
         from charm import MicroCloudCharm
 
         stub = self._make_charm_stub()
         MicroCloudCharm._on_loki_push_api_endpoint_departed(stub, MagicMock())
-        stub._teardown_lxd_loki_config.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# _lxd_has_api_extension
-# ---------------------------------------------------------------------------
-
-
-class TestLxdHasApiExtension:
-    def test_true_when_extension_present(self):
-        from charm import _lxd_has_api_extension
-
-        result = MagicMock(stdout=json.dumps({"api_extensions": ["loki", "other"]}))
-        with patch("charm.subprocess.run", return_value=result):
-            assert _lxd_has_api_extension("loki") is True
-
-    def test_false_when_extension_absent(self):
-        from charm import _lxd_has_api_extension
-
-        result = MagicMock(stdout=json.dumps({"api_extensions": ["other"]}))
-        with patch("charm.subprocess.run", return_value=result):
-            assert _lxd_has_api_extension("loki") is False
-
-    def test_false_on_subprocess_error(self):
-        import subprocess
-
-        from charm import _lxd_has_api_extension
-
-        with patch(
-            "charm.subprocess.run",
-            side_effect=subprocess.CalledProcessError(1, "lxc"),
-        ):
-            assert _lxd_has_api_extension("loki") is False
-
-    def test_false_on_invalid_json(self):
-        from charm import _lxd_has_api_extension
-
-        result = MagicMock(stdout="not json")
-        with patch("charm.subprocess.run", return_value=result):
-            assert _lxd_has_api_extension("loki") is False
+        stub._observability.teardown_loki.assert_called_once()
 
 
 # ---------------------------------------------------------------------------
@@ -453,191 +242,6 @@ class TestOVNExporter:
             with patch("ovn_exporter._run") as mock_run:
                 ovn.remove()
                 mock_run.assert_not_called()
-
-
-# ---------------------------------------------------------------------------
-# Scrape config generation (via charm._build_scrape_configs)
-# ---------------------------------------------------------------------------
-
-
-class TestScrapeConfigs:
-    """Test the scrape config generation logic without a full Harness."""
-
-    def _make_charm_stub(self, config: dict, unit_name: str = "microcloud/0"):
-        """Create a minimal stub that exercises _build_scrape_configs."""
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._ceph = None
-        stub._ovn = None
-        stub.config = config
-        stub.app.name = "microcloud"
-        stub.unit.name = unit_name
-        stub._build_scrape_configs = lambda: MicroCloudCharm._build_scrape_configs(stub)
-        stub._cluster_label = lambda: MicroCloudCharm._cluster_label(stub)
-        stub._member_label = lambda: MicroCloudCharm._member_label(stub)
-        return stub
-
-    def test_all_services_enabled(self, tmp_path):
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-
-        stub._ceph = CephMgrPrometheus(port=9283)
-        stub._ovn = OVNExporter()
-
-        with (
-            patch.object(stub._ceph, "is_mgr_active", return_value=True),
-            patch("charm.snap.is_installed", return_value=True),
-            patch("microcloud.socket.gethostname", return_value="node1"),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        job_names = [c["job_name"] for c in configs]
-        assert "microcloud-lxd" in job_names
-        assert "microcloud-microceph" in job_names
-        assert "microcloud-microovn" in job_names
-
-    def test_microceph_job_honors_intrinsic_instance_labels(self):
-        """Ceph mgr's own per-host "instance" labels (e.g. ceph_disk_occupation)
-
-        must survive scraping untouched, otherwise Prometheus renames them to
-        "exported_instance" and overwrites "instance" with the scrape target
-        address, which is identical on every unit and collapses per-host
-        panels/variables in the bundled dashboards.
-        """
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-            }
-        )
-        stub._ceph = CephMgrPrometheus(port=9283)
-        stub._ovn = OVNExporter()
-
-        with (
-            patch.object(stub._ceph, "is_mgr_active", return_value=True),
-            patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"),
-            patch("microcloud.socket.gethostname", return_value="node1"),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        ceph_job = next(c for c in configs if c["job_name"] == "microcloud-microceph")
-        assert ceph_job["honor_labels"] is True
-
-    def test_microceph_job_relabels_fallback_instance_to_member(self):
-        """Metrics lacking their own "instance" label fall back to the scrape
-
-        target (127.0.0.1:<port>), which is meaningless and identical across
-        units; it must be rewritten to this unit's member name.
-        """
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-            }
-        )
-        stub._ceph = CephMgrPrometheus(port=9283)
-        stub._ovn = OVNExporter()
-
-        with (
-            patch.object(stub._ceph, "is_mgr_active", return_value=True),
-            patch("charm.snap.is_installed", side_effect=lambda name: name == "microceph"),
-            patch("microcloud.socket.gethostname", return_value="node1"),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-            expected_member = stub._member_label()
-
-        ceph_job = next(c for c in configs if c["job_name"] == "microcloud-microceph")
-        relabel = ceph_job["metric_relabel_configs"][0]
-        assert relabel["source_labels"] == ["instance"]
-        assert relabel["regex"] == "127\\.0\\.0\\.1:9283"
-        assert relabel["replacement"] == expected_member
-
-    def test_lxd_job_uses_https_with_ca_file(self):
-        """LXD scrape job must use https scheme and trust the cluster cert via ca_file.
-
-        core.metrics_authentication=false removes the need for a client cert,
-        but the metrics endpoint always speaks TLS — the scrape job must use
-        https and supply ca_file so the collector can verify the self-signed
-        LXD cluster certificate.
-        """
-        from charm import _LXD_METRICS_ADDRESS, MicroCloudCharm
-
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-        stub._ceph = CephMgrPrometheus()
-        stub._ovn = OVNExporter()
-
-        with (
-            patch("charm.snap.is_installed", return_value=False),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        lxd_job = next(c for c in configs if c["job_name"] == "microcloud-lxd")
-        assert lxd_job["scheme"] == "https", "LXD scrape job must use https"
-        assert lxd_job["static_configs"][0]["targets"] == [_LXD_METRICS_ADDRESS]
-
-        tls = lxd_job.get("tls_config", {})
-        assert tls, "LXD scrape job must have tls_config"
-        assert "cert_file" not in tls, "No client cert required — metrics_authentication=false"
-        assert "key_file" not in tls, "No client key required — metrics_authentication=false"
-
-    def test_lxd_always_enabled_when_no_other_snaps(self):
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-        stub._ceph = CephMgrPrometheus()
-        stub._ovn = OVNExporter()
-
-        with (
-            patch("charm.snap.is_installed", return_value=False),
-            patch("charm.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
-        ):
-            from charm import MicroCloudCharm
-
-            configs = MicroCloudCharm._build_scrape_configs(stub)
-
-        job_names = [c["job_name"] for c in configs]
-        assert job_names == ["microcloud-lxd"]
-
-    def test_cluster_label_falls_back_to_app_name(self):
-        stub = self._make_charm_stub(
-            {
-                "scrape-interval": "30s",
-                "ceph-mgr-prometheus-port": 9283,
-                "ovn-exporter-listen-port": 9310,
-            }
-        )
-        stub._ceph = CephMgrPrometheus()
-        stub._ovn = OVNExporter()
-
-        from charm import MicroCloudCharm
-
-        assert MicroCloudCharm._cluster_label(stub) == "microcloud"
 
 
 # ---------------------------------------------------------------------------
@@ -828,169 +432,6 @@ class TestMembershipValidation:
 
 
 # ---------------------------------------------------------------------------
-# _binding_network (shared get_binding + .network access, both error-guarded)
-# ---------------------------------------------------------------------------
-
-
-class TestBindingNetwork:
-    def test_returns_network_from_binding(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        binding = MagicMock()
-        binding.network = network
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.return_value = binding
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is network
-        stub.model.get_binding.assert_called_once_with("ovn-uplink")
-
-    def test_returns_none_when_get_binding_raises(self):
-        import ops
-
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.side_effect = ops.ModelError("no such binding")
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
-
-    def test_returns_none_when_network_access_raises(self):
-        """Regression test: juju raises "no network config found for binding"
-        lazily, when accessing binding.network -- not when calling
-        get_binding() itself -- so both must be guarded by the same
-        try/except or an unbound extra-binding crashes the install hook."""
-        import ops
-
-        from charm import MicroCloudCharm
-
-        binding = MagicMock()
-        type(binding).network = property(
-            lambda self: (_ for _ in ()).throw(
-                ops.ModelError('no network config found for binding "ovn-uplink"')
-            )
-        )
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.return_value = binding
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
-
-    def test_returns_none_when_binding_falsy(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.model.get_binding.return_value = None
-
-        assert MicroCloudCharm._binding_network(stub, "ovn-uplink") is None
-
-
-# ---------------------------------------------------------------------------
-# _space_network_cidr (Juju space binding -> Ceph public/internal network)
-# ---------------------------------------------------------------------------
-
-
-class TestSpaceNetworkCidr:
-    def test_returns_cidr_from_bound_subnet(self):
-        import ipaddress
-
-        from charm import MicroCloudCharm
-
-        interface = MagicMock()
-        interface.subnet = ipaddress.ip_network("10.42.0.0/24")
-        network = MagicMock()
-        network.interfaces = [interface]
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_network_cidr(stub, "ceph-public") == "10.42.0.0/24"
-        stub._binding_network.assert_called_once_with("ceph-public")
-
-    def test_returns_empty_when_no_interfaces(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        network.interfaces = []
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_network_cidr(stub, "ceph-internal") == ""
-
-    def test_returns_empty_when_network_unavailable(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = None
-
-        assert MicroCloudCharm._space_network_cidr(stub, "ceph-public") == ""
-
-
-# ---------------------------------------------------------------------------
-# _ovn_uplink_interface (config-derived, per-unit OVN uplink interface name)
-# ---------------------------------------------------------------------------
-
-
-class TestOvnUplinkInterface:
-    def test_empty_config_omits_uplink(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": ""}
-
-        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == ""
-        assert problem is None
-
-    def test_plain_string_applies_to_every_unit(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": "eth1"}
-
-        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == "eth1"
-        assert problem is None
-
-    def test_mapping_resolves_own_hostname(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": "node1: eth1\nnode2: enp5s0\n"}
-
-        with patch("charm.microcloud.hostname", return_value="node2"):
-            interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == "enp5s0"
-        assert problem is None
-
-    def test_mapping_missing_hostname_blocks(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": '{"node1": "eth1", "node2": "enp5s0"}'}
-
-        with patch("charm.microcloud.hostname", return_value="node3"):
-            interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == ""
-        assert problem is not None
-        assert "node3" in problem
-        assert "node1" in problem
-        assert "node2" in problem
-
-    def test_invalid_yaml_blocks(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"ovn-uplink-interface": "{unbalanced: ["}
-
-        interface, problem = MicroCloudCharm._ovn_uplink_interface(stub)
-        assert interface == ""
-        assert problem is not None
-
-
-# ---------------------------------------------------------------------------
 # ClusterCoordinator: per-unit OVN uplink interface / underlay IP
 # ---------------------------------------------------------------------------
 
@@ -1087,53 +528,6 @@ peers:
 
 
 # ---------------------------------------------------------------------------
-# _space_bind_address (Juju space binding -> per-unit address, e.g. OVN underlay)
-# ---------------------------------------------------------------------------
-
-
-class TestSpaceBindAddress:
-    def test_returns_address_from_binding(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        network.bind_address = "10.42.0.5"
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == "10.42.0.5"
-        stub._binding_network.assert_called_once_with("ovn-underlay")
-
-    def test_returns_empty_when_no_bind_address(self):
-        from charm import MicroCloudCharm
-
-        network = MagicMock()
-        network.bind_address = None
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = network
-
-        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == ""
-
-    def test_returns_empty_when_network_unavailable(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._binding_network.return_value = None
-
-        assert MicroCloudCharm._space_bind_address(stub, "ovn-underlay") == ""
-
-    def test_bind_address_delegates_to_cluster_binding(self):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub._space_bind_address.return_value = "10.0.0.1"
-
-        assert MicroCloudCharm._bind_address(stub) == "10.0.0.1"
-        stub._space_bind_address.assert_called_once_with("cluster")
-
-
-# ---------------------------------------------------------------------------
 # _preseed_inputs (ceph public/internal network only derived with Ceph disks)
 # ---------------------------------------------------------------------------
 
@@ -1144,7 +538,8 @@ class TestPreseedInputs:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub.config = config
-        stub._space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
         return stub
 
     def test_ceph_networks_omitted_without_ceph_storage_disks(self):
@@ -1163,7 +558,7 @@ class TestPreseedInputs:
         # fallback for an endpoint that was never explicitly --bind-ed),
         # the network must not be looked up at all without Ceph disks -
         # "microcloud preseed" would otherwise reject the whole document.
-        stub._space_network_cidr.assert_not_called()
+        stub._network.space_network_cidr.assert_not_called()
 
     def test_ceph_networks_derived_with_ceph_storage_disks(self):
         from charm import MicroCloudCharm
@@ -1318,7 +713,8 @@ class TestHeldStatus:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
 
@@ -1339,7 +735,8 @@ class TestHeldStatus:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
-        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
@@ -1719,7 +1116,9 @@ class TestGrowCharm:
         stub._status_held = False
         stub._stored = SimpleNamespace(session_failures=0)
         stub._worker_running.return_value = False
-        stub._bind_address.return_value = "10.0.0.1"
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.bind_address.return_value = "10.0.0.1"
+        stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._preseed_inputs.side_effect = lambda address, passphrase, entries: (
             address,
             passphrase,
@@ -2099,7 +1498,7 @@ class TestGrowCharm:
 
     def _joiner(self, systems=(), current=None):
         stub = self._stub(leader=False, systems=systems, current=current)
-        stub._bind_address.return_value = "10.0.0.2"
+        stub._network.bind_address.return_value = "10.0.0.2"
         return stub
 
     def test_joiner_waits_without_a_session(self):
@@ -2251,10 +1650,11 @@ class TestGrowCharm:
         from charm import MicroCloudCharm
         from microcloud import Member
 
-        stub._ovn_uplink_interface.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._reconcile_observe_only.return_value = None
         stub._reconcile_deploy.return_value = None
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.reconcile.return_value = None
         stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
             stub, initialized
         )
@@ -2262,6 +1662,7 @@ class TestGrowCharm:
         with (
             patch("charm.microcloud.hostname", return_value="node0"),
             patch("charm.microcloud.is_initialized", return_value=initialized),
+            patch("charm.lxd_cluster.is_clustered", return_value=True),
             patch(
                 "charm.microcloud.list_members",
                 return_value=[Member(name, "") for name in members],
@@ -2332,7 +1733,6 @@ class TestGrowCharm:
 
         stub = self._stub(leader=True)
         self._lagging_coordinator(stub, [self._system("node1", "10.0.0.2")])
-        stub._ovn_uplink_interface.return_value = ("", None)
         stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
             stub, initialized
         )
@@ -2383,3 +1783,232 @@ class TestSessionWorkerHelpers:
             "abc", "doc", "microcloud/0", Path("/charm"), retry_until=5.0, replacing=42
         )
         assert (stub._stored.worker_pid, stub._stored.worker_session) == (99, "abc")
+
+
+# ---------------------------------------------------------------------------
+# Failure domains
+# ---------------------------------------------------------------------------
+
+
+def _member(name, domain="zone-1", roles=(), status="Online", arch="x86_64"):
+    from lxd_cluster import Member
+
+    return Member(
+        name=name, status=status, failure_domain=domain, architecture=arch, roles=list(roles)
+    )
+
+
+class TestLxdCluster:
+    """LXD cluster members and their failure domains."""
+
+    def test_members_parses_the_cluster_member_list(self):
+        import lxd_cluster
+
+        payload = json.dumps(
+            [
+                {
+                    "server_name": "node1",
+                    "status": "Online",
+                    "failure_domain": "zone-1",
+                    "architecture": "x86_64",
+                    "roles": ["database-leader", "database-voter"],
+                }
+            ]
+        )
+        with patch("lxd_cluster.subprocess.run", return_value=MagicMock(stdout=payload)) as run:
+            [member] = lxd_cluster.members()
+
+        assert run.call_args.args[0] == [
+            "lxc",
+            "query",
+            "-X",
+            "GET",
+            "/1.0/cluster/members?recursion=1",
+        ]
+        assert member.name == "node1"
+
+    @pytest.mark.parametrize(
+        ("payload", "clustered"), [({"enabled": True}, True), ({"enabled": False}, False)]
+    )
+    def test_is_clustered_reads_the_cluster_state(self, payload, clustered):
+        import lxd_cluster
+
+        with patch(
+            "lxd_cluster.subprocess.run", return_value=MagicMock(stdout=json.dumps(payload))
+        ) as run:
+            assert lxd_cluster.is_clustered() is clustered
+
+        assert run.call_args.args[0] == ["lxc", "query", "-X", "GET", "/1.0/cluster"]
+
+    def test_set_failure_domain_writes_back_the_whole_member(self):
+        """LXD empties any writable field left out, and refuses a member without groups."""
+        import lxd_cluster
+
+        member = {
+            "server_name": "node1",
+            "config": {"scheduler.instance": "all"},
+            "description": "rack 4",
+            "groups": ["default", "gpu"],
+            "roles": ["database-voter", "database-leader", "control-plane"],
+            "failure_domain": "default",
+            "status": "Online",
+        }
+        with patch(
+            "lxd_cluster.subprocess.run",
+            side_effect=[MagicMock(stdout=json.dumps(member)), MagicMock(stdout="")],
+        ) as run:
+            lxd_cluster.set_failure_domain("node1", "zone-2")
+
+        put = run.call_args_list[1].args[0]
+        assert put[:4] == ["lxc", "query", "-X", "PUT"]
+        assert put[-1] == "/1.0/cluster/members/node1"
+        assert json.loads(put[5]) == {
+            "config": {"scheduler.instance": "all"},
+            "description": "rack 4",
+            "groups": ["default", "gpu"],
+            "roles": ["control-plane"],
+            "failure_domain": "zone-2",
+        }
+
+    def test_set_failure_domain_keeps_the_legacy_database_role(self):
+        """Older LXD refuses a PUT that drops or adds "database", so it is written back as read."""
+        import lxd_cluster
+
+        member = {"groups": ["default"], "roles": ["database", "database-standby"]}
+        with patch(
+            "lxd_cluster.subprocess.run",
+            side_effect=[MagicMock(stdout=json.dumps(member)), MagicMock(stdout="")],
+        ) as run:
+            lxd_cluster.set_failure_domain("node1", "zone-2")
+
+        assert json.loads(run.call_args_list[1].args[0][5])["roles"] == ["database"]
+
+    def test_failed_query_raises(self):
+        import subprocess
+
+        import lxd_cluster
+
+        with (
+            patch(
+                "lxd_cluster.subprocess.run",
+                side_effect=subprocess.CalledProcessError(1, "lxc", stderr="Error: not clustered"),
+            ),
+            pytest.raises(lxd_cluster.LXDClusterError, match="not clustered"),
+        ):
+            lxd_cluster.members()
+
+    def test_render_table(self):
+        import lxd_cluster
+
+        table = lxd_cluster.render_table(
+            [
+                _member("node-02", "zone-2", ["database-voter", "control-plane"]),
+                _member("node-01", "zone-1", ["database-leader", "control-plane"]),
+                _member("node-10", "zone-3", [], arch="aarch64"),
+            ]
+        )
+
+        assert table.splitlines() == [
+            "NAME     ROLES                          FAILURE DOMAIN  ARCHITECTURE",
+            "node-01  database-leader,control-plane  zone-1          x86_64",
+            "node-02  database-voter,control-plane   zone-2          x86_64",
+            "node-10  -                              zone-3          aarch64",
+        ]
+
+
+class TestFailureDomains:
+    """How the charm uses this unit's zone and LXD failure domain."""
+
+    def _stub(self):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._failure_domains = MagicMock(spec=FailureDomains)
+        stub._failure_domains.reconcile.return_value = None
+        return stub
+
+    def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
+        from charm import MicroCloudCharm
+
+        stub._status_held = False
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._coordinator = MagicMock()
+        stub._reconcile_deploy.return_value = None
+        stub._reconcile_observe_only.return_value = None
+        stub._cos_related.return_value = False
+
+        def hold(status):
+            stub.unit.status = status
+            stub._status_held = True
+
+        stub._hold_status.side_effect = hold
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", side_effect=[initialized, True]),
+            patch("charm.lxd_cluster.is_clustered", return_value=lxd_clustered),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+    @pytest.mark.parametrize("initialized", [True, False])
+    def test_only_a_unit_clustered_when_the_hook_starts_sets_its_failure_domain(self, initialized):
+        """A join finishing in the background may not have brought LXD in yet."""
+        stub = self._stub()
+
+        self._reconcile(stub, initialized=initialized)
+
+        assert stub._failure_domains.reconcile.called is initialized
+
+    def test_waits_for_lxd_to_join_before_setting_the_failure_domain(self):
+        """MicroCloud reports a joiner clustered before the initiator has added its LXD."""
+        import ops
+
+        stub = self._stub()
+
+        self._reconcile(stub, lxd_clustered=False)
+
+        stub._failure_domains.reconcile.assert_not_called()
+        assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
+        stub._set_status.assert_not_called()
+
+    def test_unreadable_lxd_cluster_blocks(self):
+        import ops
+
+        import lxd_cluster
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub.unit.is_leader.return_value = False
+        stub._status_held = False
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._coordinator = MagicMock()
+        stub._reconcile_observe_only.return_value = None
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch(
+                "charm.lxd_cluster.is_clustered", side_effect=lxd_cluster.LXDClusterError("boom")
+            ),
+        ):
+            MicroCloudCharm._reconcile(stub)
+
+        assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
+        stub._failure_domains.reconcile.assert_not_called()
+
+    def test_status_action_renders_the_member_table(self):
+        from charm import MicroCloudCharm
+        from microcloud import Member
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        event = MagicMock()
+        with (
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch("charm.lxd_cluster.members", return_value=[_member("node1", "zone-1")]),
+            patch("charm.microcloud.list_members", return_value=[Member("node1", "10.0.0.1")]),
+        ):
+            MicroCloudCharm._on_status_action(stub, event)
+
+        results = event.set_results.call_args.args[0]
+        assert results["members"].splitlines()[1].split() == ["node1", "-", "zone-1", "x86_64"]
+        assert json.loads(results["microcloud-members"])[0]["name"] == "node1"

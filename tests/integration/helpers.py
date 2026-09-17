@@ -125,9 +125,9 @@ def cluster_members(juju: jubilant.Juju, unit: str | None = None) -> list[dict[s
     """Return the MicroCloud members reported by the "status" action."""
     results = run_action(juju, "status", unit)
     assert as_bool(results["initialized"]), f"MicroCloud is not initialized: {results}"
-    assert "members-error" not in results, results.get("members-error")
-    assert "members" in results, f"status action reported no members: {results}"
-    return json.loads(results["members"])
+    assert "microcloud-members-error" not in results, results.get("microcloud-members-error")
+    assert "microcloud-members" in results, f"status action reported no members: {results}"
+    return json.loads(results["microcloud-members"])
 
 
 def unit_hostnames(juju: jubilant.Juju) -> dict[str, str]:
@@ -270,3 +270,25 @@ def assert_no_session_state(juju: jubilant.Juju) -> None:
             f"sudo grep -rlF -e {pattern} /var/lib/charm-microcloud /tmp 2>/dev/null || true",
         )
         assert not found.strip(), (unit, found)
+
+
+def machine_zones(juju: jubilant.Juju, app: str = MICROCLOUD_CHARM) -> dict[str, str]:
+    """Map each unit's hostname to the zone Juju reports for its machine.
+
+    Juju renders the zone into the machine's hardware characteristics, e.g.
+    "arch=amd64 cores=0 mem=0M availability-zone=node1".
+    """
+    status = json.loads(juju.cli("status", "--format", "json"))
+    hostnames = unit_hostnames(juju)
+    zones = {}
+    for unit, details in status["applications"][app]["units"].items():
+        hardware = status["machines"][details["machine"]].get("hardware", "")
+        fields = dict(item.split("=", 1) for item in hardware.split() if "=" in item)
+        zones[hostnames[unit]] = fields.get("availability-zone", "")
+    return zones
+
+
+def lxd_members(juju: jubilant.Juju) -> dict[str, dict[str, Any]]:
+    """Map each LXD cluster member's name to its details, as LXD reports them."""
+    output = ssh(juju, leader_unit(juju), "sudo lxc query /1.0/cluster/members?recursion=1")
+    return {member["server_name"]: member for member in json.loads(output)}
