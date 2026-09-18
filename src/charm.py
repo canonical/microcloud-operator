@@ -99,7 +99,9 @@ class MicroCloudCharm(ops.CharmBase):
 
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
-        self._stored.set_default(session_failures=0, worker_pid=0, worker_session="")
+        self._stored.set_default(
+            session_failures=0, worker_pid=0, worker_session="", lxd_join_since=0.0
+        )
 
         self._coordinator = ClusterCoordinator(self)
         self._failure_domains = FailureDomains()
@@ -287,9 +289,10 @@ class MicroCloudCharm(ops.CharmBase):
                 problem = f"Cannot read the LXD cluster: {exc}"
             else:
                 if lxd_clustered:
+                    self._stored.lxd_join_since = 0.0
                     problem = self._failure_domains.reconcile()
                 else:
-                    self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
+                    problem = self._await_lxd_join()
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -304,6 +307,48 @@ class MicroCloudCharm(ops.CharmBase):
 
         if not self._status_held:
             self._set_status(initialized=microcloud.is_initialized())
+
+    def _await_lxd_join(self) -> str | None:
+        """Wait for this unit's LXD to join, or report a bootstrap that stopped half way.
+
+        MicroCloud reports a unit clustered once it has joined MicroCloud
+        itself, a little before the initiator has added its LXD, so a short
+        wait here is normal.
+
+        A bootstrap that fails between those two points never recovers,
+        though: the charm sees an initialized MicroCloud, so it treats every
+        later session as growth, and growth needs the LXD that is missing.
+        MicroCloud then rejects each session with "LXD is not initialized",
+        which names neither the service that failed nor the real state. Say
+        what actually happened instead of waiting forever.
+
+        Returns a problem string to block on, or None while still waiting.
+        """
+        now = time.time()
+
+        # A published session is the initiator still working, and LXD joins at
+        # the end of it. Keep restarting the clock while one is open so the
+        # grace below is measured from the session ending, not from the first
+        # hook that noticed LXD missing.
+        if self._coordinator.session() is not None:
+            self._stored.lxd_join_since = now
+            self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
+            return None
+
+        if not self._stored.lxd_join_since:
+            self._stored.lxd_join_since = now
+        waiting_for = now - float(self._stored.lxd_join_since)
+
+        grace = int(self.config.get("session-timeout", 300)) + _SESSION_GRACE
+        if waiting_for < grace:
+            self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
+            return None
+
+        return (
+            f"MicroCloud is initialized but LXD has not joined after {int(waiting_for)}s: "
+            "the bootstrap stopped part way and the charm cannot finish it. The last error is "
+            f"in {session.STATE_DIR / 'join-session.log'} on this unit."
+        )
 
     def _hold_status(self, status: ops.StatusBase) -> None:
         """Report a transitional status that reconciliation must not overwrite."""
