@@ -601,6 +601,12 @@ storage:
     multiple:
       range: 0-
 """,
+            config="""
+options:
+  local-device:
+    type: string
+    default: ""
+""",
         )
         harness.begin()
         return harness
@@ -610,7 +616,7 @@ storage:
 
         harness = self._harness()
         try:
-            assert MicroCloudCharm._storage_local_path(harness.charm) == ""
+            assert MicroCloudCharm._storage_local_path(harness.charm) == ("", None)
         finally:
             harness.cleanup()
 
@@ -630,7 +636,58 @@ storage:
         try:
             harness.add_storage("local", count=1, attach=True)
             location = harness.charm.model.storages["local"][0].location
-            assert MicroCloudCharm._storage_local_path(harness.charm) == str(location)
+            assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
+        finally:
+            harness.cleanup()
+
+    def test_local_device_config_names_the_device(self):
+        """Juju cannot attach a RAID, LVM volume or partition on MAAS."""
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"local-device": "/dev/md1"})
+            with patch("charm.microcloud.hostname", return_value="node1"):
+                assert MicroCloudCharm._storage_local_path(harness.charm) == ("/dev/md1", None)
+        finally:
+            harness.cleanup()
+
+    def test_local_device_accepts_a_hostname_mapping(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"local-device": "{node1: /dev/md1, node2: /dev/nvme0n1p3}"})
+            with patch("charm.microcloud.hostname", return_value="node2"):
+                path, problem = MicroCloudCharm._storage_local_path(harness.charm)
+            assert (path, problem) == ("/dev/nvme0n1p3", None)
+        finally:
+            harness.cleanup()
+
+    def test_local_device_mapping_without_this_host_blocks(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"local-device": "{node1: /dev/md1}"})
+            with patch("charm.microcloud.hostname", return_value="node9"):
+                path, problem = MicroCloudCharm._storage_local_path(harness.charm)
+            assert path == ""
+            assert problem == (
+                "local-device is missing an entry for hostname 'node9'; known entries: ['node1']"
+            )
+        finally:
+            harness.cleanup()
+
+    def test_attached_storage_wins_over_local_device(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.add_storage("local", count=1, attach=True)
+            harness.update_config({"local-device": "/dev/md1"})
+            location = harness.charm.model.storages["local"][0].location
+            assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
         finally:
             harness.cleanup()
 
@@ -715,6 +772,7 @@ class TestHeldStatus:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
 
@@ -737,6 +795,7 @@ class TestHeldStatus:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
@@ -1119,6 +1178,7 @@ class TestGrowCharm:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._preseed_inputs.side_effect = lambda address, passphrase, entries: (
             address,
             passphrase,
@@ -1933,6 +1993,7 @@ class TestFailureDomains:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
@@ -1982,6 +2043,7 @@ class TestFailureDomains:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_observe_only.return_value = None
         with (

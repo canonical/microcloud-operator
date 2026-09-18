@@ -61,6 +61,7 @@ from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import lxd_cluster
 import microcloud
+import network
 import session
 import snap
 from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_membership
@@ -230,6 +231,11 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        storage_local_path, problem = self._storage_local_path()
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
+
         initialized = microcloud.is_initialized()
 
         # Publish our identity for peers as early as possible.
@@ -238,7 +244,7 @@ class MicroCloudCharm(ops.CharmBase):
             self._network.bind_address(),
             ovn_uplink_interface=ovn_uplink_interface,
             ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
-            storage_local_path=self._storage_local_path(),
+            storage_local_path=storage_local_path,
             storage_ceph_paths=self._storage_ceph_paths(),
             initialized=initialized,
         )
@@ -605,17 +611,31 @@ class MicroCloudCharm(ops.CharmBase):
             storage_encrypt=bool(self.config.get("storage-encrypt", False)),
         )
 
-    def _storage_local_path(self) -> str:
-        """Return the device path of this unit's attached "local" Juju storage.
+    def _storage_local_path(self) -> tuple[str, str | None]:
+        """Return this unit's local storage device path.
+
+        An attached "local" Juju storage volume wins. Otherwise the
+        "local-device" config names the device, which is how local storage
+        Juju cannot attach is reached. A MAAS storage pool selects by tag,
+        and MAAS matches that tag against whole block devices when it
+        allocates a machine, so a tag on a partition, a RAID or an LVM
+        volume matches no machine at all: the unit never gets placed and
+        the storage stays pending forever.
 
         The "local" storage volume is declared with ``multiple: range: 0-1``
         in charmcraft.yaml, so at most one instance is ever attached.
-        Returns "" if none is attached.
+
+        Returns (path, problem). "path" is "" when this unit has no local
+        storage at all, which is allowed.
         """
         storages = self.model.storages["local"]
-        if not storages:
-            return ""
-        return str(storages[0].location)
+        if storages:
+            attached = str(storages[0].location)
+            if str(self.config.get("local-device", "")).strip():
+                logger.info("Ignoring local-device: %s is attached as Juju storage", attached)
+            return attached, None
+
+        return network.per_host_value(str(self.config.get("local-device", "")), "local-device")
 
     def _storage_ceph_paths(self) -> list[str]:
         """Return device paths of this unit's attached "ceph" Juju storage.

@@ -12,6 +12,39 @@ import yaml
 import microcloud
 
 
+def per_host_value(raw: str, option: str) -> tuple[str, str | None]:
+    """Resolve a config option that is one value, or a mapping per hostname.
+
+    Several options name something that differs per machine (an interface, a
+    device path). Each accepts either a single value applied everywhere, or a
+    YAML/JSON mapping of hostname to value; a unit missing from a mapping
+    cannot guess, so it blocks.
+
+    Returns (value, problem). "problem" is a human-readable status string if
+    reconciliation should block; "value" is only meaningful when it is None.
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", None
+
+    try:
+        parsed = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        return "", f"Cannot parse {option}: {exc}"
+
+    if not isinstance(parsed, dict):
+        return raw, None
+
+    hostname = microcloud.hostname()
+    value = parsed.get(hostname)
+    if not value:
+        known = sorted(str(key) for key in parsed)
+        return "", (
+            f"{option} is missing an entry for hostname {hostname!r}; known entries: {known}"
+        )
+    return str(value), None
+
+
 class UnitNetwork:
     """Helper that resolves this unit's network settings from bindings and config."""
 
@@ -86,24 +119,5 @@ class UnitNetwork:
         string if reconciliation should block; "interface" is only
         meaningful when "problem" is None.
         """
-        raw = str(self._config.get("ovn-uplink-interface", "")).strip()
-        if not raw:
-            return "", None
-
-        try:
-            parsed = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            return "", f"Cannot parse ovn-uplink-interface: {exc}"
-
-        if not isinstance(parsed, dict):
-            return raw, None
-
-        hostname = microcloud.hostname()
-        interface = parsed.get(hostname)
-        if not interface:
-            known = sorted(str(key) for key in parsed)
-            return "", (
-                f"ovn-uplink-interface is missing an entry for hostname {hostname!r}; "
-                f"known entries: {known}"
-            )
-        return str(interface), None
+        raw = str(self._config.get("ovn-uplink-interface", ""))
+        return per_host_value(raw, "ovn-uplink-interface")
