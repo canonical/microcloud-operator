@@ -12,3 +12,8 @@ __pycache__/
 src/dashboards/lxd/
 src/dashboards/microceph/
 src/dashboards/microovn/
+
+# Alert rule subdirectories and their YAML files are created at charmcraft
+# pack time by tools/fetch-alert-rules.py — do not commit them.
+src/prometheus_alert_rules/microceph/
+src/prometheus_alert_rules/microovn/
