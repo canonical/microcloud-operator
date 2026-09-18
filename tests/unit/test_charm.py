@@ -1665,7 +1665,7 @@ class TestGrowCharm:
 
     # ---- _reconcile_deploy ----
 
-    def _deploy(self, stub, *, initialized, pending):
+    def _deploy(self, stub, *, initialized, pending, uplink_problem=None):
         from charm import MicroCloudCharm
 
         coordinator = stub._coordinator
@@ -1674,6 +1674,8 @@ class TestGrowCharm:
         coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
         stub._lead_session.return_value = None
         stub._join_session.return_value = None
+        stub._network.ovn_uplink_interface.return_value = ("enp9s0", None)
+        stub._network.missing_uplink_interface.return_value = uplink_problem
 
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
@@ -1681,6 +1683,38 @@ class TestGrowCharm:
         ):
             problem = MicroCloudCharm._reconcile_deploy(stub, initialized, pending)
         return problem, ensure_snaps
+
+    def test_an_uplink_nic_that_is_missing_blocks_the_deploy(self):
+        """A cluster formed with an unknown uplink has no external network at all."""
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": "24.03/stable"}
+
+        problem, _ = self._deploy(
+            stub,
+            initialized=False,
+            pending=[],
+            uplink_problem="ovn-uplink-interface 'eth99' does not exist on node1; interfaces: []",
+        )
+
+        assert problem is not None
+        assert "does not exist" in problem
+        stub._lead_session.assert_not_called()
+
+    def test_the_uplink_nic_is_not_checked_without_microovn(self):
+        """With MicroOVN off the name never reaches the preseed, so a stale value is harmless."""
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": ""}
+
+        problem, _ = self._deploy(
+            stub,
+            initialized=False,
+            pending=[],
+            uplink_problem="ovn-uplink-interface 'eth99' does not exist on node1; interfaces: []",
+        )
+
+        assert problem is None
+        stub._network.missing_uplink_interface.assert_not_called()
+        stub._lead_session.assert_called_once()
 
     def test_clustered_leader_does_not_refresh_snaps(self):
         """Refreshing here would upgrade the leader ahead of the rest of the cluster."""

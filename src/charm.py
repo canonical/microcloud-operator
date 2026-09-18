@@ -400,6 +400,15 @@ class MicroCloudCharm(ops.CharmBase):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
 
+        # Only where the uplink is actually used: with MicroOVN disabled the
+        # interface name never reaches the preseed, and a stale value left in
+        # the config must not stop the cluster forming.
+        if self.config.get("snap-channel-microovn", ""):
+            interface, _ = self._network.ovn_uplink_interface()
+            problem = self._network.missing_uplink_interface(interface)
+            if problem:
+                return problem
+
         if not self._coordinator.all_identities_published():
             self._hold_status(ops.WaitingStatus("Waiting for all peers to report identity"))
             return None

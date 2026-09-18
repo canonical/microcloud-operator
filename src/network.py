@@ -4,6 +4,7 @@
 """This unit's network: addresses and subnets from Juju space bindings, and its OVN uplink."""
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import ops
@@ -121,3 +122,27 @@ class UnitNetwork:
         """
         raw = str(self._config.get("ovn-uplink-interface", ""))
         return per_host_value(raw, "ovn-uplink-interface")
+
+    def missing_uplink_interface(self, interface: str) -> str | None:
+        """Return a problem if ``interface`` is not a NIC on this machine.
+
+        MicroCloud accepts an interface that does not exist and simply leaves
+        the uplink out: the cluster then forms and reports ready while having
+        no UPLINK network and no default OVN network at all, so nothing it
+        hosts can reach the outside. A name that is not there is a typo, not
+        a configuration.
+
+        Only worth checking where the name is actually used, which is why the
+        caller decides: with MicroOVN disabled the value is never read, and
+        blocking on it would refuse a deployment that is perfectly valid.
+        """
+        if not interface or Path("/sys/class/net", interface).exists():
+            return None
+
+        present = sorted(
+            path.name for path in Path("/sys/class/net").iterdir() if path.name != "lo"
+        )
+        return (
+            f"ovn-uplink-interface {interface!r} does not exist on "
+            f"{microcloud.hostname()}; interfaces: {present}"
+        )
