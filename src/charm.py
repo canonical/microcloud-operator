@@ -109,6 +109,7 @@ class MicroCloudCharm(ops.CharmBase):
             scrape_configs=self._build_scrape_configs,
             dashboard_dirs=_DASHBOARD_DIRS,
             metrics_rules_dir=_ALERT_RULES_DIR,
+            recurse_rules_dirs=True,
             log_slots=self._log_slots(),
             refresh_events=[
                 self.on.config_changed,
