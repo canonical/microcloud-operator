@@ -10,6 +10,11 @@ output:
 sections:
   hide:
     - header
+    # The resolved provider version comes from whatever "init" picked, which
+    # differs between a developer's lock file and CI, and would make the
+    # freshness check fail on unrelated pull requests. The constraint itself
+    # is still shown under Requirements.
+    - providers
 
 sort:
   enabled: true
