@@ -34,6 +34,64 @@ jobs:
       - name: Unit tests
         run: tox -e unit
 
+  terraform:
+    name: Terraform module
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: terraform
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Install Terraform
+        uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          # The module needs 1.9 for the cross-variable "units" validation.
+          terraform_version: "1.9.8"
+          terraform_wrapper: false
+
+      - name: Install tflint
+        uses: terraform-linters/setup-tflint@1cf010d3c7aef302051ccdb68c14c5dc2efa34ef # v6.3.1
+        with:
+          tflint_version: v0.53.0
+
+      - name: Format
+        run: terraform fmt -check -recursive -diff
+
+      - name: Init
+        # No backend and no controller: this only fetches the provider schema.
+        run: terraform init -backend=false -input=false
+
+      - name: Validate
+        run: terraform validate
+
+      - name: Lint
+        run: |
+          tflint --init --config "${GITHUB_WORKSPACE}/.tflint.hcl"
+          tflint --config "${GITHUB_WORKSPACE}/.tflint.hcl" --format compact
+
+      - name: Test
+        # mock_provider, so no Juju controller is needed.
+        run: terraform test
+
+      - name: Documentation is current
+        # Checksum pinned like every action in this workflow: the binary is
+        # downloaded and executed, so it gets the same treatment.
+        env:
+          TFDOCS_SHA256: 34ae01772412bb11474e6718ea62113e38ff5964ee570a98c69fafe3a6dff286
+        run: |
+          curl -sSLo /tmp/terraform-docs.tar.gz \
+            https://terraform-docs.io/dl/v0.20.0/terraform-docs-v0.20.0-linux-amd64.tar.gz
+          echo "${TFDOCS_SHA256}  /tmp/terraform-docs.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/terraform-docs.tar.gz -C /tmp terraform-docs
+          /tmp/terraform-docs --config ../.terraform-docs.yml --output-check .
+
   build:
     name: Pack ubuntu@${{ matrix.base }}:${{ matrix.arch }}
     needs: [static]
