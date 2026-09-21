@@ -1,0 +1,16 @@
+# Copyright 2026 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+
+sections:
+  hide:
+    - header
+
+sort:
+  enabled: true
+  by: name
