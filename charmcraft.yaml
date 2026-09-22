@@ -67,8 +67,10 @@ parts:
     build-snaps:
       - astral-uv
     override-build: |
-      # Fetch upstream dashboards before the uv plugin stages the charm files.
+      # Fetch upstream dashboards and alert rules before the uv plugin stages
+      # the charm files.
       python3 tools/fetch-dashboards.py
+      python3 tools/fetch-alert-rules.py
       craftctl default
 
 provides:
