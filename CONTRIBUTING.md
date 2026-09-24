@@ -71,14 +71,44 @@ workflow instead (see [Publishing](#publishing)). Both call the reusable
 `.github/workflows/build-and-test.yaml`, which:
 
 1. **static** — `tox -e lint` and `tox -e unit`;
-2. **build** — one job per base and architecture, packing `ubuntu@<base>:<arch>`, running
-   `charmcraft analyse` on the result and uploading it as its own artifact.
-   the result and uploading it as its own artifact;
-3. **integration** — deploys each packed charm with `concierge` and runs the suite against it.
+2. **terraform** — formats, validates, lints and tests the Terraform module, and checks its
+   generated documentation is current. Runs alongside **static**; **build** does not wait for it;
+3. **build** — one job per base and architecture, packing `ubuntu@<base>:<arch>`, running
+   `charmcraft analyse` on the result and uploading it as its own artifact;
+4. **integration** — deploys each packed charm with `concierge` and runs the suite against it.
 
 `build` depends on `static`, so a lint error never reaches a charm build. Every job runs with
 `contents: read` and no other permission. The matrix covers every platform `charmcraft.yaml`
 declares.
+
+## Terraform module
+
+`terraform/` holds the charm's Terraform module, which deploys one `microcloud` application into
+an existing model. Its README documents the inputs; `charmcraft.yaml` stays the source of truth
+for config options.
+
+The module is not part of the Python toolchain, so `tox` does not cover it. Run the same commands
+CI does, from `terraform/`:
+
+```shell
+sudo snap install --classic terraform
+sudo snap install tflint
+
+terraform fmt -check -recursive -diff
+terraform init -backend=false      # fetches the provider schema; no controller needed
+terraform validate
+tflint --init --config ../.tflint.hcl && tflint --config ../.tflint.hcl
+terraform test                     # plan-only, mock_provider
+```
+
+After changing a variable or output, regenerate the documentation table, which CI checks:
+
+```shell
+terraform-docs --config ../.terraform-docs.yml .
+```
+
+The module is not packed into the charm: the `uv` plugin copies only `src/` and `lib/` into
+the built charm, so anything else in the repository stays out of it.
 
 ## Publishing
 

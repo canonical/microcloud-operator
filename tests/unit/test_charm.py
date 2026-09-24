@@ -601,6 +601,12 @@ storage:
     multiple:
       range: 0-
 """,
+            config="""
+options:
+  local-device:
+    type: string
+    default: ""
+""",
         )
         harness.begin()
         return harness
@@ -610,7 +616,7 @@ storage:
 
         harness = self._harness()
         try:
-            assert MicroCloudCharm._storage_local_path(harness.charm) == ""
+            assert MicroCloudCharm._storage_local_path(harness.charm) == ("", None)
         finally:
             harness.cleanup()
 
@@ -630,7 +636,58 @@ storage:
         try:
             harness.add_storage("local", count=1, attach=True)
             location = harness.charm.model.storages["local"][0].location
-            assert MicroCloudCharm._storage_local_path(harness.charm) == str(location)
+            assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
+        finally:
+            harness.cleanup()
+
+    def test_local_device_config_names_the_device(self):
+        """Juju cannot attach a RAID, LVM volume or partition on MAAS."""
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"local-device": "/dev/md1"})
+            with patch("charm.microcloud.hostname", return_value="node1"):
+                assert MicroCloudCharm._storage_local_path(harness.charm) == ("/dev/md1", None)
+        finally:
+            harness.cleanup()
+
+    def test_local_device_accepts_a_hostname_mapping(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"local-device": "{node1: /dev/md1, node2: /dev/nvme0n1p3}"})
+            with patch("charm.microcloud.hostname", return_value="node2"):
+                path, problem = MicroCloudCharm._storage_local_path(harness.charm)
+            assert (path, problem) == ("/dev/nvme0n1p3", None)
+        finally:
+            harness.cleanup()
+
+    def test_local_device_mapping_without_this_host_blocks(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"local-device": "{node1: /dev/md1}"})
+            with patch("charm.microcloud.hostname", return_value="node9"):
+                path, problem = MicroCloudCharm._storage_local_path(harness.charm)
+            assert path == ""
+            assert problem == (
+                "local-device is missing an entry for hostname 'node9'; known entries: ['node1']"
+            )
+        finally:
+            harness.cleanup()
+
+    def test_attached_storage_wins_over_local_device(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.add_storage("local", count=1, attach=True)
+            harness.update_config({"local-device": "/dev/md1"})
+            location = harness.charm.model.storages["local"][0].location
+            assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
         finally:
             harness.cleanup()
 
@@ -715,6 +772,7 @@ class TestHeldStatus:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
 
@@ -737,6 +795,7 @@ class TestHeldStatus:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
@@ -1119,6 +1178,7 @@ class TestGrowCharm:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._preseed_inputs.side_effect = lambda address, passphrase, entries: (
             address,
             passphrase,
@@ -1605,7 +1665,7 @@ class TestGrowCharm:
 
     # ---- _reconcile_deploy ----
 
-    def _deploy(self, stub, *, initialized, pending):
+    def _deploy(self, stub, *, initialized, pending, uplink_problem=None):
         from charm import MicroCloudCharm
 
         coordinator = stub._coordinator
@@ -1614,6 +1674,8 @@ class TestGrowCharm:
         coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
         stub._lead_session.return_value = None
         stub._join_session.return_value = None
+        stub._network.ovn_uplink_interface.return_value = ("enp9s0", None)
+        stub._network.missing_uplink_interface.return_value = uplink_problem
 
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
@@ -1621,6 +1683,38 @@ class TestGrowCharm:
         ):
             problem = MicroCloudCharm._reconcile_deploy(stub, initialized, pending)
         return problem, ensure_snaps
+
+    def test_an_uplink_nic_that_is_missing_blocks_the_deploy(self):
+        """A cluster formed with an unknown uplink has no external network at all."""
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": "24.03/stable"}
+
+        problem, _ = self._deploy(
+            stub,
+            initialized=False,
+            pending=[],
+            uplink_problem="ovn-uplink-interface 'eth99' does not exist on node1; interfaces: []",
+        )
+
+        assert problem is not None
+        assert "does not exist" in problem
+        stub._lead_session.assert_not_called()
+
+    def test_the_uplink_nic_is_not_checked_without_microovn(self):
+        """With MicroOVN off the name never reaches the preseed, so a stale value is harmless."""
+        stub = self._stub(leader=True)
+        stub.config = {"snap-channel-microovn": ""}
+
+        problem, _ = self._deploy(
+            stub,
+            initialized=False,
+            pending=[],
+            uplink_problem="ovn-uplink-interface 'eth99' does not exist on node1; interfaces: []",
+        )
+
+        assert problem is None
+        stub._network.missing_uplink_interface.assert_not_called()
+        stub._lead_session.assert_called_once()
 
     def test_clustered_leader_does_not_refresh_snaps(self):
         """Refreshing here would upgrade the leader ahead of the rest of the cluster."""
@@ -1933,6 +2027,7 @@ class TestFailureDomains:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
@@ -1959,17 +2054,73 @@ class TestFailureDomains:
 
         assert stub._failure_domains.reconcile.called is initialized
 
-    def test_waits_for_lxd_to_join_before_setting_the_failure_domain(self):
-        """MicroCloud reports a joiner clustered before the initiator has added its LXD."""
-        import ops
+    def _await_stub(self, *, since=0.0, session=None, now=1000.0):
+        from charm import MicroCloudCharm
 
         stub = self._stub()
+        stub._status_held = False
+        stub.config = {"session-timeout": 300}
+        stub._stored = SimpleNamespace(lxd_join_since=since)
+        stub._coordinator = MagicMock()
+        stub._coordinator.session.return_value = session
+        stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
+        with patch("charm.time.time", return_value=now):
+            problem = MicroCloudCharm._await_lxd_join(stub)
+        return stub, problem
+
+    def test_await_lxd_join_waits_while_a_session_is_open(self):
+        """The initiator is still working; LXD joins at the end of it."""
+        import ops
+
+        from cluster import JoinSession
+
+        session = JoinSession(id="abc", address="10.0.0.1", systems=["node1"], deadline=2000.0)
+        stub, problem = self._await_stub(since=1.0, session=session, now=100000.0)
+
+        assert problem is None
+        assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
+
+    def test_await_lxd_join_restarts_the_clock_while_a_session_runs(self):
+        """Otherwise a long session eats the grace and the next hook blocks for nothing."""
+        from cluster import JoinSession
+
+        session = JoinSession(id="abc", address="10.0.0.1", systems=["node1"], deadline=2000.0)
+        stub, _ = self._await_stub(since=1.0, session=session, now=100000.0)
+
+        assert stub._stored.lxd_join_since == 100000.0
+
+    def test_await_lxd_join_waits_inside_the_grace(self):
+        import ops
+
+        stub, problem = self._await_stub(since=900.0, now=1000.0)
+
+        assert problem is None
+        assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
+
+    def test_await_lxd_join_starts_the_clock_on_the_first_hook(self):
+        stub, problem = self._await_stub(since=0.0, now=1000.0)
+
+        assert problem is None
+        assert stub._stored.lxd_join_since == 1000.0
+
+    def test_await_lxd_join_reports_a_bootstrap_that_stopped_part_way(self):
+        """Growth cannot fix this: it needs the LXD that never arrived."""
+        stub, problem = self._await_stub(since=1000.0, now=1000.0 + 421)
+
+        assert problem is not None
+        assert "MicroCloud is initialized but LXD has not joined after 421s" in problem
+        assert "join-session.log" in problem
+        stub._hold_status.assert_not_called()
+
+    def test_waits_for_lxd_to_join_before_setting_the_failure_domain(self):
+        """MicroCloud reports a joiner clustered before the initiator has added its LXD."""
+        stub = self._stub()
+        stub._await_lxd_join.return_value = None
 
         self._reconcile(stub, lxd_clustered=False)
 
         stub._failure_domains.reconcile.assert_not_called()
-        assert stub.unit.status == ops.WaitingStatus("Waiting for LXD to join the cluster")
-        stub._set_status.assert_not_called()
+        stub._await_lxd_join.assert_called_once()
 
     def test_unreadable_lxd_cluster_blocks(self):
         import ops
@@ -1982,6 +2133,7 @@ class TestFailureDomains:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ("", None)
         stub._coordinator = MagicMock()
         stub._reconcile_observe_only.return_value = None
         with (

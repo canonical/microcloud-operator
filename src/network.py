@@ -4,12 +4,46 @@
 """This unit's network: addresses and subnets from Juju space bindings, and its OVN uplink."""
 
 from collections.abc import Mapping
+from pathlib import Path
 from typing import Any
 
 import ops
 import yaml
 
 import microcloud
+
+
+def per_host_value(raw: str, option: str) -> tuple[str, str | None]:
+    """Resolve a config option that is one value, or a mapping per hostname.
+
+    Several options name something that differs per machine (an interface, a
+    device path). Each accepts either a single value applied everywhere, or a
+    YAML/JSON mapping of hostname to value; a unit missing from a mapping
+    cannot guess, so it blocks.
+
+    Returns (value, problem). "problem" is a human-readable status string if
+    reconciliation should block; "value" is only meaningful when it is None.
+    """
+    raw = raw.strip()
+    if not raw:
+        return "", None
+
+    try:
+        parsed = yaml.safe_load(raw)
+    except yaml.YAMLError as exc:
+        return "", f"Cannot parse {option}: {exc}"
+
+    if not isinstance(parsed, dict):
+        return raw, None
+
+    hostname = microcloud.hostname()
+    value = parsed.get(hostname)
+    if not value:
+        known = sorted(str(key) for key in parsed)
+        return "", (
+            f"{option} is missing an entry for hostname {hostname!r}; known entries: {known}"
+        )
+    return str(value), None
 
 
 class UnitNetwork:
@@ -86,24 +120,29 @@ class UnitNetwork:
         string if reconciliation should block; "interface" is only
         meaningful when "problem" is None.
         """
-        raw = str(self._config.get("ovn-uplink-interface", "")).strip()
-        if not raw:
-            return "", None
+        raw = str(self._config.get("ovn-uplink-interface", ""))
+        return per_host_value(raw, "ovn-uplink-interface")
 
-        try:
-            parsed = yaml.safe_load(raw)
-        except yaml.YAMLError as exc:
-            return "", f"Cannot parse ovn-uplink-interface: {exc}"
+    def missing_uplink_interface(self, interface: str) -> str | None:
+        """Return a problem if ``interface`` is not a NIC on this machine.
 
-        if not isinstance(parsed, dict):
-            return raw, None
+        MicroCloud accepts an interface that does not exist and simply leaves
+        the uplink out: the cluster then forms and reports ready while having
+        no UPLINK network and no default OVN network at all, so nothing it
+        hosts can reach the outside. A name that is not there is a typo, not
+        a configuration.
 
-        hostname = microcloud.hostname()
-        interface = parsed.get(hostname)
-        if not interface:
-            known = sorted(str(key) for key in parsed)
-            return "", (
-                f"ovn-uplink-interface is missing an entry for hostname {hostname!r}; "
-                f"known entries: {known}"
-            )
-        return str(interface), None
+        Only worth checking where the name is actually used, which is why the
+        caller decides: with MicroOVN disabled the value is never read, and
+        blocking on it would refuse a deployment that is perfectly valid.
+        """
+        if not interface or Path("/sys/class/net", interface).exists():
+            return None
+
+        present = sorted(
+            path.name for path in Path("/sys/class/net").iterdir() if path.name != "lo"
+        )
+        return (
+            f"ovn-uplink-interface {interface!r} does not exist on "
+            f"{microcloud.hostname()}; interfaces: {present}"
+        )

@@ -61,6 +61,7 @@ from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import lxd_cluster
 import microcloud
+import network
 import session
 import snap
 from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_membership
@@ -98,7 +99,9 @@ class MicroCloudCharm(ops.CharmBase):
 
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
-        self._stored.set_default(session_failures=0, worker_pid=0, worker_session="")
+        self._stored.set_default(
+            session_failures=0, worker_pid=0, worker_session="", lxd_join_since=0.0
+        )
 
         self._coordinator = ClusterCoordinator(self)
         self._failure_domains = FailureDomains()
@@ -230,6 +233,11 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        storage_local_path, problem = self._storage_local_path()
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
+
         initialized = microcloud.is_initialized()
 
         # Publish our identity for peers as early as possible.
@@ -238,7 +246,7 @@ class MicroCloudCharm(ops.CharmBase):
             self._network.bind_address(),
             ovn_uplink_interface=ovn_uplink_interface,
             ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
-            storage_local_path=self._storage_local_path(),
+            storage_local_path=storage_local_path,
             storage_ceph_paths=self._storage_ceph_paths(),
             initialized=initialized,
         )
@@ -281,9 +289,10 @@ class MicroCloudCharm(ops.CharmBase):
                 problem = f"Cannot read the LXD cluster: {exc}"
             else:
                 if lxd_clustered:
+                    self._stored.lxd_join_since = 0.0
                     problem = self._failure_domains.reconcile()
                 else:
-                    self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
+                    problem = self._await_lxd_join()
 
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -298,6 +307,48 @@ class MicroCloudCharm(ops.CharmBase):
 
         if not self._status_held:
             self._set_status(initialized=microcloud.is_initialized())
+
+    def _await_lxd_join(self) -> str | None:
+        """Wait for this unit's LXD to join, or report a bootstrap that stopped half way.
+
+        MicroCloud reports a unit clustered once it has joined MicroCloud
+        itself, a little before the initiator has added its LXD, so a short
+        wait here is normal.
+
+        A bootstrap that fails between those two points never recovers,
+        though: the charm sees an initialized MicroCloud, so it treats every
+        later session as growth, and growth needs the LXD that is missing.
+        MicroCloud then rejects each session with "LXD is not initialized",
+        which names neither the service that failed nor the real state. Say
+        what actually happened instead of waiting forever.
+
+        Returns a problem string to block on, or None while still waiting.
+        """
+        now = time.time()
+
+        # A published session is the initiator still working, and LXD joins at
+        # the end of it. Keep restarting the clock while one is open so the
+        # grace below is measured from the session ending, not from the first
+        # hook that noticed LXD missing.
+        if self._coordinator.session() is not None:
+            self._stored.lxd_join_since = now
+            self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
+            return None
+
+        if not self._stored.lxd_join_since:
+            self._stored.lxd_join_since = now
+        waiting_for = now - float(self._stored.lxd_join_since)
+
+        grace = int(self.config.get("session-timeout", 300)) + _SESSION_GRACE
+        if waiting_for < grace:
+            self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
+            return None
+
+        return (
+            f"MicroCloud is initialized but LXD has not joined after {int(waiting_for)}s: "
+            "the bootstrap stopped part way and the charm cannot finish it. The last error is "
+            f"in {session.STATE_DIR / 'join-session.log'} on this unit."
+        )
 
     def _hold_status(self, status: ops.StatusBase) -> None:
         """Report a transitional status that reconciliation must not overwrite."""
@@ -348,6 +399,15 @@ class MicroCloudCharm(ops.CharmBase):
         if not microcloud.waitready(timeout=60):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
+
+        # Only where the uplink is actually used: with MicroOVN disabled the
+        # interface name never reaches the preseed, and a stale value left in
+        # the config must not stop the cluster forming.
+        if self.config.get("snap-channel-microovn", ""):
+            interface, _ = self._network.ovn_uplink_interface()
+            problem = self._network.missing_uplink_interface(interface)
+            if problem:
+                return problem
 
         if not self._coordinator.all_identities_published():
             self._hold_status(ops.WaitingStatus("Waiting for all peers to report identity"))
@@ -605,17 +665,31 @@ class MicroCloudCharm(ops.CharmBase):
             storage_encrypt=bool(self.config.get("storage-encrypt", False)),
         )
 
-    def _storage_local_path(self) -> str:
-        """Return the device path of this unit's attached "local" Juju storage.
+    def _storage_local_path(self) -> tuple[str, str | None]:
+        """Return this unit's local storage device path.
+
+        An attached "local" Juju storage volume wins. Otherwise the
+        "local-device" config names the device, which is how local storage
+        Juju cannot attach is reached. A MAAS storage pool selects by tag,
+        and MAAS matches that tag against whole block devices when it
+        allocates a machine, so a tag on a partition, a RAID or an LVM
+        volume matches no machine at all: the unit never gets placed and
+        the storage stays pending forever.
 
         The "local" storage volume is declared with ``multiple: range: 0-1``
         in charmcraft.yaml, so at most one instance is ever attached.
-        Returns "" if none is attached.
+
+        Returns (path, problem). "path" is "" when this unit has no local
+        storage at all, which is allowed.
         """
         storages = self.model.storages["local"]
-        if not storages:
-            return ""
-        return str(storages[0].location)
+        if storages:
+            attached = str(storages[0].location)
+            if str(self.config.get("local-device", "")).strip():
+                logger.info("Ignoring local-device: %s is attached as Juju storage", attached)
+            return attached, None
+
+        return network.per_host_value(str(self.config.get("local-device", "")), "local-device")
 
     def _storage_ceph_paths(self) -> list[str]:
         """Return device paths of this unit's attached "ceph" Juju storage.

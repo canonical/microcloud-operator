@@ -16,3 +16,10 @@ __pycache__/
 src/dashboards/lxd/
 src/dashboards/microceph/
 src/dashboards/microovn/
+
+# Terraform
+.terraform/
+.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+crash.log

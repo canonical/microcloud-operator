@@ -7,6 +7,7 @@ import ipaddress
 from unittest.mock import MagicMock, patch
 
 import ops
+import pytest
 
 from network import UnitNetwork
 
@@ -128,6 +129,14 @@ class TestSpaceBindAddress:
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def netdir(tmp_path):
+    """Stand in for /sys/class/net, so tests decide which interfaces exist."""
+    (tmp_path / "lo").mkdir()
+    with patch("network.Path", lambda *parts: tmp_path.joinpath(*[str(p) for p in parts[1:]])):
+        yield tmp_path
+
+
 class TestOvnUplinkInterface:
     def test_empty_config_omits_uplink(self):
         interface, problem = _network(config={"ovn-uplink-interface": ""}).ovn_uplink_interface()
@@ -140,6 +149,24 @@ class TestOvnUplinkInterface:
         ).ovn_uplink_interface()
         assert interface == "eth1"
         assert problem is None
+
+    def test_an_interface_that_exists_is_accepted(self, netdir):
+        (netdir / "enp9s0").mkdir()
+        assert _network().missing_uplink_interface("enp9s0") is None
+
+    def test_an_unset_interface_is_accepted(self, netdir):
+        assert _network().missing_uplink_interface("") is None
+
+    def test_an_interface_that_does_not_exist_is_reported(self, netdir):
+        """MicroCloud drops an unknown uplink and forms a cluster with no UPLINK at all."""
+        (netdir / "enp5s0").mkdir()
+
+        with patch("network.microcloud.hostname", return_value="node1"):
+            problem = _network().missing_uplink_interface("eth99")
+
+        assert problem == (
+            "ovn-uplink-interface 'eth99' does not exist on node1; interfaces: ['enp5s0']"
+        )
 
     def test_mapping_resolves_own_hostname(self):
         unit_network = _network(config={"ovn-uplink-interface": "node1: eth1\nnode2: enp5s0\n"})

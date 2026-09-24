@@ -1,0 +1,21 @@
+# Copyright 2026 Canonical Ltd.
+# See LICENSE file for licensing details.
+
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+
+sections:
+  hide:
+    - header
+    # The resolved provider version comes from whatever "init" picked, which
+    # differs between a developer's lock file and CI, and would make the
+    # freshness check fail on unrelated pull requests. The constraint itself
+    # is still shown under Requirements.
+    - providers
+
+sort:
+  enabled: true
+  by: name
