@@ -106,6 +106,15 @@ class MicroCloudCharm(ops.CharmBase):
         self._coordinator = ClusterCoordinator(self)
         self._failure_domains = FailureDomains()
         self._network = UnitNetwork(self.model, self.config)
+        self._sessions = session.JoinSessions(
+            self.unit,
+            self._coordinator,
+            self._network,
+            self.config,
+            self.charm_dir,
+            self._stored,
+            self._hold_status,
+        )
         self._observability = Observability(self.config, self.app.name)
 
         # Set once the deploy path reports a transitional status of its own,
@@ -262,7 +271,7 @@ class MicroCloudCharm(ops.CharmBase):
         # initialized and can only be the initiator"), which would leave them
         # retrying instead of sitting active.
         try:
-            pending = self._pending_systems(initialized)
+            pending = self._sessions.pending(initialized)
         except microcloud.MicroCloudError as exc:
             self.unit.status = ops.BlockedStatus(f"Cannot read MicroCloud members: {exc}")
             return
@@ -478,7 +487,7 @@ class MicroCloudCharm(ops.CharmBase):
             # would list units that have just joined, and that never dial in.
             initialized = microcloud.is_initialized()
             try:
-                pending = self._pending_systems(initialized)
+                pending = self._sessions.pending(initialized)
             except microcloud.MicroCloudError as exc:
                 return f"Cannot read MicroCloud members: {exc}"
 
@@ -534,20 +543,6 @@ class MicroCloudCharm(ops.CharmBase):
             message = f"{message}; retrying after: {failure}"
         self._hold_status(ops.MaintenanceStatus(message))
         return None
-
-    def _pending_systems(self, initialized: bool) -> list[PeerSystem]:
-        """Return the systems not yet clustered.
-
-        ``initialized`` is whether this unit is clustered. The published flags
-        lag behind, so a clustered leader reads the membership back from
-        MicroCloud instead.
-
-        Raises microcloud.MicroCloudError if the membership cannot be read.
-        """
-        if initialized and self.unit.is_leader():
-            members = {member.name for member in microcloud.list_members()}
-            return self._coordinator.pending_systems(members)
-        return self._coordinator.pending_systems()
 
     def _join_session(self, passphrase: str) -> str | None:
         """Joiner side: dial in to the published join session if listed in it.

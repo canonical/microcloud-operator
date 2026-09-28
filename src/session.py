@@ -26,7 +26,15 @@ import logging
 import os
 import signal
 import subprocess
+from collections.abc import Callable, Mapping
 from pathlib import Path
+from typing import Any
+
+import ops
+
+import microcloud
+from cluster import ClusterCoordinator, PeerSystem
+from network import UnitNetwork
 
 logger = logging.getLogger(__name__)
 
@@ -146,3 +154,39 @@ def result(session_id: str) -> tuple[int, str] | None:
 def clear() -> None:
     """Forget the last session's result."""
     (STATE_DIR / _RESULT_FILE).unlink(missing_ok=True)
+
+
+class JoinSessions:
+    """Manages join sessions for forming or growing a MicroCloud cluster."""
+
+    def __init__(
+        self,
+        unit: ops.Unit,
+        coordinator: ClusterCoordinator,
+        network: UnitNetwork,
+        config: Mapping[str, Any],
+        charm_dir: Path,
+        stored: ops.StoredState,
+        hold_status: Callable[[ops.StatusBase], None],
+    ) -> None:
+        self._unit = unit
+        self._coordinator = coordinator
+        self._network = network
+        self._config = config
+        self._charm_dir = charm_dir
+        self._stored = stored
+        self._hold_status = hold_status
+
+    def pending(self, initialized: bool) -> list[PeerSystem]:
+        """Return the systems not yet clustered.
+
+        ``initialized`` is whether this unit is clustered. The published flags
+        lag behind, so a clustered leader reads the membership back from
+        MicroCloud instead.
+
+        Raises microcloud.MicroCloudError if the membership cannot be read.
+        """
+        if initialized and self._unit.is_leader():
+            members = {member.name for member in microcloud.list_members()}
+            return self._coordinator.pending_systems(members)
+        return self._coordinator.pending_systems()

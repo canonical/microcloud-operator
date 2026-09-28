@@ -50,6 +50,7 @@ sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
 # Now import the modules under test.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+import session
 from ceph_mgr import CephMgrPrometheus
 from failure_domains import FailureDomains
 from network import UnitNetwork
@@ -775,6 +776,7 @@ class TestHeldStatus:
         stub._storage_local_path.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
+        stub._sessions = MagicMock()
 
         def deploy(*args):
             stub._status_held = True
@@ -798,6 +800,7 @@ class TestHeldStatus:
         stub._storage_local_path.return_value = ("", None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
+        stub._sessions = MagicMock()
         stub._reconcile_deploy.return_value = None
         with (
             patch("charm.microcloud.hostname", return_value="node1"),
@@ -1190,6 +1193,7 @@ class TestGrowCharm:
         coordinator.all_ready.return_value = True
         coordinator.any_initialized.return_value = False
         coordinator.session.return_value = current
+        stub._sessions = MagicMock()
         return stub
 
     def _lead(
@@ -1211,7 +1215,7 @@ class TestGrowCharm:
         """
         from charm import MicroCloudCharm
 
-        stub._pending_systems.return_value = pending if pending_after is None else pending_after
+        stub._sessions.pending.return_value = pending if pending_after is None else pending_after
         with (
             patch("charm.snap.is_installed", return_value=ceph),
             patch("charm.render", side_effect=lambda inputs: inputs),
@@ -1419,7 +1423,7 @@ class TestGrowCharm:
 
         assert problem is None
         clear.assert_called_once()
-        stub._pending_systems.assert_called_once_with(True)
+        stub._sessions.pending.assert_called_once_with(True)
         stub._coordinator.publish_session.assert_called_once_with(None)
         start.assert_not_called()
 
@@ -1427,7 +1431,7 @@ class TestGrowCharm:
         import microcloud
 
         stub = self._stub(leader=True, current=self._current())
-        stub._pending_systems.side_effect = microcloud.MicroCloudError("boom")
+        stub._sessions.pending.side_effect = microcloud.MicroCloudError("boom")
 
         problem, start, _ = self._lead(
             stub, initialized=True, pending=[self._system("node1", "10.0.0.2")], outcome=(0, "")
@@ -1749,9 +1753,15 @@ class TestGrowCharm:
         stub._reconcile_deploy.return_value = None
         stub._failure_domains = MagicMock(spec=FailureDomains)
         stub._failure_domains.reconcile.return_value = None
-        stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
-            stub, initialized
-        )
+        stub._sessions.pending.side_effect = lambda initialized: session.JoinSessions(
+            stub.unit,
+            stub._coordinator,
+            stub._network,
+            stub.config,
+            stub.charm_dir,
+            stub._stored,
+            stub._hold_status,
+        ).pending(initialized)
 
         with (
             patch("charm.microcloud.hostname", return_value="node0"),
@@ -1827,9 +1837,15 @@ class TestGrowCharm:
 
         stub = self._stub(leader=True)
         self._lagging_coordinator(stub, [self._system("node1", "10.0.0.2")])
-        stub._pending_systems.side_effect = lambda initialized: MicroCloudCharm._pending_systems(
-            stub, initialized
-        )
+        stub._sessions.pending.side_effect = lambda initialized: session.JoinSessions(
+            stub.unit,
+            stub._coordinator,
+            stub._network,
+            stub.config,
+            stub.charm_dir,
+            stub._stored,
+            stub._hold_status,
+        ).pending(initialized)
 
         with (
             patch("charm.microcloud.hostname", return_value="node0"),
@@ -1844,6 +1860,73 @@ class TestGrowCharm:
         assert isinstance(stub.unit.status, ops.BlockedStatus)
         stub._reconcile_deploy.assert_not_called()
         stub._reconcile_observe_only.assert_not_called()
+
+
+class TestJoinSessions:
+    """JoinSessions helper in session.py."""
+
+    def _sessions(self, *, leader=True, coordinator=None, network=None, config=None, stored=None):
+        import ops
+
+        unit = MagicMock(spec=ops.Unit)
+        unit.is_leader.return_value = leader
+        unit.name = "microcloud/0"
+        coordinator = coordinator or MagicMock()
+        network = network or MagicMock(spec=UnitNetwork)
+        config = config if config is not None else {"session-timeout": 300}
+        charm_dir = Path("/charm")
+        stored = stored or SimpleNamespace(session_failures=0, worker_pid=0, worker_session="")
+        hold_status = MagicMock()
+        return session.JoinSessions(
+            unit=unit,
+            coordinator=coordinator,
+            network=network,
+            config=config,
+            charm_dir=charm_dir,
+            stored=stored,
+            hold_status=hold_status,
+        )
+
+    def test_pending_clustered_leader_reads_microcloud_members(self):
+        from microcloud import Member
+
+        coordinator = MagicMock()
+        coordinator.pending_systems.return_value = ["pending"]
+        sessions = self._sessions(leader=True, coordinator=coordinator)
+
+        with patch(
+            "session.microcloud.list_members",
+            return_value=[Member("node0", ""), Member("node1", "")],
+        ) as list_members:
+            pending = sessions.pending(initialized=True)
+
+        assert pending == ["pending"]
+        list_members.assert_called_once()
+        coordinator.pending_systems.assert_called_once_with({"node0", "node1"})
+
+    def test_pending_unclustered_leader_uses_published_flags(self):
+        coordinator = MagicMock()
+        coordinator.pending_systems.return_value = ["pending"]
+        sessions = self._sessions(leader=True, coordinator=coordinator)
+
+        with patch("session.microcloud.list_members") as list_members:
+            pending = sessions.pending(initialized=False)
+
+        assert pending == ["pending"]
+        list_members.assert_not_called()
+        coordinator.pending_systems.assert_called_once_with()
+
+    def test_pending_clustered_non_leader_uses_published_flags(self):
+        coordinator = MagicMock()
+        coordinator.pending_systems.return_value = ["pending"]
+        sessions = self._sessions(leader=False, coordinator=coordinator)
+
+        with patch("session.microcloud.list_members") as list_members:
+            pending = sessions.pending(initialized=True)
+
+        assert pending == ["pending"]
+        list_members.assert_not_called()
+        coordinator.pending_systems.assert_called_once_with()
 
 
 class TestSessionWorkerHelpers:
@@ -2019,6 +2102,7 @@ class TestFailureDomains:
         stub = MagicMock(spec=MicroCloudCharm)
         stub._failure_domains = MagicMock(spec=FailureDomains)
         stub._failure_domains.reconcile.return_value = None
+        stub._sessions = MagicMock()
         return stub
 
     def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
