@@ -190,3 +190,19 @@ class JoinSessions:
             members = {member.name for member in microcloud.list_members()}
             return self._coordinator.pending_systems(members)
         return self._coordinator.pending_systems()
+
+    def _worker_running(self, session_id: str) -> bool:
+        """Return True while this unit's worker for ``session_id`` is running."""
+        return self._stored.worker_session == session_id and is_running(self._stored.worker_pid)
+
+    def _start_worker(self, session_id: str, document: str, retry_until: float = 0) -> None:
+        """Replace this unit's join session worker with one for ``session_id``."""
+        self._stored.worker_pid = start(
+            session_id,
+            document,
+            self._unit.name,
+            self._charm_dir,
+            retry_until=retry_until,
+            replacing=self._stored.worker_pid,
+        )
+        self._stored.worker_session = session_id

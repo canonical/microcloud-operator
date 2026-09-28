@@ -1177,7 +1177,8 @@ class TestGrowCharm:
         stub.config = {"session-timeout": 300}
         stub._status_held = False
         stub._stored = SimpleNamespace(session_failures=0)
-        stub._worker_running.return_value = False
+        stub._worker_running = MagicMock(return_value=False)
+        stub._start_worker = MagicMock()
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
@@ -1194,6 +1195,8 @@ class TestGrowCharm:
         coordinator.any_initialized.return_value = False
         coordinator.session.return_value = current
         stub._sessions = MagicMock()
+        stub._sessions._worker_running = stub._worker_running
+        stub._sessions._start_worker = stub._start_worker
         return stub
 
     def _lead(
@@ -1932,34 +1935,37 @@ class TestJoinSessions:
 class TestSessionWorkerHelpers:
     """The charm's bookkeeping for its one join session worker."""
 
-    def _stub(self, pid=0, session_id=""):
-        from charm import MicroCloudCharm
+    def _sessions(self, pid=0, session_id=""):
+        import ops
 
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.unit.name = "microcloud/0"
-        stub.charm_dir = Path("/charm")
-        stub._stored = SimpleNamespace(worker_pid=pid, worker_session=session_id)
-        return stub
+        unit = MagicMock(spec=ops.Unit)
+        unit.name = "microcloud/0"
+        stored = SimpleNamespace(worker_pid=pid, worker_session=session_id)
+        return session.JoinSessions(
+            unit=unit,
+            coordinator=MagicMock(),
+            network=MagicMock(spec=UnitNetwork),
+            config={},
+            charm_dir=Path("/charm"),
+            stored=stored,
+            hold_status=MagicMock(),
+        )
 
     def test_worker_for_another_session_is_not_running(self):
-        from charm import MicroCloudCharm
-
-        stub = self._stub(pid=42, session_id="old")
-        with patch("charm.session.is_running", return_value=True):
-            assert MicroCloudCharm._worker_running(stub, "abc") is False
-            assert MicroCloudCharm._worker_running(stub, "old") is True
+        sessions = self._sessions(pid=42, session_id="old")
+        with patch("session.is_running", return_value=True):
+            assert sessions._worker_running("abc") is False
+            assert sessions._worker_running("old") is True
 
     def test_start_worker_replaces_the_previous_one(self):
-        from charm import MicroCloudCharm
-
-        stub = self._stub(pid=42, session_id="old")
-        with patch("charm.session.start", return_value=99) as start:
-            MicroCloudCharm._start_worker(stub, "abc", "doc", retry_until=5.0)
+        sessions = self._sessions(pid=42, session_id="old")
+        with patch("session.start", return_value=99) as start:
+            sessions._start_worker("abc", "doc", retry_until=5.0)
 
         start.assert_called_once_with(
             "abc", "doc", "microcloud/0", Path("/charm"), retry_until=5.0, replacing=42
         )
-        assert (stub._stored.worker_pid, stub._stored.worker_session) == (99, "abc")
+        assert (sessions._stored.worker_pid, sessions._stored.worker_session) == (99, "abc")
 
 
 # ---------------------------------------------------------------------------

@@ -460,7 +460,7 @@ class MicroCloudCharm(ops.CharmBase):
             # hook the worker fires once it is done runs while the worker is
             # still waiting on that hook.
             outcome = session.result(current.id)
-            if outcome is None and self._worker_running(current.id):
+            if outcome is None and self._sessions._worker_running(current.id):
                 self._hold_status(
                     ops.MaintenanceStatus(_session_message(current, microcloud.hostname()))
                 )
@@ -533,7 +533,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         document = render(self._preseed_inputs(address, passphrase, _system_entries(listed)))
         try:
-            self._start_worker(opened.id, document)
+            self._sessions._start_worker(opened.id, document)
         except session.SessionError as exc:
             return str(exc)
 
@@ -585,7 +585,7 @@ class MicroCloudCharm(ops.CharmBase):
             )
             return None
 
-        if not self._worker_running(current.id):
+        if not self._sessions._worker_running(current.id):
             # Render exactly the systems the initiator listed, so this
             # document matches the one the session was opened with.
             by_name = {system.name: system for system in self._coordinator.all_systems()}
@@ -594,30 +594,12 @@ class MicroCloudCharm(ops.CharmBase):
                 self._preseed_inputs(current.address, passphrase, _system_entries(listed))
             )
             try:
-                self._start_worker(current.id, document, retry_until=current.deadline)
+                self._sessions._start_worker(current.id, document, retry_until=current.deadline)
             except session.SessionError as exc:
                 return str(exc)
 
         self._hold_status(ops.MaintenanceStatus("Joining the MicroCloud cluster"))
         return None
-
-    def _worker_running(self, session_id: str) -> bool:
-        """Return True while this unit's worker for ``session_id`` is running."""
-        return self._stored.worker_session == session_id and session.is_running(
-            self._stored.worker_pid
-        )
-
-    def _start_worker(self, session_id: str, document: str, retry_until: float = 0) -> None:
-        """Replace this unit's join session worker with one for ``session_id``."""
-        self._stored.worker_pid = session.start(
-            session_id,
-            document,
-            self.unit.name,
-            self.charm_dir,
-            retry_until=retry_until,
-            replacing=self._stored.worker_pid,
-        )
-        self._stored.worker_session = session_id
 
     def _preseed_inputs(
         self, initiator_address: str, passphrase: str, systems: list[SystemEntry]
