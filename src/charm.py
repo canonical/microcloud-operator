@@ -68,7 +68,7 @@ from cluster import ClusterCoordinator, JoinSession, PeerSystem, validate_member
 from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
-from preseed import PreseedInputs, SystemEntry, render
+from preseed import render
 
 logger = logging.getLogger(__name__)
 
@@ -531,7 +531,9 @@ class MicroCloudCharm(ops.CharmBase):
             deadline=time.time() + timeout + _SESSION_GRACE,
         )
 
-        document = render(self._preseed_inputs(address, passphrase, _system_entries(listed)))
+        document = render(
+            self._sessions._preseed_inputs(address, passphrase, session._system_entries(listed))
+        )
         try:
             self._sessions._start_worker(opened.id, document)
         except session.SessionError as exc:
@@ -591,7 +593,9 @@ class MicroCloudCharm(ops.CharmBase):
             by_name = {system.name: system for system in self._coordinator.all_systems()}
             listed = [by_name[name] for name in current.systems if name in by_name]
             document = render(
-                self._preseed_inputs(current.address, passphrase, _system_entries(listed))
+                self._sessions._preseed_inputs(
+                    current.address, passphrase, session._system_entries(listed)
+                )
             )
             try:
                 self._sessions._start_worker(current.id, document, retry_until=current.deadline)
@@ -600,47 +604,6 @@ class MicroCloudCharm(ops.CharmBase):
 
         self._hold_status(ops.MaintenanceStatus("Joining the MicroCloud cluster"))
         return None
-
-    def _preseed_inputs(
-        self, initiator_address: str, passphrase: str, systems: list[SystemEntry]
-    ) -> PreseedInputs:
-        """Build the PreseedInputs for this unit's preseed document."""
-        with_ceph_storage = any(s.storage_ceph_paths for s in systems)
-
-        return PreseedInputs(
-            initiator_address=initiator_address,
-            session_passphrase=passphrase,
-            systems=systems,
-            session_timeout=int(self.config.get("session-timeout", 300)),
-            # In preseed mode this is how long the initiator waits for every
-            # listed system to reach out, not just a multicast setting. Its
-            # 60s default would expire long before a joiner held up in
-            # another hook dials in, so wait for the whole session.
-            lookup_timeout=int(self.config.get("session-timeout", 300)),
-            with_ceph=bool(self.config.get("snap-channel-microceph", "")),
-            ceph_cephfs=bool(self.config.get("ceph-cephfs", False)),
-            # "microcloud preseed" rejects a public/internal network without
-            # Ceph storage disks ("Cannot specify a Ceph public network
-            # without Ceph storage disks"), so only derive these from the
-            # ceph-public/ceph-internal bindings when at least one system
-            # has a "ceph" Juju storage volume attached. Otherwise Juju's
-            # default-space fallback for an unbound extra-binding would
-            # still resolve to *some* subnet and produce an invalid
-            # preseed.
-            ceph_public_network=self._network.space_network_cidr("ceph-public")
-            if with_ceph_storage
-            else "",
-            ceph_internal_network=self._network.space_network_cidr("ceph-internal")
-            if with_ceph_storage
-            else "",
-            with_ovn=bool(self.config.get("snap-channel-microovn", "")),
-            ovn_ipv4_gateway=self.config.get("ovn-ipv4-gateway", ""),
-            ovn_ipv4_range=self.config.get("ovn-ipv4-range", ""),
-            ovn_ipv6_gateway=self.config.get("ovn-ipv6-gateway", ""),
-            ovn_dns_servers=self.config.get("ovn-dns-servers", ""),
-            storage_wipe=bool(self.config.get("storage-wipe", False)),
-            storage_encrypt=bool(self.config.get("storage-encrypt", False)),
-        )
 
     def _storage_local_path(self) -> tuple[str, str | None]:
         """Return this unit's local storage device path.
@@ -754,21 +717,6 @@ class MicroCloudCharm(ops.CharmBase):
     def _on_dump_metrics_config(self, event: ops.ActionEvent) -> None:
         configs = self._observability.scrape_configs()
         event.set_results({"scrape-configs": json.dumps(configs, indent=2)})
-
-
-def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
-    """Convert published peer identities into preseed system entries."""
-    return [
-        SystemEntry(
-            name=system.name,
-            address=system.address,
-            ovn_uplink_interface=system.ovn_uplink_interface,
-            ovn_underlay_ip=system.ovn_underlay_ip,
-            storage_local_path=system.storage_local_path,
-            storage_ceph_paths=system.storage_ceph_paths,
-        )
-        for system in systems
-    ]
 
 
 def _session_message(opened: JoinSession, initiator: str) -> str:

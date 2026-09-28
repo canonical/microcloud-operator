@@ -35,6 +35,7 @@ import ops
 import microcloud
 from cluster import ClusterCoordinator, PeerSystem
 from network import UnitNetwork
+from preseed import PreseedInputs, SystemEntry
 
 logger = logging.getLogger(__name__)
 
@@ -206,3 +207,59 @@ class JoinSessions:
             replacing=self._stored.worker_pid,
         )
         self._stored.worker_session = session_id
+
+    def _preseed_inputs(
+        self, initiator_address: str, passphrase: str, systems: list[SystemEntry]
+    ) -> PreseedInputs:
+        """Build the PreseedInputs for this unit's preseed document."""
+        with_ceph_storage = any(s.storage_ceph_paths for s in systems)
+
+        return PreseedInputs(
+            initiator_address=initiator_address,
+            session_passphrase=passphrase,
+            systems=systems,
+            session_timeout=int(self._config.get("session-timeout", 300)),
+            # In preseed mode this is how long the initiator waits for every
+            # listed system to reach out, not just a multicast setting. Its
+            # 60s default would expire long before a joiner held up in
+            # another hook dials in, so wait for the whole session.
+            lookup_timeout=int(self._config.get("session-timeout", 300)),
+            with_ceph=bool(self._config.get("snap-channel-microceph", "")),
+            ceph_cephfs=bool(self._config.get("ceph-cephfs", False)),
+            # "microcloud preseed" rejects a public/internal network without
+            # Ceph storage disks ("Cannot specify a Ceph public network
+            # without Ceph storage disks"), so only derive these from the
+            # ceph-public/ceph-internal bindings when at least one system
+            # has a "ceph" Juju storage volume attached. Otherwise Juju's
+            # default-space fallback for an unbound extra-binding would
+            # still resolve to *some* subnet and produce an invalid
+            # preseed.
+            ceph_public_network=self._network.space_network_cidr("ceph-public")
+            if with_ceph_storage
+            else "",
+            ceph_internal_network=self._network.space_network_cidr("ceph-internal")
+            if with_ceph_storage
+            else "",
+            with_ovn=bool(self._config.get("snap-channel-microovn", "")),
+            ovn_ipv4_gateway=self._config.get("ovn-ipv4-gateway", ""),
+            ovn_ipv4_range=self._config.get("ovn-ipv4-range", ""),
+            ovn_ipv6_gateway=self._config.get("ovn-ipv6-gateway", ""),
+            ovn_dns_servers=self._config.get("ovn-dns-servers", ""),
+            storage_wipe=bool(self._config.get("storage-wipe", False)),
+            storage_encrypt=bool(self._config.get("storage-encrypt", False)),
+        )
+
+
+def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
+    """Convert published peer identities into preseed system entries."""
+    return [
+        SystemEntry(
+            name=system.name,
+            address=system.address,
+            ovn_uplink_interface=system.ovn_uplink_interface,
+            ovn_underlay_ip=system.ovn_underlay_ip,
+            storage_local_path=system.storage_local_path,
+            storage_ceph_paths=system.storage_ceph_paths,
+        )
+        for system in systems
+    ]

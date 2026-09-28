@@ -534,24 +534,26 @@ peers:
 
 
 class TestPreseedInputs:
-    def _stub(self, config: dict, cidrs: dict):
-        from charm import MicroCloudCharm
-
-        stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = config
-        stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
-        return stub
+    def _sessions(self, config: dict, cidrs: dict):
+        network = MagicMock(spec=UnitNetwork)
+        network.space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
+        return session.JoinSessions(
+            unit=MagicMock(),
+            coordinator=MagicMock(),
+            network=network,
+            config=config,
+            charm_dir=Path("/charm"),
+            stored=SimpleNamespace(),
+            hold_status=MagicMock(),
+        )
 
     def test_ceph_networks_omitted_without_ceph_storage_disks(self):
-        from charm import MicroCloudCharm
-
-        stub = self._stub(
+        sessions = self._sessions(
             config={"snap-channel-microceph": "squid/stable"},
             cidrs={"ceph-public": "10.42.0.0/24", "ceph-internal": "10.42.1.0/24"},
         )
 
-        inputs = MicroCloudCharm._preseed_inputs(stub, "10.0.0.1", "secret", [])
+        inputs = sessions._preseed_inputs("10.0.0.1", "secret", [])
 
         assert inputs.ceph_public_network == ""
         assert inputs.ceph_internal_network == ""
@@ -559,13 +561,12 @@ class TestPreseedInputs:
         # fallback for an endpoint that was never explicitly --bind-ed),
         # the network must not be looked up at all without Ceph disks -
         # "microcloud preseed" would otherwise reject the whole document.
-        stub._network.space_network_cidr.assert_not_called()
+        sessions._network.space_network_cidr.assert_not_called()
 
     def test_ceph_networks_derived_with_ceph_storage_disks(self):
-        from charm import MicroCloudCharm
         from preseed import SystemEntry
 
-        stub = self._stub(
+        sessions = self._sessions(
             config={"snap-channel-microceph": "squid/stable"},
             cidrs={"ceph-public": "10.42.0.0/24", "ceph-internal": "10.42.1.0/24"},
         )
@@ -573,7 +574,7 @@ class TestPreseedInputs:
         systems = [
             SystemEntry(name="node1", address="10.0.0.1", storage_ceph_paths=["/dev/nvme1n1"])
         ]
-        inputs = MicroCloudCharm._preseed_inputs(stub, "10.0.0.1", "secret", systems)
+        inputs = sessions._preseed_inputs("10.0.0.1", "secret", systems)
 
         assert inputs.ceph_public_network == "10.42.0.0/24"
         assert inputs.ceph_internal_network == "10.42.1.0/24"
@@ -1183,11 +1184,6 @@ class TestGrowCharm:
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._storage_local_path.return_value = ("", None)
-        stub._preseed_inputs.side_effect = lambda address, passphrase, entries: (
-            address,
-            passphrase,
-            [entry.name for entry in entries],
-        )
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
         coordinator = stub._coordinator = MagicMock()
         coordinator.all_systems.return_value = list(systems)
@@ -1197,6 +1193,11 @@ class TestGrowCharm:
         stub._sessions = MagicMock()
         stub._sessions._worker_running = stub._worker_running
         stub._sessions._start_worker = stub._start_worker
+        stub._sessions._preseed_inputs.side_effect = lambda address, passphrase, entries: (
+            address,
+            passphrase,
+            [entry.name for entry in entries],
+        )
         return stub
 
     def _lead(
