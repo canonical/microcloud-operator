@@ -668,13 +668,12 @@ class MicroCloudCharm(ops.CharmBase):
     def _storage_local_path(self) -> tuple[str, str | None]:
         """Return this unit's local storage device path.
 
-        An attached "local" Juju storage volume wins. Otherwise the
-        "local-device" config names the device, which is how local storage
-        Juju cannot attach is reached. A MAAS storage pool selects by tag,
-        and MAAS matches that tag against whole block devices when it
-        allocates a machine, so a tag on a partition, a RAID or an LVM
-        volume matches no machine at all: the unit never gets placed and
-        the storage stays pending forever.
+        An attached "local" Juju storage volume wins, and on MAAS this can be a
+        tagged partition from a ``partition,<tag>`` storage pool. When
+        "local-device" is also set, it is ignored and an INFO record is logged.
+        Otherwise, "local-device" names the device for clouds where Juju cannot
+        attach the device (clouds without partition pools, pre-placed machines,
+        or when using ``--to``).
 
         The "local" storage volume is declared with ``multiple: range: 0-1``
         in charmcraft.yaml, so at most one instance is ever attached.
