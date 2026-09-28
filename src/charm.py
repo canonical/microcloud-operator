@@ -433,7 +433,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         if self.unit.is_leader():
             return self._lead_session(initialized, pending, passphrase or "")
-        return self._join_session(passphrase or "")
+        return self._sessions.join(passphrase or "")
 
     def _lead_session(
         self, initialized: bool, pending: list[PeerSystem], passphrase: str
@@ -470,7 +470,7 @@ class MicroCloudCharm(ops.CharmBase):
             session.clear()
             if outcome is not None and outcome[0] != 0:
                 logger.error("Join session %s failed:\n%s", current.id, outcome[1])
-                failure = _last_line(outcome[1])
+                failure = session._last_line(outcome[1])
                 self._stored.session_failures += 1
                 # Nothing else wakes the leader once its session is cleared,
                 # so open the next one from this hook, unless sessions keep
@@ -544,65 +544,6 @@ class MicroCloudCharm(ops.CharmBase):
         if failure:
             message = f"{message}; retrying after: {failure}"
         self._hold_status(ops.MaintenanceStatus(message))
-        return None
-
-    def _join_session(self, passphrase: str) -> str | None:
-        """Joiner side: dial in to the published join session if listed in it.
-
-        The attempt runs in the background, like the initiator's session, so
-        that a later session can replace it: a joiner still waiting on a
-        session that failed would otherwise miss the next one. Once it
-        succeeds, the hook it fires finds this unit clustered and publishes
-        that, which is what tells the leader.
-        """
-        current = self._coordinator.session()
-        if current is None:
-            self._hold_status(ops.WaitingStatus("Waiting for the leader to open a join session"))
-            return None
-
-        if microcloud.hostname() not in current.systems:
-            self._hold_status(ops.WaitingStatus("Waiting for the next join session"))
-            return None
-
-        # A leader that lost leadership mid-session is still its initiator.
-        if current.address == self._network.bind_address():
-            self._hold_status(
-                ops.WaitingStatus("Waiting for the join session this unit opened to end")
-            )
-            return None
-
-        outcome = session.result(current.id)
-        if outcome is not None and outcome[0] == 0:
-            # MicroCloud reports this unit as clustered only once the other
-            # services have joined too, a little after the attempt succeeds.
-            self._hold_status(ops.MaintenanceStatus("Joined the MicroCloud cluster"))
-            return None
-        if outcome is not None:
-            # The leader opens the next session; this unit just waits for it.
-            logger.error("Joining session %s failed:\n%s", current.id, outcome[1])
-            self._hold_status(
-                ops.WaitingStatus(
-                    f"Waiting for the next join session; joining failed: {_last_line(outcome[1])}"
-                )
-            )
-            return None
-
-        if not self._sessions._worker_running(current.id):
-            # Render exactly the systems the initiator listed, so this
-            # document matches the one the session was opened with.
-            by_name = {system.name: system for system in self._coordinator.all_systems()}
-            listed = [by_name[name] for name in current.systems if name in by_name]
-            document = render(
-                self._sessions._preseed_inputs(
-                    current.address, passphrase, session._system_entries(listed)
-                )
-            )
-            try:
-                self._sessions._start_worker(current.id, document, retry_until=current.deadline)
-            except session.SessionError as exc:
-                return str(exc)
-
-        self._hold_status(ops.MaintenanceStatus("Joining the MicroCloud cluster"))
         return None
 
     def _storage_local_path(self) -> tuple[str, str | None]:
@@ -725,12 +666,6 @@ def _session_message(opened: JoinSession, initiator: str) -> str:
     if initiator not in opened.systems:
         return f"Joining {len(opened.systems)} unit(s) to the MicroCloud cluster"
     return f"Forming the MicroCloud cluster with {len(opened.systems)} units"
-
-
-def _last_line(output: str) -> str:
-    """Return the last non-empty line of command output, for a status message."""
-    lines = [line.strip() for line in output.splitlines() if line.strip()]
-    return lines[-1] if lines else "no output"
 
 
 if __name__ == "__main__":

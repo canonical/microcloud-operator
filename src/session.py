@@ -35,7 +35,7 @@ import ops
 import microcloud
 from cluster import ClusterCoordinator, PeerSystem
 from network import UnitNetwork
-from preseed import PreseedInputs, SystemEntry
+from preseed import PreseedInputs, SystemEntry, render
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +249,63 @@ class JoinSessions:
             storage_encrypt=bool(self._config.get("storage-encrypt", False)),
         )
 
+    def join(self, passphrase: str) -> str | None:
+        """Joiner side: dial in to the published join session if listed in it.
+
+        The attempt runs in the background, like the initiator's session, so
+        that a later session can replace it: a joiner still waiting on a
+        session that failed would otherwise miss the next one. Once it
+        succeeds, the hook it fires finds this unit clustered and publishes
+        that, which is what tells the leader.
+        """
+        current = self._coordinator.session()
+        if current is None:
+            self._hold_status(ops.WaitingStatus("Waiting for the leader to open a join session"))
+            return None
+
+        if microcloud.hostname() not in current.systems:
+            self._hold_status(ops.WaitingStatus("Waiting for the next join session"))
+            return None
+
+        # A leader that lost leadership mid-session is still its initiator.
+        if current.address == self._network.bind_address():
+            self._hold_status(
+                ops.WaitingStatus("Waiting for the join session this unit opened to end")
+            )
+            return None
+
+        outcome = result(current.id)
+        if outcome is not None and outcome[0] == 0:
+            # MicroCloud reports this unit as clustered only once the other
+            # services have joined too, a little after the attempt succeeds.
+            self._hold_status(ops.MaintenanceStatus("Joined the MicroCloud cluster"))
+            return None
+        if outcome is not None:
+            # The leader opens the next session; this unit just waits for it.
+            logger.error("Joining session %s failed:\n%s", current.id, outcome[1])
+            self._hold_status(
+                ops.WaitingStatus(
+                    f"Waiting for the next join session; joining failed: {_last_line(outcome[1])}"
+                )
+            )
+            return None
+
+        if not self._worker_running(current.id):
+            # Render exactly the systems the initiator listed, so this
+            # document matches the one the session was opened with.
+            by_name = {system.name: system for system in self._coordinator.all_systems()}
+            listed = [by_name[name] for name in current.systems if name in by_name]
+            document = render(
+                self._preseed_inputs(current.address, passphrase, _system_entries(listed))
+            )
+            try:
+                self._start_worker(current.id, document, retry_until=current.deadline)
+            except SessionError as exc:
+                return str(exc)
+
+        self._hold_status(ops.MaintenanceStatus("Joining the MicroCloud cluster"))
+        return None
+
 
 def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
     """Convert published peer identities into preseed system entries."""
@@ -263,3 +320,9 @@ def _system_entries(systems: list[PeerSystem]) -> list[SystemEntry]:
         )
         for system in systems
     ]
+
+
+def _last_line(output: str) -> str:
+    """Return the last non-empty line of command output, for a status message."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    return lines[-1] if lines else "no output"

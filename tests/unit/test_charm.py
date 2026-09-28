@@ -1198,6 +1198,7 @@ class TestGrowCharm:
             passphrase,
             [entry.name for entry in entries],
         )
+        stub._sessions.join = MagicMock(return_value=None)
         return stub
 
     def _lead(
@@ -1550,127 +1551,6 @@ class TestGrowCharm:
         assert problem is None
         start.assert_called_once()
 
-    # ---- _join_session ----
-
-    def _join(self, stub, *, hostname="node1", running=False, outcome=None):
-        from charm import MicroCloudCharm
-
-        with (
-            patch("charm.render", side_effect=lambda inputs: inputs),
-            patch("charm.microcloud.hostname", return_value=hostname),
-            patch("charm.session.result", return_value=outcome),
-        ):
-            stub._worker_running.return_value = running
-            problem = MicroCloudCharm._join_session(stub, "secret")
-        return problem, stub._start_worker
-
-    def _joiner(self, systems=(), current=None):
-        stub = self._stub(leader=False, systems=systems, current=current)
-        stub._network.bind_address.return_value = "10.0.0.2"
-        return stub
-
-    def test_joiner_waits_without_a_session(self):
-        import ops
-
-        stub = self._joiner()
-
-        problem, start = self._join(stub)
-
-        assert problem is None
-        start.assert_not_called()
-        assert isinstance(stub.unit.status, ops.WaitingStatus)
-
-    def test_joiner_not_listed_waits_for_the_next_session(self):
-        stub = self._joiner(current=self._current())
-
-        problem, start = self._join(stub, hostname="node7")
-
-        assert problem is None
-        start.assert_not_called()
-        assert "next join session" in stub.unit.status.message
-
-    def test_former_leader_does_not_dial_its_own_session(self):
-        """A leader that lost leadership mid-session is still that session's initiator."""
-        stub = self._joiner(current=self._current(address="10.0.0.2"))
-
-        problem, start = self._join(stub)
-
-        assert problem is None
-        start.assert_not_called()
-        assert "this unit opened" in stub.unit.status.message
-
-    def test_joiner_dials_in_the_background_with_exactly_the_listed_systems(self):
-        import ops
-
-        from cluster import JoinSession
-
-        systems = [
-            self._system("node0", "10.0.0.1", initialized=True),
-            self._system("node1", "10.0.0.2"),
-            self._system("node2", "10.0.0.3"),
-        ]
-        current = JoinSession("abc", "10.0.0.1", ["node1", "node2"], 2000.0)
-        stub = self._joiner(systems=systems, current=current)
-
-        problem, start = self._join(stub)
-
-        assert problem is None
-        start.assert_called_once_with(
-            "abc", ("10.0.0.1", "secret", ["node1", "node2"]), retry_until=2000.0
-        )
-        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
-
-    def test_joiner_follows_its_attempt_without_restarting_it(self):
-        import ops
-
-        stub = self._joiner(current=self._current())
-
-        problem, start = self._join(stub, running=True)
-
-        assert problem is None
-        start.assert_not_called()
-        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
-
-    def test_joiner_reports_a_successful_attempt_while_services_finish_joining(self):
-        import ops
-
-        stub = self._joiner(current=self._current())
-
-        problem, start = self._join(stub, outcome=(0, "Successfully joined\n"))
-
-        assert problem is None
-        start.assert_not_called()
-        assert isinstance(stub.unit.status, ops.MaintenanceStatus)
-        assert "Joined" in stub.unit.status.message
-
-    def test_joiner_waits_for_the_next_session_after_a_failed_attempt(self):
-        """The attempt already retried until the deadline; the leader opens the next session."""
-        import ops
-
-        stub = self._joiner(current=self._current())
-
-        problem, start = self._join(stub, outcome=(1, "Error: No active session\n"))
-
-        assert problem is None
-        start.assert_not_called()
-        assert isinstance(stub.unit.status, ops.WaitingStatus)
-        assert "Error: No active session" in stub.unit.status.message
-
-    def test_joiner_blocks_when_the_attempt_cannot_start(self):
-        import session
-        from charm import MicroCloudCharm
-
-        stub = self._joiner(current=self._current())
-        with (
-            patch("charm.render", side_effect=lambda inputs: inputs),
-            patch("charm.microcloud.hostname", return_value="node1"),
-            patch("charm.session.result", return_value=None),
-        ):
-            stub._start_worker.side_effect = session.SessionError("no worker")
-            problem = MicroCloudCharm._join_session(stub, "secret")
-
-        assert problem == "no worker"
-
     # ---- _reconcile_deploy ----
 
     def _deploy(self, stub, *, initialized, pending, uplink_problem=None):
@@ -1681,7 +1561,7 @@ class TestGrowCharm:
         coordinator.ensure_passphrase.return_value = "secret"
         coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
         stub._lead_session.return_value = None
-        stub._join_session.return_value = None
+        stub._sessions.join.return_value = None
         stub._network.ovn_uplink_interface.return_value = ("enp9s0", None)
         stub._network.missing_uplink_interface.return_value = uplink_problem
 
@@ -1743,7 +1623,7 @@ class TestGrowCharm:
         assert problem is None
         ensure_snaps.assert_called_once()
         stub._coordinator.publish_ready.assert_called_once()
-        stub._join_session.assert_called_once_with("secret")
+        stub._sessions.join.assert_called_once_with("secret")
         stub._lead_session.assert_not_called()
 
     # ---- _reconcile ----
@@ -1931,6 +1811,166 @@ class TestJoinSessions:
         assert pending == ["pending"]
         list_members.assert_not_called()
         coordinator.pending_systems.assert_called_once_with()
+
+    # ---- join ----
+
+    @staticmethod
+    def _system(name, address, initialized=False):
+        from cluster import PeerSystem
+
+        return PeerSystem(name=name, address=address, initialized=initialized)
+
+    def _current(self, address="10.0.0.1", deadline=2000.0):
+        from cluster import JoinSession
+
+        return JoinSession(id="abc", address=address, systems=["node1"], deadline=deadline)
+
+    def _joiner(self, systems=(), current=None):
+        import ops
+
+        coordinator = MagicMock()
+        coordinator.all_systems.return_value = list(systems)
+        coordinator.session.return_value = current
+
+        network = MagicMock(spec=UnitNetwork)
+        network.bind_address.return_value = "10.0.0.2"
+
+        unit = MagicMock(spec=ops.Unit)
+        unit.status = None
+        unit.is_leader.return_value = False
+        unit.name = "microcloud/1"
+
+        def hold(status):
+            unit.status = status
+
+        sessions = session.JoinSessions(
+            unit=unit,
+            coordinator=coordinator,
+            network=network,
+            config={"session-timeout": 300},
+            charm_dir=Path("/charm"),
+            stored=SimpleNamespace(session_failures=0, worker_pid=0, worker_session=""),
+            hold_status=hold,
+        )
+        sessions._worker_running = MagicMock(return_value=False)
+        sessions._start_worker = MagicMock()
+        sessions._preseed_inputs = MagicMock(
+            side_effect=lambda address, passphrase, entries: (
+                address,
+                passphrase,
+                [entry.name for entry in entries],
+            )
+        )
+        return sessions
+
+    def _join(self, sessions, *, hostname="node1", running=False, outcome=None):
+        with (
+            patch("session.render", side_effect=lambda inputs: inputs),
+            patch("session.microcloud.hostname", return_value=hostname),
+            patch("session.result", return_value=outcome),
+        ):
+            sessions._worker_running.return_value = running
+            problem = sessions.join("secret")
+        return problem, sessions._start_worker
+
+    def test_joiner_waits_without_a_session(self):
+        import ops
+
+        sessions = self._joiner()
+
+        problem, start = self._join(sessions)
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(sessions._unit.status, ops.WaitingStatus)
+
+    def test_joiner_not_listed_waits_for_the_next_session(self):
+        sessions = self._joiner(current=self._current())
+
+        problem, start = self._join(sessions, hostname="node7")
+
+        assert problem is None
+        start.assert_not_called()
+        assert "next join session" in sessions._unit.status.message
+
+    def test_former_leader_does_not_dial_its_own_session(self):
+        """A leader that lost leadership mid-session is still that session's initiator."""
+        sessions = self._joiner(current=self._current(address="10.0.0.2"))
+
+        problem, start = self._join(sessions)
+
+        assert problem is None
+        start.assert_not_called()
+        assert "this unit opened" in sessions._unit.status.message
+
+    def test_joiner_dials_in_the_background_with_exactly_the_listed_systems(self):
+        import ops
+
+        from cluster import JoinSession
+
+        systems = [
+            self._system("node0", "10.0.0.1", initialized=True),
+            self._system("node1", "10.0.0.2"),
+            self._system("node2", "10.0.0.3"),
+        ]
+        current = JoinSession("abc", "10.0.0.1", ["node1", "node2"], 2000.0)
+        sessions = self._joiner(systems=systems, current=current)
+
+        problem, start = self._join(sessions)
+
+        assert problem is None
+        start.assert_called_once_with(
+            "abc", ("10.0.0.1", "secret", ["node1", "node2"]), retry_until=2000.0
+        )
+        assert isinstance(sessions._unit.status, ops.MaintenanceStatus)
+
+    def test_joiner_follows_its_attempt_without_restarting_it(self):
+        import ops
+
+        sessions = self._joiner(current=self._current())
+
+        problem, start = self._join(sessions, running=True)
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(sessions._unit.status, ops.MaintenanceStatus)
+
+    def test_joiner_reports_a_successful_attempt_while_services_finish_joining(self):
+        import ops
+
+        sessions = self._joiner(current=self._current())
+
+        problem, start = self._join(sessions, outcome=(0, "Successfully joined\n"))
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(sessions._unit.status, ops.MaintenanceStatus)
+        assert "Joined" in sessions._unit.status.message
+
+    def test_joiner_waits_for_the_next_session_after_a_failed_attempt(self):
+        """The attempt already retried until the deadline; the leader opens the next session."""
+        import ops
+
+        sessions = self._joiner(current=self._current())
+
+        problem, start = self._join(sessions, outcome=(1, "Error: No active session\n"))
+
+        assert problem is None
+        start.assert_not_called()
+        assert isinstance(sessions._unit.status, ops.WaitingStatus)
+        assert "Error: No active session" in sessions._unit.status.message
+
+    def test_joiner_blocks_when_the_attempt_cannot_start(self):
+        sessions = self._joiner(current=self._current())
+        with (
+            patch("session.render", side_effect=lambda inputs: inputs),
+            patch("session.microcloud.hostname", return_value="node1"),
+            patch("session.result", return_value=None),
+        ):
+            sessions._start_worker.side_effect = session.SessionError("no worker")
+            problem = sessions.join("secret")
+
+        assert problem == "no worker"
 
 
 class TestSessionWorkerHelpers:
