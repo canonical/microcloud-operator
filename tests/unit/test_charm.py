@@ -4,6 +4,7 @@
 """Unit tests for microcloud charm."""
 
 import json
+import logging
 
 # Stub out the cos_agent library so we don't need the full charm SDK installed
 # during unit tests — the library is tested separately.
@@ -679,15 +680,23 @@ options:
         finally:
             harness.cleanup()
 
-    def test_attached_storage_wins_over_local_device(self):
+    def test_attached_storage_wins_over_local_device(self, caplog):
         from charm import MicroCloudCharm
 
+        caplog.set_level(logging.INFO, logger="charm")
         harness = self._harness()
         try:
             harness.add_storage("local", count=1, attach=True)
             harness.update_config({"local-device": "/dev/md1"})
             location = harness.charm.model.storages["local"][0].location
             assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
+            records = [r for r in caplog.records if r.name == "charm"]
+            assert len(records) == 1
+            assert records[0].levelname == "INFO"
+            assert (
+                records[0].getMessage()
+                == f"Ignoring local-device: {location} is attached as Juju storage"
+            )
         finally:
             harness.cleanup()
 
