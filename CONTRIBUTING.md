@@ -71,7 +71,7 @@ workflow instead (see [Publishing](#publishing)). Both call the reusable
 `.github/workflows/build-and-test.yaml`, which:
 
 1. **static** — `tox -e lint` and `tox -e unit`;
-2. **terraform** — formats, validates, lints and tests the Terraform module, and checks its
+2. **terraform** — formats, validates, lints and tests each Terraform module, and checks its
    generated documentation is current. Runs alongside **static**; **build** does not wait for it;
 3. **build** — one job per base and architecture, packing `ubuntu@<base>:<arch>`, running
    `charmcraft analyse` on the result and uploading it as its own artifact;
@@ -85,10 +85,13 @@ declares.
 
 `terraform/` holds the charm's Terraform module, which deploys one `microcloud` application into
 an existing model. Its README documents the inputs; `charmcraft.yaml` stays the source of truth
-for config options.
+for config options. `terraform/product/` holds the product module built on it, following
+Canonical's CC008 standard: it creates or reuses the model and wires MicroCloud to COS. It calls
+the charm module by relative path, so the two always come from the same commit.
 
-The module is not part of the Python toolchain, so `tox` does not cover it. Run the same commands
-CI does, from `terraform/`:
+The modules are not part of the Python toolchain, so `tox` does not cover them. Run the same
+commands CI does, from `terraform/`, and again from `terraform/product/` with the config paths one
+level further up:
 
 ```shell
 sudo snap install --classic terraform
@@ -98,7 +101,7 @@ terraform fmt -check -recursive -diff
 terraform init -backend=false      # fetches the provider schema; no controller needed
 terraform validate
 tflint --init --config ../.tflint.hcl && tflint --config ../.tflint.hcl
-terraform test                     # plan-only, mock_provider
+terraform test                     # mock_provider; no controller needed
 ```
 
 After changing a variable or output, regenerate the documentation table, which CI checks:
