@@ -7,15 +7,23 @@ output "application" {
 }
 
 output "provides" {
-  description = "Endpoints this charm provides, keyed by alias."
+  description = "Endpoints this charm provides, keyed by alias, in the CC008 endpoint shape."
   value = {
-    cos_agent = "cos-agent"
+    cos_agent = {
+      kind     = "endpoint"
+      name     = juju_application.microcloud.name
+      endpoint = "cos-agent"
+    }
   }
 }
 
 output "requires" {
-  description = "Endpoints this charm requires, keyed by alias."
+  description = "Endpoints this charm requires, keyed by alias, in the CC008 endpoint shape."
   value = {
-    logging = "logging"
+    logging = {
+      kind     = "endpoint"
+      name     = juju_application.microcloud.name
+      endpoint = "logging"
+    }
   }
 }

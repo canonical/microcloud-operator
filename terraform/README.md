@@ -82,15 +82,16 @@ module "microcloud" {
 ### Wiring up observability
 
 Integrations belong to the caller, not to this module. The `provides` and
-`requires` outputs give you the endpoint names:
+`requires` outputs describe each endpoint in the CC008 shape, `{ kind =
+"endpoint", name = <application>, endpoint = <endpoint> }`:
 
 ```hcl
 resource "juju_integration" "cos_agent" {
   model_uuid = juju_model.prod.uuid
 
   application {
-    name     = module.microcloud.application.name
-    endpoint = module.microcloud.provides.cos_agent
+    name     = module.microcloud.provides.cos_agent.name
+    endpoint = module.microcloud.provides.cos_agent.endpoint
   }
 
   application {
@@ -209,6 +210,6 @@ No modules.
 | Name | Description |
 |------|-------------|
 | <a name="output_application"></a> [application](#output\_application) | The deployed juju\_application object. |
-| <a name="output_provides"></a> [provides](#output\_provides) | Endpoints this charm provides, keyed by alias. |
-| <a name="output_requires"></a> [requires](#output\_requires) | Endpoints this charm requires, keyed by alias. |
+| <a name="output_provides"></a> [provides](#output\_provides) | Endpoints this charm provides, keyed by alias, in the CC008 endpoint shape. |
+| <a name="output_requires"></a> [requires](#output\_requires) | Endpoints this charm requires, keyed by alias, in the CC008 endpoint shape. |
 <!-- END_TF_DOCS -->

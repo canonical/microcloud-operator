@@ -201,3 +201,29 @@ run "accepts_a_single_character_app_name" {
     error_message = "a one-character app name is valid in Juju"
   }
 }
+
+run "endpoints_use_the_cc008_shape" {
+  command = plan
+
+  variables {
+    app_name = "cloud"
+  }
+
+  assert {
+    condition = output.provides.cos_agent == {
+      kind     = "endpoint"
+      name     = "cloud"
+      endpoint = "cos-agent"
+    }
+    error_message = "provides.cos_agent should be a CC008 endpoint object naming the application"
+  }
+
+  assert {
+    condition = output.requires.logging == {
+      kind     = "endpoint"
+      name     = "cloud"
+      endpoint = "logging"
+    }
+    error_message = "requires.logging should be a CC008 endpoint object naming the application"
+  }
+}
