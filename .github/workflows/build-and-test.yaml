@@ -35,14 +35,19 @@ jobs:
         run: tox -e unit
 
   terraform:
-    name: Terraform module
+    name: Terraform module (${{ matrix.module }})
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        # The charm module, and the product module that calls it.
+        module: ["terraform", "terraform/product"]
     defaults:
       run:
-        working-directory: terraform
+        working-directory: ${{ matrix.module }}
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -52,7 +57,7 @@ jobs:
       - name: Install Terraform
         uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
         with:
-          # The module needs 1.9 for the cross-variable "units" validation.
+          # The modules need 1.9 for their cross-variable validations.
           terraform_version: "1.9.8"
           terraform_wrapper: false
 
@@ -62,6 +67,8 @@ jobs:
           tflint_version: v0.53.0
 
       - name: Format
+        # The charm module's leg recurses into product/ already.
+        if: matrix.module == 'terraform'
         run: terraform fmt -check -recursive -diff
 
       - name: Init
@@ -90,7 +97,7 @@ jobs:
             https://terraform-docs.io/dl/v0.20.0/terraform-docs-v0.20.0-linux-amd64.tar.gz
           echo "${TFDOCS_SHA256}  /tmp/terraform-docs.tar.gz" | sha256sum -c -
           tar -xzf /tmp/terraform-docs.tar.gz -C /tmp terraform-docs
-          /tmp/terraform-docs --config ../.terraform-docs.yml --output-check .
+          /tmp/terraform-docs --config "${GITHUB_WORKSPACE}/.terraform-docs.yml" --output-check .
 
   build:
     name: Pack ubuntu@${{ matrix.base }}:${{ matrix.arch }}
