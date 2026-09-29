@@ -96,15 +96,23 @@ storage:
     type: block
     description: >
       Local (single-node ZFS) storage disk for this MicroCloud system.
-      Juju attaches a raw physical block device (e.g. a MAAS-provisioned
-      NVMe disk) directly; the charm passes its device path straight
-      through to "microcloud preseed" as
-      "systems[*].storage.local.path" - no LXD resource-filter matching
-      is involved, so the exact disk is whatever Juju/MAAS resolved this
-      storage directive to (e.g.
-      "juju deploy microcloud --storage local=maas,1,100G"). Optional:
-      leave unattached (0 instances) to skip local storage on this
-      system.
+      On MAAS, tag one unformatted partition per node (e.g. "local"),
+      create a storage pool with
+      "juju create-storage-pool maas-local maas tags=partition,local",
+      and deploy with
+      "juju deploy microcloud --storage local=maas-local,1,2G"
+      without setting "local-device". Note the three MAAS caveats:
+      (1) MAAS matches the smallest tagged partition that fits the size,
+      so tag exactly one partition per node;
+      (2) a partition that already has a filesystem in the MAAS storage
+      layout never matches, and the storage remains pending;
+      (3) MAAS storage only attaches at machine allocation, so placing
+      onto existing machines (e.g. with "--to") fails with "does not
+      support dynamic storage".
+      The charm passes the attached device path straight through to
+      "microcloud preseed" as "systems[*].storage.local.path" - no LXD
+      resource-filter matching is involved. Optional: leave unattached
+      (0 instances) to skip local storage on this system.
     minimum-size: 1G
     multiple:
       range: 0-1
@@ -211,18 +219,15 @@ config:
       default: ""
       description: >
         Device path for this system's local storage, used when no "local"
-        Juju storage volume is attached. Either a single path applied to
-        every unit (e.g. "/dev/nvme0n1p3"), or a YAML/JSON mapping of
-        hostname to path for heterogeneous hardware, e.g.:
+        Juju storage volume is attached. This option covers clouds without
+        partition pools, such as non-MAAS clouds, machines already in the
+        model, or when placing units with "--to". Either a single path
+        applied to every unit (e.g. "/dev/nvme0n1p3"), or a YAML/JSON
+        mapping of hostname to path for heterogeneous hardware, e.g.:
           node1: /dev/nvme0n1p3
           node2: /dev/sda3
-        A Juju storage pool on MAAS selects by tag, and MAAS matches that
-        tag against whole block devices when it allocates a machine. A tag
-        on a partition, a RAID or an LVM volume matches nothing, so no
-        machine is ever allocated and the storage stays pending; local
-        storage built from those has to be named here instead. An
-        attached "local" volume takes precedence. When set to a mapping, a
-        unit whose hostname is missing blocks rather than bootstrapping
+        An attached "local" volume takes precedence. When set to a mapping,
+        a unit whose hostname is missing blocks rather than bootstrapping
         without local storage.
 
     storage-wipe:

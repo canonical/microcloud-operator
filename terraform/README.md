@@ -37,11 +37,12 @@ module "microcloud" {
 
 ### A MAAS cluster
 
-Each MicroCloud network gets its own Juju space, the Ceph OSDs come from a
-storage pool backed by a MAAS tag, and Juju asks MAAS for one machine per unit.
-The pool has to exist in the model first:
+Each MicroCloud network gets its own Juju space, the Ceph OSDs and local
+storage partition come from storage pools backed by MAAS tags, and Juju asks
+MAAS for one machine per unit. The pools have to exist in the model first:
 
 ```sh
+juju create-storage-pool maas-local maas tags=partition,local
 juju create-storage-pool maas-ceph maas tags=ceph
 ```
 
@@ -56,7 +57,8 @@ module "microcloud" {
   constraints = "arch=amd64"
 
   storage_directives = {
-    ceph = "maas-ceph,3,8G"
+    local = "maas-local,1,2G"
+    ceph  = "maas-ceph,3,8G"
   }
 
   endpoint_bindings = [
@@ -68,7 +70,6 @@ module "microcloud" {
   ]
 
   config = {
-    "local-device"         = "/dev/disk/by-dname/nvme0n1-part3"
     "storage-wipe"         = "true"
     "ovn-uplink-interface" = "enp9s0"
     "ovn-ipv4-gateway"     = "10.0.5.1/24"
@@ -122,21 +123,25 @@ config = {
 Every unit's hostname must appear in the mapping. A unit that is missing blocks
 rather than deploying without an uplink or local disk.
 
-**Local storage on MAAS often cannot be a Juju volume.** A storage pool selects
-by MAAS tag, and MAAS matches that tag against whole block devices when it
-allocates a machine. A tag on a partition, a RAID or an LVM volume matches no
-machine, so the unit is never placed and the storage sits `pending` — the
-deploy simply never proceeds, with `No available machine matches constraints`
-as the only clue. Name such a device with the `local-device` config option
-instead of a `local` storage directive. Whole disks tagged in MAAS work
-normally, which is why the Ceph OSDs above come through `storage_directives`.
+**Local storage on MAAS comes from a partition pool.** Create a storage pool
+tagged `partition,<tag>` (e.g. `tags=partition,local`) and pass it in
+`storage_directives` as `local = "maas-local,1,2G"`, with no `local-device`
+config. Keep three caveats in mind:
+1. MAAS selects the smallest tagged partition that fits the requested size,
+   so tag exactly one partition per node.
+2. A partition that already has a filesystem in the MAAS layout never matches,
+   and the storage sits `pending` forever.
+3. MAAS storage only attaches when Juju allocates the machine; placing units
+   with `machines` or `--to` fails (see "MAAS storage needs Juju to allocate the machine" below).
 
-**Give `local-device` a stable path.** `/dev/sdX` names can change between
-boots. On MAAS, the `/dev/disk/by-dname/` links that MAAS creates for the
-partitions it lays out (e.g. `/dev/disk/by-dname/sda-part3`) keep their names,
-and are the same on every node deployed with the same layout, so a single path
-covers them all. `local-device` is only understood by charm revisions that
-have it; an older revision fails the apply with an unknown config key.
+**Give `local-device` a stable path.** On clouds without partition pools where
+`local-device` is used, `/dev/sdX` names can change between boots. On MAAS
+(when not using a partition pool), the `/dev/disk/by-dname/` links that MAAS
+creates for the partitions it lays out (e.g. `/dev/disk/by-dname/sda-part3`)
+keep their names, and are the same on every node deployed with the same layout,
+so a single path covers them all. `local-device` is only understood by charm
+revisions that have it; an older revision fails the apply with an unknown
+config key.
 
 **Binding `ovn-uplink` only constrains placement.** The uplink NIC usually has
 no address, and Juju spaces only track addressed interfaces, so the interface
