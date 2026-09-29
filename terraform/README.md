@@ -3,7 +3,8 @@
 Deploys the MicroCloud charm as a single Juju application. This is a *charm
 module*: it takes an existing model and creates one `juju_application`. It does
 not create the model, and it does not integrate MicroCloud with anything —
-compose it from a product module for that.
+compose it from a product module for that. [`product/`](product/README.md) is
+one: it creates or reuses the model and wires MicroCloud to COS.
 
 `charmcraft.yaml` in the repository root is the source of truth for the charm's
 config options, storage and endpoints. This module deliberately does not restate
