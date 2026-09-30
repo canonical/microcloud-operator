@@ -177,7 +177,7 @@ apply time.
 | Name | Version |
 |------|---------|
 | <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.9 |
-| <a name="requirement_juju"></a> [juju](#requirement\_juju) | ~> 1.0 |
+| <a name="requirement_juju"></a> [juju](#requirement\_juju) | >= 1.0.0, < 3.0.0 |
 
 ## Modules
 
