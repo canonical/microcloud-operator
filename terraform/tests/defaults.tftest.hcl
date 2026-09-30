@@ -30,6 +30,34 @@ run "defaults" {
     condition     = one(juju_application.microcloud.charm).base == "ubuntu@24.04"
     error_message = "base should default to ubuntu@24.04"
   }
+
+  assert {
+    # CC008 defaults these to empty; the provider should still see them unset.
+    condition = (
+      juju_application.microcloud.storage_directives == null &&
+      juju_application.microcloud.endpoint_bindings == null
+    )
+    error_message = "empty storage directives and bindings should reach the provider as null"
+  }
+}
+
+run "an_explicit_null_collection_means_empty" {
+  command = plan
+
+  variables {
+    endpoint_bindings  = null
+    machines           = null
+    storage_directives = null
+  }
+
+  assert {
+    condition = (
+      juju_application.microcloud.units == 1 &&
+      juju_application.microcloud.storage_directives == null &&
+      juju_application.microcloud.endpoint_bindings == null
+    )
+    error_message = "a null collection should behave as its empty default"
+  }
 }
 
 run "config_passes_through_unchanged" {
