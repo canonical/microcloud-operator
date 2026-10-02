@@ -2324,19 +2324,39 @@ class TestFailureDomains:
         assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
         stub._failure_domains.reconcile.assert_not_called()
 
-    def test_status_action_renders_the_member_table(self):
+    def _status_action(self, *, mode_side_effect=None):
         from charm import MicroCloudCharm
+        from control_plane import ControlPlane
         from microcloud import Member
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub._control_plane = MagicMock(spec=ControlPlane)
+        stub._control_plane.mode.return_value = "inactive (0 of 3 role holders)"
+        stub._control_plane.mode.side_effect = mode_side_effect
         event = MagicMock()
+        cluster = [_member("node1", "zone-1")]
         with (
             patch("charm.microcloud.is_initialized", return_value=True),
-            patch("charm.lxd_cluster.members", return_value=[_member("node1", "zone-1")]),
+            patch("charm.lxd_cluster.members", return_value=cluster),
             patch("charm.microcloud.list_members", return_value=[Member("node1", "10.0.0.1")]),
         ):
             MicroCloudCharm._on_status_action(stub, event)
 
-        results = event.set_results.call_args.args[0]
+        stub._control_plane.mode.assert_called_once_with(cluster)
+        return event.set_results.call_args.args[0]
+
+    def test_status_action_renders_the_member_table(self):
+        results = self._status_action()
+
         assert results["members"].splitlines()[1].split() == ["node1", "-", "zone-1", "x86_64"]
+        assert results["control-plane-mode"] == "inactive (0 of 3 role holders)"
         assert json.loads(results["microcloud-members"])[0]["name"] == "node1"
+
+    def test_status_action_keeps_the_member_table_when_the_mode_is_unreadable(self):
+        import lxd_cluster
+
+        results = self._status_action(mode_side_effect=lxd_cluster.LXDClusterError("boom"))
+
+        assert "members" in results
+        assert "control-plane-mode" not in results
+        assert results["control-plane-mode-error"] == "boom"

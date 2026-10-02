@@ -514,9 +514,15 @@ class MicroCloudCharm(ops.CharmBase):
         }
         if initialized:
             try:
-                result["members"] = lxd_cluster.render_table(lxd_cluster.members())
+                cluster = lxd_cluster.members()
             except lxd_cluster.LXDClusterError as exc:
                 result["members-error"] = str(exc)
+            else:
+                result["members"] = lxd_cluster.render_table(cluster)
+                try:
+                    result["control-plane-mode"] = self._control_plane.mode(cluster)
+                except lxd_cluster.LXDClusterError as exc:
+                    result["control-plane-mode-error"] = str(exc)
             try:
                 members = microcloud.list_members()
                 result["microcloud-members"] = json.dumps(

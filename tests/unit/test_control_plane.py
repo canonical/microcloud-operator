@@ -105,6 +105,29 @@ class TestControlPlaneSummary:
         )
 
 
+class TestMode:
+    def _mode(self, cluster, *, version="6.9", extensions=("clustering_control_plane",)):
+        with patch(
+            "control_plane.lxd_cluster.server_version", return_value=(version, set(extensions))
+        ):
+            return ControlPlane().mode(cluster)
+
+    def test_active_with_3_holders(self):
+        cluster = [_holder("node1"), _holder("node2"), _holder("node3", status="Offline")]
+
+        assert self._mode(cluster) == "active (3 role holders)"
+
+    def test_inactive_below_3_holders(self):
+        assert self._mode([_holder("node1"), _member("node2")]) == (
+            "inactive (1 of 3 role holders)"
+        )
+
+    def test_unsupported_on_lxd_without_the_role(self):
+        assert self._mode([_member("node1")], version="5.21.4", extensions=()) == (
+            "unsupported (LXD 5.21.4)"
+        )
+
+
 class TestActions:
     def _run(
         self,
