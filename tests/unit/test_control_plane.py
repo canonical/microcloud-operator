@@ -128,6 +128,50 @@ class TestMode:
         )
 
 
+class TestCoverageWarning:
+    def _warning(self, cluster=None, *, side_effect=None):
+        with patch(
+            "control_plane.lxd_cluster.members", return_value=cluster, side_effect=side_effect
+        ):
+            return ControlPlane().coverage_warning()
+
+    def test_no_warning_without_holders(self):
+        """LXD stores no intent, so a cluster that never used the role is left alone."""
+        assert self._warning([_member("node1", "rack1"), _member("node2", "rack2")]) is None
+
+    @pytest.mark.parametrize("count", [1, 2])
+    def test_warns_below_3_holders(self, count):
+        cluster = [_holder(f"node{i}", f"rack{i}") for i in range(count)]
+
+        assert (
+            self._warning(cluster) == f"control-plane: mode inactive ({count} of 3 role holders)"
+        )
+
+    def test_no_warning_with_one_failure_domain(self):
+        assert self._warning([_holder("node1"), _holder("node2"), _holder("node3")]) is None
+
+    def test_no_warning_with_2_online_holders_per_failure_domain(self):
+        cluster = [_holder(f"node{i}", f"rack{i % 3}") for i in range(6)]
+
+        assert self._warning(cluster) is None
+
+    def test_names_each_thin_failure_domain(self):
+        cluster = [
+            _holder("node1", "rack1"),
+            _holder("node2", "rack1"),
+            _holder("node3", "rack2"),
+            _holder("node4", "rack2", status="Offline"),
+            _member("node5", "rack3"),
+        ]
+
+        assert self._warning(cluster) == (
+            "control-plane: rack2 has 1 online role holder, rack3 has 0 online role holders"
+        )
+
+    def test_an_unreadable_cluster_is_not_a_warning(self):
+        assert self._warning(side_effect=lxd_cluster.LXDClusterError("boom")) is None
+
+
 class TestActions:
     def _run(
         self,

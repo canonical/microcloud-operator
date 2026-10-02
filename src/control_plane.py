@@ -44,6 +44,36 @@ class ControlPlane:
             return f"unsupported (LXD {version})"
         return lxd_cluster.control_plane_summary(cluster).mode
 
+    def coverage_warning(self) -> str | None:
+        """Return a warning when role holders are too few or too thin, or None.
+
+        LXD stores no intent, so a cluster without role holders gets no
+        warning. One that is down to 1 or 2 does: removals and redeploys leave
+        clusters there first. With at least 2 failure domains, every one of
+        them should keep 2 online role holders, so that losing one domain
+        still leaves enough to restore 3 voters.
+        """
+        try:
+            summary = lxd_cluster.control_plane_summary(lxd_cluster.members())
+        except lxd_cluster.LXDClusterError as exc:
+            logger.debug("Cannot check control-plane coverage: %s", exc)
+            return None
+
+        if not summary.holders:
+            return None
+        if len(summary.holders) < lxd_cluster.CONTROL_PLANE_MIN_HOLDERS:
+            return f"control-plane: mode {summary.mode}"
+
+        online = summary.online_by_failure_domain
+        if len(online) < 2:
+            return None
+        thin = [
+            f"{domain} has {count} online role holder{'' if count == 1 else 's'}"
+            for domain, count in sorted(online.items())
+            if count < 2
+        ]
+        return f"control-plane: {', '.join(thin)}" if thin else None
+
     def _set_role(self, event: ops.ActionEvent, *, present: bool) -> None:
         hostname = microcloud.hostname()
         try:
