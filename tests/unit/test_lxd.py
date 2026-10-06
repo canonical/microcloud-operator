@@ -79,7 +79,12 @@ def test_ensure_loki_config_sets_url():
         manager.ensure_loki_config(endpoints)
 
     client.api.put.assert_called_once_with(
-        json={"config": {"loki.api.url": "http://127.0.0.1:3100"}}
+        json={
+            "config": {
+                "loki.api.url": "http://127.0.0.1:3100",
+                "loki.api.check_ready": "false",
+            }
+        }
     )
 
 
@@ -88,3 +93,17 @@ def test_ensure_loki_config_no_endpoints_is_noop():
     with patch("lxd.pylxd.Client") as client_cls:
         manager.ensure_loki_config([])
     client_cls.assert_not_called()
+
+
+def test_teardown_loki_config_calls_lxd_api():
+    manager = LXDManager()
+    client = _mock_client(
+        {
+            "loki.api.url": "http://127.0.0.1:3100",
+            "loki.api.check_ready": "false",
+        }
+    )
+    with patch("lxd.pylxd.Client", return_value=client):
+        manager.teardown_loki_config()
+
+    client.api.put.assert_called_once_with(json={"config": {}})
