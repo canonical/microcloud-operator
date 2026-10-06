@@ -80,7 +80,13 @@ class LXDManager:
         url = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
 
         try:
-            self._lxc_config_set({"loki.api.url": url})
+            self._lxc_config_set(
+                {
+                    "loki.api.url": url,
+                    # Disable the readiness check for the Loki API as the opentelemetry-collector OTLP endpoint doesn't support it.
+                    "loki.api.check_ready": "false",
+                }
+            )
         except LXDConfigError as exc:
             logger.warning("Cannot set LXD loki.api.url: %s", exc)
             return
@@ -90,7 +96,7 @@ class LXDManager:
     def teardown_loki_config(self) -> None:
         """Stop LXD from streaming logs to Loki."""
         try:
-            self._lxc_config_unset(["loki.api.url"])
+            self._lxc_config_unset(["loki.api.url", "loki.api.check_ready"])
         except LXDConfigError as exc:
             logger.warning("Cannot reset LXD loki.api.url during teardown: %s", exc)
             return
