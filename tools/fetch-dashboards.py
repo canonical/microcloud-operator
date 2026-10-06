@@ -43,7 +43,7 @@ _DATASOURCE_INPUTS: dict[str, str] = {
 # ---------------------------------------------------------------------------
 
 # Commits in the upstream charm repositories.
-LXD_REF = "966a0381ef459724343b8b6d8fafccc87fb5f2cb"
+LXD_REF = "26e5294e7f31cfd33a4fdcccd98f4d7a1cc40bed"
 MICROCEPH_REF = "9e8e20aadd5cf8434cd24bb1b6770f3b1f7a2205"
 MICROOVN_REF = "be49a96072896c8c8aa4758455136e1c1df6de8e"
 
@@ -61,9 +61,11 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
         ),
     ],
     "microceph": [
-        (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/grafana_dashboards/{name}.json",
-         ["microcloud", "microceph"])
+        (
+            f"{name}.json",
+            f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/grafana_dashboards/{name}.json",
+            ["microcloud", "microceph"],
+        )
         for name in [
             "ceph-cluster-advanced",
             "ceph-cluster",
@@ -82,9 +84,11 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
         ]
     ],
     "microovn": [
-        (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/dashboards/{name}.json",
-         ["microcloud", "microovn"])
+        (
+            f"{name}.json",
+            f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/dashboards/{name}.json",
+            ["microcloud", "microovn"],
+        )
         for name in [
             "central-north-daemon",
             "central-northbound-db",
