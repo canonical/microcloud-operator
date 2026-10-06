@@ -6,36 +6,15 @@ subordinate: false
 summary: Operate observability for an externally deployed MicroCloud cluster.
 
 description: |
-  The MicroCloud charm does NOT deploy or bootstrap a MicroCloud cluster.
+  The MicroCloud charm does not deploy or bootstrap a MicroCloud cluster.
   MicroCloud (LXD, MicroCeph, MicroOVN) must already be deployed
   out-of-band, with each MicroCloud member added to Juju via
-  "juju add-machine" and this charm then deployed across all of those
-  machines.
+  "juju add-machine".
 
-  On each unit the charm requires MicroCloud to already be initialized: it
+  On each unit the charm requires MicroCloud to already be initialized. It
   validates that this unit's own hostname is a MicroCloud member and blocks
   if it is not. The charm never installs the MicroCloud component snaps but
   it may install the ovn-exporter snap.
-
-  Observability (optional)
-  ------------------------
-  Metrics integration is only configured when a related
-  opentelemetry-collector subordinate is attached via the cos-agent relation.
-  When related, the charm ensures Prometheus-compatible endpoints exist for
-  LXD, MicroCeph, and MicroOVN and advertises them. MicroCeph's own logs are
-  also forwarded over this same relation (via its "ceph-logs" snap slot).
-  When the relation is removed, the metrics setup is torn down. A base
-  MicroCloud deployment performs no metrics setup.
-
-  Log forwarding for LXD is configured separately, over the "logging"
-  relation (loki_push_api interface). When related to a Loki-compatible
-  endpoint (e.g. opentelemetry-collector's receive-loki-logs endpoint), the
-  charm configures LXD's native Loki client (loki.api.url) to stream its
-  logs there directly. Since that endpoint is always provided by a
-  subordinate co-located on this same machine, the host is always forced to
-  127.0.0.1 (only the published scheme/port/path are kept) rather than
-  trusting the hostname/address published over the relation. When the
-  relation is removed, LXD's Loki streaming is disabled again.
 
 links:
   source: https://github.com/canonical/charm-microcloud
@@ -107,8 +86,8 @@ config:
       default: "lxd_remote"
       description: >
         Comma-separated list of RBD pools to collect per-image IO statistics
-        for (mgr/prometheus/rbd_stats_pools). Empty disables
-        per-image RBD stats, required by the bundled rbd-details and
+        for (mgr/prometheus/rbd_stats_pools). An empty string disables
+        per-image RBD stats. Required by the bundled rbd-details and
         rbd-overview dashboards.
 
     ceph-enable-perf-metrics:
@@ -116,13 +95,13 @@ config:
       default: true
       description: >
         Include Ceph performance counters in the Prometheus mgr module
-        output (mgr/prometheus/exclude_perf_counters, inverted).
+        output (mgr/prometheus/exclude_perf_counters).
 
     ovn-exporter-channel:
       type: string
       default: "latest/edge"
       description: >
-        Snap Store channel for the ovn-exporter snap (observability only).
+        Snap Store channel for the ovn-exporter snap.
 
     lxd-metrics-listen-port:
       type: int
