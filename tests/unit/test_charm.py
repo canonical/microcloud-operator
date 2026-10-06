@@ -79,11 +79,32 @@ class TestLokiRelationHandlers:
         MicroCloudCharm._on_loki_push_api_endpoint_joined(stub, MagicMock())
         stub._observability.ensure_loki.assert_called_once_with(stub._loki_consumer.loki_endpoints)
 
-    def test_departed_stops_lxd_streaming_logs(self):
+    def test_departed_repoints_lxd_at_a_remaining_endpoint(self):
         from charm import MicroCloudCharm
 
         stub = self._make_charm_stub()
+        stub._loki_consumer.loki_endpoints = [{"url": "http://otelcol-1:3500/loki/api/v1/push"}]
         MicroCloudCharm._on_loki_push_api_endpoint_departed(stub, MagicMock())
+        stub._observability.ensure_loki.assert_called_once_with(
+            [{"url": "http://otelcol-1:3500/loki/api/v1/push"}]
+        )
+        stub._observability.teardown_loki.assert_not_called()
+
+    def test_departed_stops_lxd_streaming_logs_when_no_endpoint_is_left(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        stub._loki_consumer.loki_endpoints = []
+        MicroCloudCharm._on_loki_push_api_endpoint_departed(stub, MagicMock())
+        stub._observability.teardown_loki.assert_called_once()
+        stub._observability.ensure_loki.assert_not_called()
+
+    def test_broken_stops_lxd_streaming_logs(self):
+        from charm import MicroCloudCharm
+
+        stub = self._make_charm_stub()
+        stub._loki_consumer.loki_endpoints = [{"url": "http://otelcol-1:3500/loki/api/v1/push"}]
+        MicroCloudCharm._on_loki_push_api_endpoint_broken(stub, MagicMock())
         stub._observability.teardown_loki.assert_called_once()
 
 

@@ -3,7 +3,8 @@
 Deploys the MicroCloud charm as a single Juju application. This is a *charm
 module*: it takes an existing model and creates one `juju_application`. It does
 not create the model, and it does not integrate MicroCloud with anything —
-compose it from a product module for that.
+compose it from a product module for that. [`product/`](product/README.md) is
+one: it creates or reuses the model and wires MicroCloud to COS.
 
 `charmcraft.yaml` in the repository root is the source of truth for the charm's
 config options, storage and endpoints. This module deliberately does not restate
@@ -82,15 +83,16 @@ module "microcloud" {
 ### Wiring up observability
 
 Integrations belong to the caller, not to this module. The `provides` and
-`requires` outputs give you the endpoint names:
+`requires` outputs describe each endpoint in the CC008 shape, `{ kind =
+"endpoint", name = <application>, endpoint = <endpoint> }`:
 
 ```hcl
 resource "juju_integration" "cos_agent" {
   model_uuid = juju_model.prod.uuid
 
   application {
-    name     = module.microcloud.application.name
-    endpoint = module.microcloud.provides.cos_agent
+    name     = module.microcloud.provides.cos_agent.name
+    endpoint = module.microcloud.provides.cos_agent.endpoint
   }
 
   application {
@@ -176,7 +178,7 @@ apply time.
 | Name | Version |
 |------|---------|
 | <a name="requirement_terraform"></a> [terraform](#requirement\_terraform) | >= 1.9 |
-| <a name="requirement_juju"></a> [juju](#requirement\_juju) | ~> 1.0 |
+| <a name="requirement_juju"></a> [juju](#requirement\_juju) | >= 1.0.0, < 3.0.0 |
 
 ## Modules
 
@@ -197,11 +199,11 @@ No modules.
 | <a name="input_channel"></a> [channel](#input\_channel) | Charm channel to deploy, as <track>/<risk>[/<branch>]. | `string` | `"3/edge"` | no |
 | <a name="input_config"></a> [config](#input\_config) | Charm config options, passed through unchanged. Every value is a string:<br/>"true" for booleans, "300" for integers. Options that take a mapping of<br/>hostname to value ("local-device", "ovn-uplink-interface") take a<br/>yamlencode(...) of that map. See the charm's charmcraft.yaml for the<br/>available options; this module deliberately does not restate them. | `map(string)` | `{}` | no |
 | <a name="input_constraints"></a> [constraints](#input\_constraints) | Juju constraints for the application, e.g. "arch=amd64 tags=microcloud". | `string` | `null` | no |
-| <a name="input_endpoint_bindings"></a> [endpoint\_bindings](#input\_endpoint\_bindings) | Bindings of endpoints to Juju spaces. An entry with no endpoint sets the<br/>application's default space. On MAAS the extra-bindings are what put each<br/>MicroCloud network on its own space. | <pre>set(object({<br/>    endpoint = optional(string)<br/>    space    = string<br/>  }))</pre> | `null` | no |
-| <a name="input_machines"></a> [machines](#input\_machines) | Machines to place units on, e.g. ["0", "1", "2"]. The unit count becomes<br/>the size of this set; "units" must be left at 1 or match it. | `set(string)` | `null` | no |
+| <a name="input_endpoint_bindings"></a> [endpoint\_bindings](#input\_endpoint\_bindings) | Bindings of endpoints to Juju spaces. An entry with no endpoint sets the<br/>application's default space. On MAAS the extra-bindings are what put each<br/>MicroCloud network on its own space. | <pre>set(object({<br/>    endpoint = optional(string)<br/>    space    = string<br/>  }))</pre> | `[]` | no |
+| <a name="input_machines"></a> [machines](#input\_machines) | Machines to place units on, e.g. ["0", "1", "2"]. The unit count becomes<br/>the size of this set; "units" must be left at 1 or match it. | `set(string)` | `[]` | no |
 | <a name="input_model_uuid"></a> [model\_uuid](#input\_model\_uuid) | UUID of the Juju model to deploy into. | `string` | n/a | yes |
 | <a name="input_revision"></a> [revision](#input\_revision) | Charm revision to deploy. Defaults to the channel's latest. | `number` | `null` | no |
-| <a name="input_storage_directives"></a> [storage\_directives](#input\_storage\_directives) | Juju storage directives keyed by storage name, e.g.<br/>{ local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the<br/>charm accepts zero local disks and zero Ceph disks. | `map(string)` | `null` | no |
+| <a name="input_storage_directives"></a> [storage\_directives](#input\_storage\_directives) | Juju storage directives keyed by storage name, e.g.<br/>{ local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the<br/>charm accepts zero local disks and zero Ceph disks. | `map(string)` | `{}` | no |
 | <a name="input_units"></a> [units](#input\_units) | Number of units to deploy. With "machines" set, the unit count is the<br/>number of machines, so this must be left at 1 or match it. | `number` | `1` | no |
 
 ## Outputs
@@ -209,6 +211,6 @@ No modules.
 | Name | Description |
 |------|-------------|
 | <a name="output_application"></a> [application](#output\_application) | The deployed juju\_application object. |
-| <a name="output_provides"></a> [provides](#output\_provides) | Endpoints this charm provides, keyed by alias. |
-| <a name="output_requires"></a> [requires](#output\_requires) | Endpoints this charm requires, keyed by alias. |
+| <a name="output_provides"></a> [provides](#output\_provides) | Endpoints this charm provides, keyed by alias, in the CC008 endpoint shape. |
+| <a name="output_requires"></a> [requires](#output\_requires) | Endpoints this charm requires, keyed by alias, in the CC008 endpoint shape. |
 <!-- END_TF_DOCS -->

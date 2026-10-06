@@ -74,14 +74,15 @@ variable "endpoint_bindings" {
     endpoint = optional(string)
     space    = string
   }))
-  default = null
+  default  = []
+  nullable = false
 
   validation {
     # A conditional rather than "binding.endpoint == null || contains(...)":
     # "||" is not lazy in older Terraform, so contains() is called with a
     # null and errors. An absent endpoint means the default space, same as "".
-    condition = var.endpoint_bindings == null || alltrue([
-      for binding in coalesce(var.endpoint_bindings, []) :
+    condition = alltrue([
+      for binding in var.endpoint_bindings :
       contains(
         ["", "cluster", "cos-agent", "logging",
         "ceph-public", "ceph-internal", "ovn-underlay", "ovn-uplink"],
@@ -98,11 +99,12 @@ variable "machines" {
     the size of this set; "units" must be left at 1 or match it.
   EOT
   type        = set(string)
-  default     = null
+  default     = []
+  nullable    = false
 
   validation {
-    condition = var.machines == null || alltrue([
-      for machine in coalesce(var.machines, []) :
+    condition = alltrue([
+      for machine in var.machines :
       can(regex("^[0-9]+(/(lxd|kvm)/[0-9]+)?$", machine))
     ])
     error_message = "machines must be Juju machine IDs, e.g. \"0\" or \"0/lxd/1\"."
@@ -133,11 +135,12 @@ variable "storage_directives" {
     charm accepts zero local disks and zero Ceph disks.
   EOT
   type        = map(string)
-  default     = null
+  default     = {}
+  nullable    = false
 
   validation {
-    condition = var.storage_directives == null || alltrue([
-      for name in keys(coalesce(var.storage_directives, {})) :
+    condition = alltrue([
+      for name in keys(var.storage_directives) :
       contains(["local", "ceph"], name)
     ])
     error_message = "storage_directives keys must be \"local\" or \"ceph\", the storage the charm declares."
@@ -163,9 +166,9 @@ variable "units" {
   # machines set counts as unset, matching main.tf.
   validation {
     condition = (
-      length(coalesce(var.machines, [])) == 0 ||
+      length(var.machines) == 0 ||
       var.units == 1 ||
-      var.units == length(coalesce(var.machines, []))
+      var.units == length(var.machines)
     )
     error_message = "units contradicts machines: with machines set, the unit count is length(machines). Leave units at 1 or match it."
   }

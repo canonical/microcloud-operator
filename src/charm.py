@@ -45,6 +45,10 @@ logging-relation-joined / changed
       Loki-compatible endpoint (e.g. opentelemetry-collector's
       receive-loki-logs) so LXD streams its own logs there directly.
 
+logging-relation-departed
+    • Re-point LXD at a remaining endpoint, or disable streaming when none
+      is left.
+
 logging-relation-broken
     • Disable LXD's Loki streaming again.
 """
@@ -158,7 +162,7 @@ class MicroCloudCharm(ops.CharmBase):
             self.on.logging_relation_departed, self._on_loki_push_api_endpoint_departed
         )
         self.framework.observe(
-            self.on.logging_relation_broken, self._on_loki_push_api_endpoint_departed
+            self.on.logging_relation_broken, self._on_loki_push_api_endpoint_broken
         )
 
         # Actions
@@ -218,7 +222,18 @@ class MicroCloudCharm(ops.CharmBase):
     def _on_loki_push_api_endpoint_joined(self, event: ops.EventBase) -> None:
         self._observability.ensure_loki(self._loki_consumer.loki_endpoints)
 
-    def _on_loki_push_api_endpoint_departed(self, event: ops.RelationEvent) -> None:
+    def _on_loki_push_api_endpoint_departed(self, event: ops.RelationDepartedEvent) -> None:
+        # The relation is global, so a subordinate collector on every machine
+        # is a remote unit of every MicroCloud unit, and one leaving with its
+        # machine must not stop streaming for the whole cluster. Juju already
+        # leaves the departing unit out of the relation here.
+        endpoints = self._loki_consumer.loki_endpoints
+        if endpoints:
+            self._observability.ensure_loki(endpoints)
+        else:
+            self._observability.teardown_loki()
+
+    def _on_loki_push_api_endpoint_broken(self, event: ops.RelationBrokenEvent) -> None:
         self._observability.teardown_loki()
 
     # ------------------------------------------------------------------

@@ -10,7 +10,7 @@ terraform {
       source = "juju/juju"
       # v1.0.0 renamed "model" to "model_uuid" and replaced "placement" with
       # "machines", both of which this module uses.
-      version = "~> 1.0"
+      version = ">= 1.0.0, < 3.0.0"
     }
   }
 }
