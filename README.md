@@ -54,7 +54,7 @@ Later consume them and connect with the MicroCloud charm:
 
 * `juju deploy opentelemetry-collector`
 * `juju relate opentelemetry-collector <microcloud charm>:cos_agent`
+* `juju relate opentelemetry-collector <microcloud charm>:logging`
 * `juju relate opentelemetry-collector loki`
 * `juju relate opentelemetry-collector prometheus`
 * `juju relate opentelemetry-collector grafana`
-* `juju relate <microcloud charm>:logging loki`
