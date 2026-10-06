@@ -61,9 +61,11 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
         ),
     ],
     "microceph": [
-        (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/grafana_dashboards/{name}.json",
-         ["microcloud", "microceph"])
+        (
+            f"{name}.json",
+            f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/grafana_dashboards/{name}.json",
+            ["microcloud", "microceph"],
+        )
         for name in [
             "ceph-cluster-advanced",
             "ceph-cluster",
@@ -82,9 +84,11 @@ DASHBOARDS: dict[str, list[tuple[str, str, list[str]]]] = {
         ]
     ],
     "microovn": [
-        (f"{name}.json",
-         f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/dashboards/{name}.json",
-         ["microcloud", "microovn"])
+        (
+            f"{name}.json",
+            f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/dashboards/{name}.json",
+            ["microcloud", "microovn"],
+        )
         for name in [
             "central-north-daemon",
             "central-northbound-db",
