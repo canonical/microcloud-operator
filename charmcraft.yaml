@@ -3,7 +3,7 @@ title: MicroCloud
 type: charm
 subordinate: false
 
-summary: Operate observability for an externally deployed MicroCloud cluster.
+summary: Manage observability for an externally deployed MicroCloud cluster.
 
 description: |
   The MicroCloud charm does not deploy or bootstrap a MicroCloud cluster.

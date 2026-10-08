@@ -1,7 +1,6 @@
-# MicroCloud charm
+# MicroCloud operator charm
 
-This charm operates observability (metrics + logs) and membership
-consistency checks for a MicroCloud cluster (LXD, MicroCeph, MicroOVN).
+This charm manages observability for a MicroCloud cluster.
 
 **This charm does not deploy or bootstrap MicroCloud.** MicroCloud must
 already be deployed out-of-band. Once it is:
@@ -14,7 +13,7 @@ already be deployed out-of-band. Once it is:
    --to <machine-ids>`).
 
 On every unit the charm requires MicroCloud to already be initialized and
-verifies that this unit's own hostname is a MicroCloud member; if it is
+verifies that this unit's own hostname is a MicroCloud member. If it is
 not, the unit goes into an error state, since the charm is only supported
 on machines that are already MicroCloud members.
 
@@ -26,7 +25,7 @@ on machines that are already MicroCloud members.
 
 ## Deploy the charm
 
-Prereq:
+Prerequisites:
 * MicroCloud is already deployed and bootstrapped out-of-band on the target machines.
 * A Juju controller reachable from those machines.
 * Each target machine added to the model as a manual machine, e.g.
@@ -34,9 +33,9 @@ Prereq:
 
 Then deploy the charm across those machines, one unit per machine:
 
-`juju deploy ./microcloud_ubuntu@24.04-amd64.charm microcloud -n 3 --to 0,1,2`
+`juju deploy microcloud --channel 3/stable -n 3 --to 0,1,2`
 
-## Growing the cluster
+## Add a cluster member
 
 Grow MicroCloud itself out-of-band first (adding the new member to the
 MicroCloud cluster), then add the corresponding Juju machine and a new
@@ -48,7 +47,7 @@ since its hostname is not yet a MicroCloud member.
 
 Integrate with COS:
 
-As a prereq we need the COS stack.
+As a prerequisite we need the COS stack.
 Then offer the loki, prometheus and grafana SAAS bindings.
 Later consume them and connect with the MicroCloud charm:
 
