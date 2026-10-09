@@ -2345,6 +2345,42 @@ class TestFailureDomains:
         assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
         stub._failure_domains.reconcile.assert_not_called()
 
+    def _set_status(self, *, leader, warning="control-plane: rack2 has 1 online role holder"):
+        from charm import MicroCloudCharm
+        from control_plane import ControlPlane
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.unit.is_leader.return_value = leader
+        stub._cos_related.return_value = False
+        stub._control_plane = MagicMock(spec=ControlPlane)
+        stub._control_plane.coverage_warning.return_value = warning
+        MicroCloudCharm._set_status(stub, initialized=True)
+        return stub
+
+    def test_the_leader_appends_the_control_plane_warning(self):
+        import ops
+
+        stub = self._set_status(leader=True)
+
+        assert stub.unit.status == ops.ActiveStatus(
+            "Cluster ready; control-plane: rack2 has 1 online role holder"
+        )
+
+    def test_the_leader_without_a_warning_is_just_ready(self):
+        import ops
+
+        stub = self._set_status(leader=True, warning=None)
+
+        assert stub.unit.status == ops.ActiveStatus("Cluster ready")
+
+    def test_only_the_leader_checks_control_plane_coverage(self):
+        import ops
+
+        stub = self._set_status(leader=False)
+
+        stub._control_plane.coverage_warning.assert_not_called()
+        assert stub.unit.status == ops.ActiveStatus("Cluster ready")
+
     def _status_action(self, *, mode_side_effect=None):
         from charm import MicroCloudCharm
         from control_plane import ControlPlane

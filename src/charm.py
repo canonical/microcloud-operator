@@ -507,15 +507,21 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.WaitingStatus("Waiting for cluster to form")
             return
 
+        message = "Cluster ready"
         if self._cos_related():
             problems = self._observability.health_problems()
             if problems:
                 self.unit.status = ops.BlockedStatus("; ".join(problems))
                 return
-            self.unit.status = ops.ActiveStatus("Cluster ready; observability active")
-            return
+            message += "; observability active"
 
-        self.unit.status = ops.ActiveStatus("Cluster ready")
+        # The leader alone reports control-plane coverage, so it shows once.
+        if self.unit.is_leader():
+            warning = self._control_plane.coverage_warning()
+            if warning:
+                message += f"; {warning}"
+
+        self.unit.status = ops.ActiveStatus(message)
 
     # ------------------------------------------------------------------
     # Action handlers
