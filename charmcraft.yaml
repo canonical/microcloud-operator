@@ -63,6 +63,12 @@ platforms:
   ubuntu@26.04:amd64:
   ubuntu@26.04:arm64:
 
+charm-libs:
+  - lib: grafana-agent.cos_agent
+    version: "0"
+  - lib: loki-k8s.loki_push_api
+    version: "1"
+
 parts:
   charm:
     source: .
@@ -328,9 +334,22 @@ actions:
     description: >
       Print the detected charm mode and the cluster members as seen by this
       unit: a table of their names, database roles, failure domains and
-      architectures, and the MicroCloud membership.
+      architectures, LXD's control-plane mode, and the MicroCloud membership.
 
   dump-metrics-config:
     description: >
       Print the cos-agent scrape configs this unit is advertising. Useful for
       debugging observability integration.
+
+  add-control-plane-role:
+    description: >
+      Give this unit's LXD cluster member the control-plane role. Once at
+      least 3 members hold it, only role holders can be database voters or
+      standbys; extra holders stay spares. Every role holder is an event hub.
+      Needs LXD 6.8 or later. Run it on each unit that should hold the role:
+      juju run microcloud/0 microcloud/1 microcloud/2 add-control-plane-role
+
+  remove-control-plane-role:
+    description: >
+      Take the control-plane role from this unit's LXD cluster member. With
+      fewer than 3 role holders, LXD stops restricting its database to them.

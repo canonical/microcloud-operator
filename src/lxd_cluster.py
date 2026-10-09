@@ -1,7 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""LXD cluster members, their failure domains and database roles.
+"""LXD cluster members, their failure domains and roles.
 
 MicroCloud cannot set a member's failure domain when it forms or grows the
 cluster, so the charm sets it afterwards through the local LXD API.
@@ -15,6 +15,12 @@ from dataclasses import dataclass, field
 # have added back once a member has lost them. Older releases skip them too,
 # but insist "database" matches the member's, so that one is kept.
 _AUTOMATIC_ROLES = {"database-voter", "database-standby", "database-leader"}
+
+CONTROL_PLANE_ROLE = "control-plane"
+CONTROL_PLANE_EXTENSION = "clustering_control_plane"
+# LXD keeps database roles on role holders once at least this many members
+# hold the role, counting offline ones.
+CONTROL_PLANE_MIN_HOLDERS = 3
 
 
 class LXDClusterError(Exception):
@@ -89,6 +95,62 @@ def set_failure_domain(name: str, failure_domain: str) -> None:
     ]
     writable["failure_domain"] = failure_domain
     _query(path, "PUT", writable)
+
+
+def server_version() -> tuple[str, set[str]]:
+    """Return this server's LXD version and its API extensions."""
+    server = _query("/1.0")
+    if not isinstance(server, dict):
+        raise LXDClusterError("Unexpected response for /1.0")
+    environment = server.get("environment") or {}
+    return environment.get("server_version", ""), set(server.get("api_extensions") or [])
+
+
+def set_control_plane_role(name: str, present: bool) -> bool:
+    """Add or remove member ``name``'s control-plane role. Returns False if unchanged.
+
+    ``lxc cluster role`` reads the member and writes it back with its ETag,
+    so a member changed in between fails the write instead of being
+    overwritten. ``lxc query`` cannot send the ETag.
+    """
+    command = ["lxc", "cluster", "role", "add" if present else "remove", name, CONTROL_PLANE_ROLE]
+    try:
+        subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        if "already has role" in detail or "does not have role" in detail:
+            return False
+        if "ETag does not match" in detail:
+            raise LXDClusterError("cluster member changed; run the action again") from exc
+        raise LXDClusterError(f"{' '.join(command)} failed: {detail}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LXDClusterError(f"{' '.join(command)} failed: {exc}") from exc
+    return True
+
+
+@dataclass
+class ControlPlaneSummary:
+    """Control-plane role holders across the cluster."""
+
+    holders: list[str]
+    online_by_failure_domain: dict[str, int]
+
+    @property
+    def mode(self) -> str:
+        """Describe control-plane mode the way the actions report it."""
+        if len(self.holders) >= CONTROL_PLANE_MIN_HOLDERS:
+            return f"active ({len(self.holders)} role holders)"
+        return f"inactive ({len(self.holders)} of {CONTROL_PLANE_MIN_HOLDERS} role holders)"
+
+
+def control_plane_summary(cluster: list[Member]) -> ControlPlaneSummary:
+    """Summarize role holders, online or not, and online holders per failure domain."""
+    holders = sorted(member.name for member in cluster if CONTROL_PLANE_ROLE in member.roles)
+    online: dict[str, int] = {member.failure_domain: 0 for member in cluster}
+    for member in cluster:
+        if CONTROL_PLANE_ROLE in member.roles and member.status == "Online":
+            online[member.failure_domain] += 1
+    return ControlPlaneSummary(holders=holders, online_by_failure_domain=online)
 
 
 def render_table(cluster: list[Member]) -> str:

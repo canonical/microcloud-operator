@@ -68,6 +68,7 @@ import network
 import session
 import snap
 from cluster import ClusterCoordinator, PeerSystem, validate_membership
+from control_plane import ControlPlane
 from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
@@ -98,6 +99,7 @@ class MicroCloudCharm(ops.CharmBase):
         )
 
         self._coordinator = ClusterCoordinator(self)
+        self._control_plane = ControlPlane()
         self._failure_domains = FailureDomains()
         self._network = UnitNetwork(self.model, self.config)
         self._sessions = session.JoinSessions(
@@ -168,6 +170,10 @@ class MicroCloudCharm(ops.CharmBase):
         # Actions
         self.framework.observe(self.on.status_action, self._on_status_action)
         self.framework.observe(self.on.dump_metrics_config_action, self._on_dump_metrics_config)
+        self.framework.observe(self.on.add_control_plane_role_action, self._on_add_control_plane)
+        self.framework.observe(
+            self.on.remove_control_plane_role_action, self._on_remove_control_plane
+        )
 
     # ------------------------------------------------------------------
     # Mode detection
@@ -501,15 +507,21 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.WaitingStatus("Waiting for cluster to form")
             return
 
+        message = "Cluster ready"
         if self._cos_related():
             problems = self._observability.health_problems()
             if problems:
                 self.unit.status = ops.BlockedStatus("; ".join(problems))
                 return
-            self.unit.status = ops.ActiveStatus("Cluster ready; observability active")
-            return
+            message += "; observability active"
 
-        self.unit.status = ops.ActiveStatus("Cluster ready")
+        # The leader alone reports control-plane coverage, so it shows once.
+        if self.unit.is_leader():
+            warning = self._control_plane.coverage_warning()
+            if warning:
+                message += f"; {warning}"
+
+        self.unit.status = ops.ActiveStatus(message)
 
     # ------------------------------------------------------------------
     # Action handlers
@@ -523,9 +535,15 @@ class MicroCloudCharm(ops.CharmBase):
         }
         if initialized:
             try:
-                result["members"] = lxd_cluster.render_table(lxd_cluster.members())
+                cluster = lxd_cluster.members()
             except lxd_cluster.LXDClusterError as exc:
                 result["members-error"] = str(exc)
+            else:
+                result["members"] = lxd_cluster.render_table(cluster)
+                try:
+                    result["control-plane-mode"] = self._control_plane.mode(cluster)
+                except lxd_cluster.LXDClusterError as exc:
+                    result["control-plane-mode-error"] = str(exc)
             try:
                 members = microcloud.list_members()
                 result["microcloud-members"] = json.dumps(
@@ -538,6 +556,12 @@ class MicroCloudCharm(ops.CharmBase):
     def _on_dump_metrics_config(self, event: ops.ActionEvent) -> None:
         configs = self._observability.scrape_configs()
         event.set_results({"scrape-configs": json.dumps(configs, indent=2)})
+
+    def _on_add_control_plane(self, event: ops.ActionEvent) -> None:
+        self._control_plane.on_add_action(event)
+
+    def _on_remove_control_plane(self, event: ops.ActionEvent) -> None:
+        self._control_plane.on_remove_action(event)
 
 
 if __name__ == "__main__":
