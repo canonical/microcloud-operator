@@ -37,6 +37,13 @@ class ControlPlane:
         """Take the control-plane role from this unit's member."""
         self._set_role(event, present=False)
 
+    def mode(self, cluster: list[lxd_cluster.Member]) -> str:
+        """Describe control-plane mode for the status action."""
+        version, extensions = lxd_cluster.server_version()
+        if lxd_cluster.CONTROL_PLANE_EXTENSION not in extensions:
+            return f"unsupported (LXD {version})"
+        return lxd_cluster.control_plane_summary(cluster).mode
+
     def _set_role(self, event: ops.ActionEvent, *, present: bool) -> None:
         hostname = microcloud.hostname()
         try:

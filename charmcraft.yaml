@@ -328,7 +328,7 @@ actions:
     description: >
       Print the detected charm mode and the cluster members as seen by this
       unit: a table of their names, database roles, failure domains and
-      architectures, and the MicroCloud membership.
+      architectures, LXD's control-plane mode, and the MicroCloud membership.
 
   dump-metrics-config:
     description: >
