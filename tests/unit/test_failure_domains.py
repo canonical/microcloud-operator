@@ -29,10 +29,11 @@ class TestZone:
 
 
 class TestReconcile:
-    def _set(self, members, *, zone="zone-1", set_side_effect=None):
+    def _set(self, members, *, zone="zone-1", set_side_effect=None, own_name="node1"):
         with (
             _zone(zone),
             patch("failure_domains.microcloud.hostname", return_value="node1"),
+            patch("failure_domains.lxd_cluster.own_name", return_value=own_name),
             patch("failure_domains.lxd_cluster.members", return_value=members),
             patch(
                 "failure_domains.lxd_cluster.set_failure_domain", side_effect=set_side_effect
@@ -46,6 +47,14 @@ class TestReconcile:
 
         assert problem is None
         set_failure_domain.assert_called_once_with("node1", "zone-1")
+
+    def test_a_renamed_member_is_found_by_its_own_name(self):
+        """The hostname is node1, but this server is the member called "node-a"."""
+        members = [_member("node1", "zone-1"), _member("node-a", "default")]
+        problem, set_failure_domain = self._set(members, own_name="node-a")
+
+        assert problem is None
+        set_failure_domain.assert_called_once_with("node-a", "zone-1")
 
     def test_leaves_a_matching_failure_domain_alone(self):
         problem, set_failure_domain = self._set([_member("node1", "zone-1")])
