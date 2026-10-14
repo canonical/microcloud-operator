@@ -1,59 +1,89 @@
-# MicroCloud operator charm
+<p align="left">
+    <img alt="MicroCloud logo" width="10%" src="doc/images/microcloud_logo_dark.svg#gh-dark-mode-only">
+    <img alt="MicroCloud logo" width="10%" src="doc/images/microcloud_logo_light.svg#gh-light-mode-only">
+</p>
 
-This charm manages observability for a MicroCloud cluster.
+# MicroCloud Operator
+
+The MicroCloud Operator charm brings observability to an existing
+[MicroCloud](https://canonical.com/microcloud) cluster. Once integrated with the
+[Canonical Observability Stack (COS)](https://charmhub.io/topics/canonical-observability-stack),
+it exposes cluster metrics and logs so you can monitor the health of your MicroCloud deployment.
 
 **This charm does not deploy or bootstrap MicroCloud.** MicroCloud must
-already be deployed out-of-band. Once it is:
+already be deployed out-of-band. The charm is installed alongside an
+existing MicroCloud cluster, one unit per cluster member, and verifies on
+every unit that the machine is in fact a MicroCloud member. If it is not,
+the unit goes into an error state, since the charm is only supported on
+machines that are already part of a MicroCloud cluster.
 
-1. Add each MicroCloud machine as a manual Juju machine, e.g.
-   `juju add-machine ssh:user@host`, for every member of the MicroCloud
-   cluster.
-2. Deploy this charm across all of those machines, one unit per machine
-   (`juju deploy ./microcloud_ubuntu@24.04-amd64.charm microcloud -n <N> \
-   --to <machine-ids>`).
+## Requirements
 
-On every unit the charm requires MicroCloud to already be initialized and
-verifies that this unit's own hostname is a MicroCloud member. If it is
-not, the unit goes into an error state, since the charm is only supported
-on machines that are already MicroCloud members.
-
-## Build the charm
-
-* Install `charmcraft` to build the charm: `snap install charmcraft --classic`
-* Build the charm: `charmcraft pack`
-  * For example use `--platform ubuntu@24.04:amd64` to only build the charm for a specific base and architecture
-
-## Deploy the charm
-
-Prerequisites:
-* MicroCloud is already deployed and bootstrapped out-of-band on the target machines.
-* A Juju controller reachable from those machines.
-* Each target machine added to the model as a manual machine, e.g.
+* A MicroCloud cluster already deployed and bootstrapped out-of-band.
+* A Juju controller that can reach the MicroCloud machines.
+* Each MicroCloud machine added to the Juju model as a manual machine, e.g.
   `juju add-machine ssh:user@host`.
+
+## How to get started
+
+Add each MicroCloud machine as a manual Juju machine:
+
+```shell
+juju add-machine ssh:user@host
+```
 
 Then deploy the charm across those machines, one unit per machine:
 
-`juju deploy microcloud --channel 3/stable -n 3 --to 0,1,2`
+```shell
+juju deploy microcloud --channel 3/stable -n <N> --to <machine-ids>
+```
+
+For example, for a 3-member MicroCloud cluster mapped to Juju machines `0,1,2`:
+
+```shell
+juju deploy microcloud --channel 3/stable -n 3 --to 0,1,2
+```
+
+## Relations
+
+Integrate the charm with the Canonical Observability Stack (COS) to collect
+metrics and logs from your MicroCloud cluster:
+
+```shell
+juju deploy opentelemetry-collector
+juju relate opentelemetry-collector <microcloud charm>:cos_agent
+juju relate opentelemetry-collector <microcloud charm>:logging
+juju relate opentelemetry-collector loki
+juju relate opentelemetry-collector prometheus
+juju relate opentelemetry-collector grafana
+```
+
+This requires the COS stack to already be deployed, with the `loki`,
+`prometheus`, and `grafana` SAAS offers available to consume.
 
 ## Add a cluster member
 
-Grow MicroCloud itself out-of-band first (adding the new member to the
-MicroCloud cluster), then add the corresponding Juju machine and a new
-charm unit on it (`juju add-machine` + `juju add-unit --to <machine-id>`).
-Until both have happened, the new machine's unit will report an error
-since its hostname is not yet a MicroCloud member.
+To grow the deployment, first add the new member to the MicroCloud cluster
+itself, out-of-band. Once the machine is a MicroCloud member, add the
+corresponding Juju machine and a new charm unit on it:
 
-## Observability
+```shell
+juju add-machine ssh:user@host
+juju add-unit microcloud --to <machine-id>
+```
 
-Integrate with COS:
+## Security
 
-As a prerequisite we need the COS stack.
-Then offer the loki, prometheus and grafana SAAS bindings.
-Later consume them and connect with the MicroCloud charm:
+Security issues in the MicroCloud Operator can be reported through
+[private security reports](https://github.com/canonical/microcloud-operator/security/advisories/new)
+on GitHub. For more information, see the [Security policy](SECURITY.md).
 
-* `juju deploy opentelemetry-collector`
-* `juju relate opentelemetry-collector <microcloud charm>:cos_agent`
-* `juju relate opentelemetry-collector <microcloud charm>:logging`
-* `juju relate opentelemetry-collector loki`
-* `juju relate opentelemetry-collector prometheus`
-* `juju relate opentelemetry-collector grafana`
+## Contributing
+
+* For best practices on how to write and contribute to charms, see the [Juju SDK docs](https://juju.is/docs/sdk/how-to)
+* For developer guidance specific to this charm, see [CONTRIBUTING.md](CONTRIBUTING.md)
+* Report bugs and feature requests through the [GitHub Issues tab](https://github.com/canonical/microcloud-operator/issues)
+
+## License
+
+The MicroCloud Operator is distributed under the [Apache Software License, version 2.0](LICENSE).
