@@ -110,7 +110,11 @@ class MicroCloudCharm(ops.CharmBase):
     def __init__(self, *args: Any) -> None:
         super().__init__(*args)
         self._stored.set_default(
-            session_failures=0, worker_pid=0, worker_session="", lxd_join_since=0.0
+            session_failures=0,
+            worker_pid=0,
+            worker_session="",
+            lxd_join_since=0.0,
+            ovn_uplink_interface="",
         )
 
         self._coordinator = ClusterCoordinator(self)
@@ -263,12 +267,9 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _reconcile(self) -> None:
         """Drive deployment or observe-only mode, then set status."""
-        ovn_uplink_interface, problem = self._network.ovn_uplink_interface()
-        if problem:
-            self.unit.status = ops.BlockedStatus(problem)
-            return
+        initialized = microcloud.is_initialized()
 
-        storage_local_path, problem = self._storage_local_path()
+        ovn_uplink_interface, problem = self._ovn_uplink_interface(initialized)
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
             return
@@ -278,15 +279,13 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
-        initialized = microcloud.is_initialized()
-
         # Publish our identity for peers as early as possible.
         self._coordinator.publish_identity(
             microcloud.hostname(),
             self._network.bind_address(),
             ovn_uplink_interface=ovn_uplink_interface,
             ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
-            storage_local_path=storage_local_path,
+            storage_local_path=self._storage_local_path(),
             storage_ceph_paths=storage_ceph_paths,
             initialized=initialized,
         )
@@ -427,15 +426,6 @@ class MicroCloudCharm(ops.CharmBase):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
 
-        # Only where the uplink is actually used: with MicroOVN disabled the
-        # interface name never reaches the preseed, and a stale value left in
-        # the config must not stop the cluster forming.
-        if self.config.get("snap-channel-microovn", ""):
-            interface, _ = self._network.ovn_uplink_interface()
-            problem = self._network.missing_uplink_interface(interface)
-            if problem:
-                return problem
-
         if not self._coordinator.all_identities_published():
             self._hold_status(ops.WaitingStatus("Waiting for all peers to report identity"))
             return None
@@ -453,30 +443,59 @@ class MicroCloudCharm(ops.CharmBase):
             return self._sessions.lead(initialized, pending, passphrase or "")
         return self._sessions.join(passphrase or "")
 
-    def _storage_local_path(self) -> tuple[str, str | None]:
-        """Return this unit's local storage device path.
+    def _ovn_uplink_interface(self, initialized: bool) -> tuple[str, str | None]:
+        """Return this unit's OVN uplink interface, discovering it before bootstrap.
 
-        An attached "local" Juju storage volume wins, and on MAAS this can be a
-        tagged partition from a ``partition,<tag>`` storage pool. When
-        "local-device" is also set, it is ignored and an INFO record is logged.
-        Otherwise, "local-device" names the device for clouds where Juju cannot
-        attach the device (clouds without partition pools, pre-placed machines,
-        or when using ``--to``).
+        "ovn-uplink-interface" names it where discovery cannot choose. Only
+        looked for with MicroOVN enabled, since the uplink is never used
+        otherwise. Once this unit is clustered, OVS has taken the interface
+        over, so it no longer looks like a free uplink: the interface found
+        before bootstrap is kept instead.
 
-        The "local" storage volume is declared with ``multiple: range: 0-1``
-        in charmcraft.yaml, so at most one instance is ever attached.
+        Returns (interface, problem). "problem" is a human-readable status
+        string if reconciliation should block.
+        """
+        if not self.config.get("snap-channel-microovn", ""):
+            return "", None
 
-        Returns (path, problem). "path" is "" when this unit has no local
-        storage at all, which is allowed.
+        found = str(self._stored.ovn_uplink_interface)
+        if initialized:
+            return found, None
+
+        configured, problem = self._network.configured_uplink_interface()
+        if problem:
+            return "", problem
+        if configured:
+            self._stored.ovn_uplink_interface = configured
+            return configured, None
+
+        # Joining hands the interface to OVS before MicroCloud reports this
+        # unit as initialized, so keep the interface found earlier.
+        if found and (network.SYS_CLASS_NET / found).exists():
+            return found, None
+
+        required = (
+            bool(
+                self.config.get("ovn-ipv4-gateway", "") or self.config.get("ovn-ipv6-gateway", "")
+            )
+            or self._network.uplink_space_unaddressed()
+        )
+        interface, problem = self._network.discover_uplink_interface(required)
+        if not problem:
+            self._stored.ovn_uplink_interface = interface
+        return interface, problem
+
+    def _storage_local_path(self) -> str:
+        """Return the device path of this unit's "local" Juju storage, or "".
+
+        On MAAS this is a tagged partition or disk from a storage pool, for
+        example a ``partition,<tag>`` pool. The "local" storage is declared
+        with ``multiple: range: 0-1`` in charmcraft.yaml, so at most one
+        instance is ever attached; with none, this system has no local
+        storage, which is allowed.
         """
         storages = self.model.storages["local"]
-        if storages:
-            attached = str(storages[0].location)
-            if str(self.config.get("local-device", "")).strip():
-                logger.info("Ignoring local-device: %s is attached as Juju storage", attached)
-            return attached, None
-
-        return network.per_host_value(str(self.config.get("local-device", "")), "local-device")
+        return str(storages[0].location) if storages else ""
 
     def _storage_ceph_paths(self) -> tuple[list[str], str | None]:
         """Return device paths of this unit's attached "ceph" Juju storage.

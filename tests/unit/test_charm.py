@@ -4,7 +4,6 @@
 """Unit tests for microcloud charm."""
 
 import json
-import logging
 
 # Stub out the cos_agent library so we don't need the full charm SDK installed
 # during unit tests — the library is tested separately.
@@ -627,9 +626,6 @@ storage:
 """,
             config="""
 options:
-  local-device:
-    type: string
-    default: ""
   ceph-osd-architectures:
     type: string
     default: "amd64"
@@ -643,7 +639,7 @@ options:
 
         harness = self._harness()
         try:
-            assert MicroCloudCharm._storage_local_path(harness.charm) == ("", None)
+            assert MicroCloudCharm._storage_local_path(harness.charm) == ""
         finally:
             harness.cleanup()
 
@@ -663,66 +659,7 @@ options:
         try:
             harness.add_storage("local", count=1, attach=True)
             location = harness.charm.model.storages["local"][0].location
-            assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
-        finally:
-            harness.cleanup()
-
-    def test_local_device_config_names_the_device(self):
-        """Juju cannot attach a RAID, LVM volume or partition on MAAS."""
-        from charm import MicroCloudCharm
-
-        harness = self._harness()
-        try:
-            harness.update_config({"local-device": "/dev/md1"})
-            with patch("charm.microcloud.hostname", return_value="node1"):
-                assert MicroCloudCharm._storage_local_path(harness.charm) == ("/dev/md1", None)
-        finally:
-            harness.cleanup()
-
-    def test_local_device_accepts_a_hostname_mapping(self):
-        from charm import MicroCloudCharm
-
-        harness = self._harness()
-        try:
-            harness.update_config({"local-device": "{node1: /dev/md1, node2: /dev/nvme0n1p3}"})
-            with patch("charm.microcloud.hostname", return_value="node2"):
-                path, problem = MicroCloudCharm._storage_local_path(harness.charm)
-            assert (path, problem) == ("/dev/nvme0n1p3", None)
-        finally:
-            harness.cleanup()
-
-    def test_local_device_mapping_without_this_host_blocks(self):
-        from charm import MicroCloudCharm
-
-        harness = self._harness()
-        try:
-            harness.update_config({"local-device": "{node1: /dev/md1}"})
-            with patch("charm.microcloud.hostname", return_value="node9"):
-                path, problem = MicroCloudCharm._storage_local_path(harness.charm)
-            assert path == ""
-            assert problem == (
-                "local-device is missing an entry for hostname 'node9'; known entries: ['node1']"
-            )
-        finally:
-            harness.cleanup()
-
-    def test_attached_storage_wins_over_local_device(self, caplog):
-        from charm import MicroCloudCharm
-
-        caplog.set_level(logging.INFO, logger="charm")
-        harness = self._harness()
-        try:
-            harness.add_storage("local", count=1, attach=True)
-            harness.update_config({"local-device": "/dev/md1"})
-            location = harness.charm.model.storages["local"][0].location
-            assert MicroCloudCharm._storage_local_path(harness.charm) == (str(location), None)
-            records = [r for r in caplog.records if r.name == "charm"]
-            assert len(records) == 1
-            assert records[0].levelname == "INFO"
-            assert (
-                records[0].getMessage()
-                == f"Ignoring local-device: {location} is attached as Juju storage"
-            )
+            assert MicroCloudCharm._storage_local_path(harness.charm) == str(location)
         finally:
             harness.cleanup()
 
@@ -799,6 +736,100 @@ options:
 
 
 # ---------------------------------------------------------------------------
+# _ovn_uplink_interface (discovered before bootstrap, kept afterwards)
+# ---------------------------------------------------------------------------
+
+
+class TestOvnUplinkInterface:
+    def _stub(self, config, stored=""):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = config
+        stub._stored = SimpleNamespace(ovn_uplink_interface=stored)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.uplink_space_unaddressed.return_value = False
+        stub._network.configured_uplink_interface.return_value = ("", None)
+        return stub
+
+    def _resolve(self, stub, initialized=False):
+        from charm import MicroCloudCharm
+
+        return MicroCloudCharm._ovn_uplink_interface(stub, initialized)
+
+    def test_not_looked_for_without_microovn(self):
+        stub = self._stub({"snap-channel-microovn": ""})
+
+        assert self._resolve(stub) == ("", None)
+        stub._network.discover_uplink_interface.assert_not_called()
+
+    def test_discovered_before_bootstrap_and_kept(self):
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"})
+        stub._network.discover_uplink_interface.return_value = ("enp9s0", None)
+
+        assert self._resolve(stub) == ("enp9s0", None)
+        stub._network.discover_uplink_interface.assert_called_once_with(False)
+        assert stub._stored.ovn_uplink_interface == "enp9s0"
+
+    def test_a_configured_interface_is_used_without_discovery(self):
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"})
+        stub._network.configured_uplink_interface.return_value = ("eth4", None)
+
+        assert self._resolve(stub) == ("eth4", None)
+        stub._network.discover_uplink_interface.assert_not_called()
+        assert stub._stored.ovn_uplink_interface == "eth4"
+
+    def test_a_bad_configured_interface_blocks(self):
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"})
+        stub._network.configured_uplink_interface.return_value = ("", "missing")
+
+        assert self._resolve(stub) == ("", "missing")
+        stub._network.discover_uplink_interface.assert_not_called()
+
+    def test_a_problem_blocks_and_keeps_nothing(self, tmp_path):
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"}, stored="enp9s0")
+        stub._network.discover_uplink_interface.return_value = ("", "several")
+
+        with patch("network.SYS_CLASS_NET", tmp_path):
+            assert self._resolve(stub) == ("", "several")
+        assert stub._stored.ovn_uplink_interface == "enp9s0"
+
+    def test_a_joining_unit_keeps_the_interface_ovs_took(self, tmp_path):
+        """OVS takes the NIC during the join, before the unit reports initialized."""
+        (tmp_path / "enp9s0").mkdir()
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"}, stored="enp9s0")
+
+        with patch("network.SYS_CLASS_NET", tmp_path):
+            assert self._resolve(stub) == ("enp9s0", None)
+        stub._network.discover_uplink_interface.assert_not_called()
+
+    @pytest.mark.parametrize("gateway", ["ovn-ipv4-gateway", "ovn-ipv6-gateway"])
+    def test_a_gateway_requires_an_uplink(self, gateway):
+        stub = self._stub({"snap-channel-microovn": "24.03/stable", gateway: "192.0.2.1/24"})
+        stub._network.discover_uplink_interface.return_value = ("enp9s0", None)
+
+        self._resolve(stub)
+
+        stub._network.discover_uplink_interface.assert_called_once_with(True)
+
+    def test_binding_to_the_uplink_space_requires_an_uplink(self):
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"})
+        stub._network.uplink_space_unaddressed.return_value = True
+        stub._network.discover_uplink_interface.return_value = ("enp9s0", None)
+
+        self._resolve(stub)
+
+        stub._network.discover_uplink_interface.assert_called_once_with(True)
+
+    def test_a_clustered_unit_keeps_the_interface_found_before_bootstrap(self):
+        """OVS owns the NIC after bootstrap, so it no longer looks like a free uplink."""
+        stub = self._stub({"snap-channel-microovn": "24.03/stable"}, stored="enp9s0")
+
+        assert self._resolve(stub, initialized=True) == ("enp9s0", None)
+        stub._network.discover_uplink_interface.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # microcloud CLI wrappers
 # ---------------------------------------------------------------------------
 
@@ -865,8 +896,8 @@ class TestHeldStatus:
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.ovn_uplink_interface.return_value = ("", None)
-        stub._storage_local_path.return_value = ("", None)
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
@@ -890,8 +921,8 @@ class TestHeldStatus:
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.ovn_uplink_interface.return_value = ("", None)
-        stub._storage_local_path.return_value = ("", None)
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
@@ -1274,8 +1305,8 @@ class TestGrowCharm:
         stub._stored = SimpleNamespace(session_failures=0)
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.bind_address.return_value = "10.0.0.1"
-        stub._network.ovn_uplink_interface.return_value = ("", None)
-        stub._storage_local_path.return_value = ("", None)
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
         coordinator = stub._coordinator = MagicMock()
@@ -1295,7 +1326,7 @@ class TestGrowCharm:
 
     # ---- _reconcile_deploy ----
 
-    def _deploy(self, stub, *, initialized, pending, uplink_problem=None):
+    def _deploy(self, stub, *, initialized, pending):
         from charm import MicroCloudCharm
 
         coordinator = stub._coordinator
@@ -1304,8 +1335,6 @@ class TestGrowCharm:
         coordinator.all_members.return_value = [("node0", "10.0.0.1"), ("node1", "10.0.0.2")]
         stub._sessions.lead.return_value = None
         stub._sessions.join.return_value = None
-        stub._network.ovn_uplink_interface.return_value = ("enp9s0", None)
-        stub._network.missing_uplink_interface.return_value = uplink_problem
 
         with (
             patch("charm.snap.ensure_snaps") as ensure_snaps,
@@ -1313,38 +1342,6 @@ class TestGrowCharm:
         ):
             problem = MicroCloudCharm._reconcile_deploy(stub, initialized, pending)
         return problem, ensure_snaps
-
-    def test_an_uplink_nic_that_is_missing_blocks_the_deploy(self):
-        """A cluster formed with an unknown uplink has no external network at all."""
-        stub = self._stub(leader=True)
-        stub.config = {"snap-channel-microovn": "24.03/stable"}
-
-        problem, _ = self._deploy(
-            stub,
-            initialized=False,
-            pending=[],
-            uplink_problem="ovn-uplink-interface 'eth99' does not exist on node1; interfaces: []",
-        )
-
-        assert problem is not None
-        assert "does not exist" in problem
-        stub._sessions.lead.assert_not_called()
-
-    def test_the_uplink_nic_is_not_checked_without_microovn(self):
-        """With MicroOVN off the name never reaches the preseed, so a stale value is harmless."""
-        stub = self._stub(leader=True)
-        stub.config = {"snap-channel-microovn": ""}
-
-        problem, _ = self._deploy(
-            stub,
-            initialized=False,
-            pending=[],
-            uplink_problem="ovn-uplink-interface 'eth99' does not exist on node1; interfaces: []",
-        )
-
-        assert problem is None
-        stub._network.missing_uplink_interface.assert_not_called()
-        stub._sessions.lead.assert_called_once()
 
     def test_clustered_leader_does_not_refresh_snaps(self):
         """Refreshing here would upgrade the leader ahead of the rest of the cluster."""
@@ -2288,8 +2285,8 @@ class TestFailureDomains:
 
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.ovn_uplink_interface.return_value = ("", None)
-        stub._storage_local_path.return_value = ("", None)
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
@@ -2395,8 +2392,8 @@ class TestFailureDomains:
         stub.unit.is_leader.return_value = False
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
-        stub._network.ovn_uplink_interface.return_value = ("", None)
-        stub._storage_local_path.return_value = ("", None)
+        stub._ovn_uplink_interface.return_value = ("", None)
+        stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
         stub._reconcile_observe_only.return_value = None
