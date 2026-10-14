@@ -80,11 +80,10 @@ module "microcloud" {
       { endpoint = "ovn-uplink", space = "ovn-uplink" },
     ]
     config = {
-      "storage-wipe"         = "true"
-      "ovn-uplink-interface" = "enp9s0"
-      "ovn-ipv4-gateway"     = "10.0.5.1/24"
-      "ovn-ipv4-range"       = "10.0.5.100-10.0.5.150"
-      "ovn-dns-servers"      = "10.0.5.1"
+      "storage-wipe"     = "true"
+      "ovn-ipv4-gateway" = "10.0.5.1/24"
+      "ovn-ipv4-range"   = "10.0.5.100-10.0.5.150"
+      "ovn-dns-servers"  = "10.0.5.1"
     }
   }
 

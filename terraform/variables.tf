@@ -37,10 +37,8 @@ variable "channel" {
 variable "config" {
   description = <<-EOT
     Charm config options, passed through unchanged. Every value is a string:
-    "true" for booleans, "300" for integers. Options that take a mapping of
-    hostname to value ("local-device", "ovn-uplink-interface") take a
-    yamlencode(...) of that map. See the charm's charmcraft.yaml for the
-    available options; this module deliberately does not restate them.
+    "true" for booleans, "300" for integers. See the charm's charmcraft.yaml
+    for the available options; this module deliberately does not restate them.
   EOT
   type        = map(string)
   default     = {}
@@ -131,7 +129,7 @@ variable "revision" {
 variable "storage_directives" {
   description = <<-EOT
     Juju storage directives keyed by storage name, e.g.
-    { local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the
+    { local = "maas-local,1,100G", ceph = "maas-ceph,3,100G" }. Both are optional: the
     charm accepts zero local disks and zero Ceph disks. Ceph disks are only
     allowed on units whose architecture is in the "ceph-osd-architectures"
     charm config (default "amd64").

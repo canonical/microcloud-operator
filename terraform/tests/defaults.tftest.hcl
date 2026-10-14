@@ -67,7 +67,7 @@ run "config_passes_through_unchanged" {
     config = {
       "snap-channel-microceph" = ""
       "session-timeout"        = "600"
-      "ovn-uplink-interface"   = "{\"node1\":\"enp9s0\"}"
+      "ovn-dns-servers"        = "10.0.5.1,10.0.6.1"
     }
   }
 
