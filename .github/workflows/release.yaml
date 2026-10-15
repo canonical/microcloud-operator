@@ -1,12 +1,12 @@
 name: Release
 
-# Publishes every push to main to 3/edge and every push to dev to 3/edge/eken.
-# Anything above edge is promoted separately; see promote.yaml.
+# Publishes every push to release-3 to 3/edge and every push to dev to
+# 3/edge/eken. Anything above edge is promoted separately; see promote.yaml.
 
 on:
   push:
     branches:
-      - main
+      - release-3
       - dev
 
 permissions: {}
@@ -62,10 +62,10 @@ jobs:
         with:
           credentials: ${{ secrets.CHARMHUB_TOKEN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          channel: ${{ github.ref_name == 'main' && '3/edge' || '3/edge/eken' }}
+          channel: ${{ github.ref_name == 'release-3' && '3/edge' || '3/edge/eken' }}
           built-charm-path: ${{ steps.charms.outputs.paths }}
           charmcraft-channel: 4.x/stable
-          # Only main revisions get a GitHub release, so dev builds never
+          # Only release-3 revisions get a GitHub release, so dev builds never
           # become the repository's latest release.
-          github-tag: ${{ github.ref_name == 'main' }}
+          github-tag: ${{ github.ref_name == 'release-3' }}
           tag-prefix: "3"
