@@ -48,16 +48,16 @@ declares.
 
 ## Publishing
 
-Every push to `main` or `dev` runs the **Release** workflow (`.github/workflows/release.yaml`):
+Every push to `release-3` or `dev` runs the **Release** workflow (`.github/workflows/release.yaml`):
 it builds and tests the pushed commit with the same `build-and-test.yaml` pull requests use, then
 uploads the packed charms to Charmhub:
 
-| Branch | Channel       |
-| ------ | ------------- |
-| `main` | `3/edge`      |
-| `dev`  | `3/edge/eken` |
+| Branch      | Channel       |
+| ----------- | ------------- |
+| `release-3` | `3/edge`      |
+| `dev`       | `3/edge/eken` |
 
-The track, `3`, mirrors the MicroCloud snap's major version track. Each `main` revision also gets
+The track, `3`, mirrors the MicroCloud snap's major version track. Each `release-3` revision also gets
 a `3-rev<N>` GitHub release and tag; `dev` revisions do not.
 
 `3/edge/eken` is a Charmhub branch. Branches are temporary and close if nothing is released to
