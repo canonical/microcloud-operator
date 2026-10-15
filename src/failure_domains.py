@@ -37,13 +37,14 @@ class FailureDomains:
             return None
 
         try:
-            member = next((m for m in lxd_cluster.members() if m.name == hostname), None)
+            name = lxd_cluster.own_name()
+            member = next((m for m in lxd_cluster.members() if m.name == name), None)
             if member is None:
                 return f"{hostname} is not an LXD cluster member"
             if member.failure_domain == zone:
                 return None
-            logger.info("Setting the failure domain of %s to %s", hostname, zone)
-            lxd_cluster.set_failure_domain(hostname, zone)
+            logger.info("Setting the failure domain of %s to %s", name, zone)
+            lxd_cluster.set_failure_domain(name, zone)
         except lxd_cluster.LXDClusterError as exc:
             return f"Cannot set the failure domain of {hostname} to {zone!r}: {exc}"
         return None
