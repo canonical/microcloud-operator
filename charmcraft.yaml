@@ -186,7 +186,7 @@ config:
 
     snap-channel-microceph:
       type: string
-      default: "squid/stable"
+      default: "tentacle/stable"
       description: >
         Snap channel for the microceph snap. Leave empty to deploy a
         MicroCloud without MicroCeph; the ceph preseed section is then
@@ -194,7 +194,7 @@ config:
 
     snap-channel-microovn:
       type: string
-      default: "24.03/stable"
+      default: "26.03/stable"
       description: >
         Snap channel for the microovn snap. Leave empty to deploy a
         MicroCloud without MicroOVN; the ovn preseed section is then omitted.
