@@ -630,6 +630,9 @@ options:
   local-device:
     type: string
     default: ""
+  ceph-osd-architectures:
+    type: string
+    default: "amd64"
 """,
         )
         harness.begin()
@@ -649,7 +652,7 @@ options:
 
         harness = self._harness()
         try:
-            assert MicroCloudCharm._storage_ceph_paths(harness.charm) == []
+            assert MicroCloudCharm._storage_ceph_paths(harness.charm) == ([], None)
         finally:
             harness.cleanup()
 
@@ -729,9 +732,68 @@ options:
         harness = self._harness()
         try:
             harness.add_storage("ceph", count=3, attach=True)
-            paths = MicroCloudCharm._storage_ceph_paths(harness.charm)
+            with patch("platform.machine", return_value="x86_64"):
+                paths, problem = MicroCloudCharm._storage_ceph_paths(harness.charm)
+            assert problem is None
             assert len(paths) == 3
             assert all(path for path in paths)
+        finally:
+            harness.cleanup()
+
+    def test_ceph_paths_blocks_on_disallowed_architecture(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.add_storage("ceph", count=1, attach=True)
+            with patch("platform.machine", return_value="aarch64"):
+                paths, problem = MicroCloudCharm._storage_ceph_paths(harness.charm)
+            assert paths == []
+            assert problem == (
+                "Ceph storage attached but arm64 is not in ceph-osd-architectures "
+                "(amd64); detach it"
+            )
+        finally:
+            harness.cleanup()
+
+    def test_ceph_paths_disallowed_architecture_without_storage(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            with patch("platform.machine", return_value="aarch64"):
+                assert MicroCloudCharm._storage_ceph_paths(harness.charm) == ([], None)
+        finally:
+            harness.cleanup()
+
+    def test_ceph_paths_allows_configured_architectures(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"ceph-osd-architectures": "amd64, arm64"})
+            harness.add_storage("ceph", count=2, attach=True)
+            with patch("platform.machine", return_value="aarch64"):
+                paths, problem = MicroCloudCharm._storage_ceph_paths(harness.charm)
+            assert problem is None
+            assert len(paths) == 2
+        finally:
+            harness.cleanup()
+
+    def test_ceph_paths_empty_config_allows_no_architecture(self):
+        from charm import MicroCloudCharm
+
+        harness = self._harness()
+        try:
+            harness.update_config({"ceph-osd-architectures": ""})
+            harness.add_storage("ceph", count=1, attach=True)
+            with patch("platform.machine", return_value="x86_64"):
+                paths, problem = MicroCloudCharm._storage_ceph_paths(harness.charm)
+            assert paths == []
+            assert problem == (
+                "Ceph storage attached but amd64 is not in ceph-osd-architectures "
+                "(empty); detach it"
+            )
         finally:
             harness.cleanup()
 
@@ -805,6 +867,7 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._storage_local_path.return_value = ("", None)
+        stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
         stub._sessions = MagicMock()
@@ -829,6 +892,7 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._storage_local_path.return_value = ("", None)
+        stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
         stub._coordinator = MagicMock()
         stub._sessions = MagicMock()
@@ -1212,6 +1276,7 @@ class TestGrowCharm:
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._storage_local_path.return_value = ("", None)
+        stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
         coordinator = stub._coordinator = MagicMock()
         coordinator.all_systems.return_value = list(systems)
@@ -2225,6 +2290,7 @@ class TestFailureDomains:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._storage_local_path.return_value = ("", None)
+        stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
@@ -2331,6 +2397,7 @@ class TestFailureDomains:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._storage_local_path.return_value = ("", None)
+        stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
         stub._reconcile_observe_only.return_value = None
         with (
