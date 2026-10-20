@@ -55,6 +55,7 @@ logging-relation-broken
 
 import json
 import logging
+import platform
 import time
 from typing import Any
 
@@ -74,6 +75,20 @@ from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
 
 logger = logging.getLogger(__name__)
+
+# Kernel machine names (uname -m) mapped to Debian/snap architecture names.
+_MACHINE_TO_ARCH = {
+    "x86_64": "amd64",
+    "aarch64": "arm64",
+    "armv7l": "armhf",
+    "ppc64le": "ppc64el",
+}
+
+
+def host_architecture() -> str:
+    """Return this machine's architecture as a Debian name, e.g. "amd64"."""
+    machine = platform.machine()
+    return _MACHINE_TO_ARCH.get(machine, machine)
 
 
 class JoinSessionEndedEvent(ops.EventBase):
@@ -258,6 +273,11 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        storage_ceph_paths, problem = self._storage_ceph_paths()
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
+
         initialized = microcloud.is_initialized()
 
         # Publish our identity for peers as early as possible.
@@ -267,7 +287,7 @@ class MicroCloudCharm(ops.CharmBase):
             ovn_uplink_interface=ovn_uplink_interface,
             ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
             storage_local_path=storage_local_path,
-            storage_ceph_paths=self._storage_ceph_paths(),
+            storage_ceph_paths=storage_ceph_paths,
             initialized=initialized,
         )
 
@@ -458,14 +478,36 @@ class MicroCloudCharm(ops.CharmBase):
 
         return network.per_host_value(str(self.config.get("local-device", "")), "local-device")
 
-    def _storage_ceph_paths(self) -> list[str]:
+    def _storage_ceph_paths(self) -> tuple[list[str], str | None]:
         """Return device paths of this unit's attached "ceph" Juju storage.
 
         The "ceph" storage volume is declared with ``multiple: range: 0-``
         in charmcraft.yaml, so any number of instances may be attached -
         each becomes a separate Ceph OSD on this system.
+
+        OSDs may only run on the architectures listed in
+        "ceph-osd-architectures". Units on other architectures still run
+        MicroCeph without OSDs, which gives LXD the Ceph keyring.
+
+        Returns (paths, problem).
         """
-        return [str(storage.location) for storage in self.model.storages["ceph"]]
+        paths = [str(storage.location) for storage in self.model.storages["ceph"]]
+        if not paths:
+            return [], None
+
+        allowed = [
+            arch.strip()
+            for arch in str(self.config.get("ceph-osd-architectures", "amd64")).split(",")
+            if arch.strip()
+        ]
+        arch = host_architecture()
+        if arch not in allowed:
+            return [], (
+                f"Ceph storage attached but {arch} is not in ceph-osd-architectures "
+                f"({','.join(allowed) or 'empty'}); detach it"
+            )
+
+        return paths, None
 
     # ---- Observe-only mode ----
 

@@ -132,7 +132,9 @@ variable "storage_directives" {
   description = <<-EOT
     Juju storage directives keyed by storage name, e.g.
     { local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the
-    charm accepts zero local disks and zero Ceph disks.
+    charm accepts zero local disks and zero Ceph disks. Ceph disks are only
+    allowed on units whose architecture is in the "ceph-osd-architectures"
+    charm config (default "amd64").
   EOT
   type        = map(string)
   default     = {}

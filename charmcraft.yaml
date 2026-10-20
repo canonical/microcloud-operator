@@ -132,7 +132,10 @@ storage:
       "juju deploy microcloud --storage ceph=maas,3,100G" for three
       OSDs per system). Optional: leave unattached (0 instances) to skip
       Ceph storage on this system, or attach as many disks as this
-      system should contribute as OSDs.
+      system should contribute as OSDs. Only units whose architecture is
+      listed in "ceph-osd-architectures" (default "amd64") may have Ceph
+      storage attached; on mixed-architecture deployments attach it per
+      unit (e.g. "juju add-unit --storage") rather than application-wide.
     minimum-size: 1G
     multiple:
       range: 0-
@@ -183,7 +186,7 @@ config:
 
     snap-channel-microceph:
       type: string
-      default: "squid/stable"
+      default: "tentacle/stable"
       description: >
         Snap channel for the microceph snap. Leave empty to deploy a
         MicroCloud without MicroCeph; the ceph preseed section is then
@@ -191,7 +194,7 @@ config:
 
     snap-channel-microovn:
       type: string
-      default: "24.03/stable"
+      default: "26.03/stable"
       description: >
         Snap channel for the microovn snap. Leave empty to deploy a
         MicroCloud without MicroOVN; the ovn preseed section is then omitted.
@@ -235,6 +238,17 @@ config:
         An attached "local" volume takes precedence. When set to a mapping,
         a unit whose hostname is missing blocks rather than bootstrapping
         without local storage.
+
+    ceph-osd-architectures:
+      type: string
+      default: "amd64"
+      description: >
+        Comma-separated list of architectures (Debian names, e.g. "amd64",
+        "arm64") allowed to contribute "ceph" Juju storage as Ceph OSDs. A
+        unit on any other architecture blocks while it has "ceph" storage
+        attached. Such units still run MicroCeph without OSDs, so they
+        receive the Ceph configuration and keyring and LXD can use the
+        remote storage pool. An empty value allows no OSDs on any unit.
 
     storage-wipe:
       type: boolean

@@ -203,7 +203,7 @@ No modules.
 | <a name="input_machines"></a> [machines](#input\_machines) | Machines to place units on, e.g. ["0", "1", "2"]. The unit count becomes<br/>the size of this set; "units" must be left at 1 or match it. | `set(string)` | `[]` | no |
 | <a name="input_model_uuid"></a> [model\_uuid](#input\_model\_uuid) | UUID of the Juju model to deploy into. | `string` | n/a | yes |
 | <a name="input_revision"></a> [revision](#input\_revision) | Charm revision to deploy. Defaults to the channel's latest. | `number` | `null` | no |
-| <a name="input_storage_directives"></a> [storage\_directives](#input\_storage\_directives) | Juju storage directives keyed by storage name, e.g.<br/>{ local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the<br/>charm accepts zero local disks and zero Ceph disks. | `map(string)` | `{}` | no |
+| <a name="input_storage_directives"></a> [storage\_directives](#input\_storage\_directives) | Juju storage directives keyed by storage name, e.g.<br/>{ local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the<br/>charm accepts zero local disks and zero Ceph disks. Ceph disks are only<br/>allowed on units whose architecture is in the "ceph-osd-architectures"<br/>charm config (default "amd64"). | `map(string)` | `{}` | no |
 | <a name="input_units"></a> [units](#input\_units) | Number of units to deploy. With "machines" set, the unit count is the<br/>number of machines, so this must be left at 1 or match it. | `number` | `1` | no |
 
 ## Outputs
