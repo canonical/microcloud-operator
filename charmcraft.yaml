@@ -101,13 +101,15 @@ storage:
   local:
     type: block
     description: >
-      Local (single-node ZFS) storage disk for this MicroCloud system.
-      On MAAS, tag one unformatted partition per node (e.g. "local"),
-      create a storage pool with
+      Local (single-node ZFS) storage disk or partition for this
+      MicroCloud system, passed through to "microcloud preseed" as
+      "systems[*].storage.local.path". On MAAS, select it with a storage
+      pool: for a partition, tag one unformatted partition per node (e.g.
+      "local"), create a pool with
       "juju create-storage-pool maas-local maas tags=partition,local",
       and deploy with
-      "juju deploy microcloud --storage local=maas-local,1,2G"
-      without setting "local-device". Note the three MAAS caveats:
+      "juju deploy microcloud --storage local=maas-local,1,2G".
+      Note the three MAAS caveats:
       (1) MAAS matches the smallest tagged partition that fits the size,
       so tag exactly one partition per node;
       (2) a partition that already has a filesystem in the MAAS storage
@@ -115,10 +117,8 @@ storage:
       (3) MAAS storage only attaches at machine allocation, so placing
       onto existing machines (e.g. with "--to") fails with "does not
       support dynamic storage".
-      The charm passes the attached device path straight through to
-      "microcloud preseed" as "systems[*].storage.local.path" - no LXD
-      resource-filter matching is involved. Optional: leave unattached
-      (0 instances) to skip local storage on this system.
+      Optional: leave unattached (0 instances) to skip local storage on
+      this system.
     minimum-size: 1G
     multiple:
       range: 0-1
@@ -152,15 +152,19 @@ extra-bindings:
   # "microcloud preseed" rejects a Ceph public/internal network without
   # Ceph storage disks.
   #
-  # "ovn-uplink" is intentionally never read via "network-get": the OVN
-  # uplink NIC is normally a bare, L2-only interface with no IP, so Juju
-  # spaces (which only track addressed interfaces) can never resolve a
-  # usable interface name from it - use the "ovn-uplink-interface" config
-  # option for that instead. This binding still has a purpose though: on a
-  # MAAS-backed model, binding it (e.g. "--bind ovn-uplink=<space>")
-  # constrains machine placement to machines that actually have a NIC on
-  # the right fabric/VLAN for the uplink, independent of IP addressing.
-  # Purely optional; leave unbound if not using MAAS placement constraints.
+  # "ovn-uplink" is never read via "network-get": a Juju space is a set of
+  # subnets, and "network-get" only lists interfaces through their
+  # addresses, while the OVN uplink NIC is a bare, L2-only interface with
+  # no IP (MAAS "link_up"). Bind it to the uplink space anyway (e.g.
+  # "--bind ovn-uplink=<space>"): on MAAS, this places units only on
+  # machines with a NIC on that space's VLAN. The charm then finds the
+  # uplink on each machine, before bootstrap, as the one interface that is
+  # up with no global address (a physical NIC, bond or VLAN that is not
+  # part of another interface). If there are several, for example
+  # because unnumbered BGP NICs are up too, it blocks until
+  # "ovn-uplink-interface" names one. It also blocks if there is none
+  # while this binding resolves to no address, which is what binding it to
+  # the uplink space looks like.
   ceph-public:
   ceph-internal:
   ovn-underlay:
@@ -223,22 +227,6 @@ config:
     # Storage options (apply to the "local"/"ceph" Juju storage volumes
     # declared under the top-level "storage:" key)
     # ------------------------------------------------------------------
-    local-device:
-      type: string
-      default: ""
-      description: >
-        Device path for this system's local storage, used when no "local"
-        Juju storage volume is attached. This option covers clouds without
-        partition pools, such as non-MAAS clouds, machines already in the
-        model, or when placing units with "--to". Either a single path
-        applied to every unit (e.g. "/dev/nvme0n1p3"), or a YAML/JSON
-        mapping of hostname to path for heterogeneous hardware, e.g.:
-          node1: /dev/nvme0n1p3
-          node2: /dev/sda3
-        An attached "local" volume takes precedence. When set to a mapping,
-        a unit whose hostname is missing blocks rather than bootstrapping
-        without local storage.
-
     ceph-osd-architectures:
       type: string
       default: "amd64"
@@ -267,21 +255,28 @@ config:
       type: string
       default: ""
       description: >
-        OVN uplink interface name. Either a single interface name applied
-        to every unit (e.g. "eth1"), or a YAML/JSON mapping of hostname to
-        interface name for heterogeneous hardware, e.g.:
-          node1: eth1
+        OVN uplink interface name. Optional: left empty, each unit takes the
+        one interface that is up with no global address. Set it where
+        several are, for example when unnumbered BGP NICs are up next to
+        the uplink, and the unit blocks listing them. Either a single
+        interface name applied to every unit (e.g. "eth4"), or a YAML/JSON
+        mapping of hostname to interface name for heterogeneous hardware,
+        e.g.:
+          node1: eth4
           node2: enp5s0
-          node3: eno1
         When set to a mapping, every deployed unit must have an entry
-        (matched on its MicroCloud hostname); a unit whose hostname is
-        missing blocks rather than bootstrapping with an unresolved
-        interface. Left empty, the OVN uplink is omitted from the preseed.
+        (matched on its MicroCloud hostname). A unit missing from the
+        mapping, or whose interface does not exist, blocks. Only read
+        before a unit bootstraps or joins.
 
     ovn-ipv4-gateway:
       type: string
       default: ""
-      description: OVN uplink IPv4 gateway in CIDR notation. Optional.
+      description: >
+        OVN uplink IPv4 gateway in CIDR notation. Optional. When set (or
+        "ovn-ipv6-gateway" is), a unit with no uplink interface blocks
+        instead of omitting the uplink, as it does when "ovn-uplink" is
+        bound to the uplink space.
 
     ovn-ipv4-range:
       type: string

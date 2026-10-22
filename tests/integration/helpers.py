@@ -79,6 +79,46 @@ def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
     )
 
 
+def config_changed_runs(juju: jubilant.Juju, unit: str) -> set[str]:
+    """Return when ``unit`` last started its config-changed hook, as Juju logged it."""
+    log = json.loads(
+        juju.cli("show-status-log", unit, "--type", "juju-unit", "-n", "100", "--format", "json")
+    )
+    return {
+        entry.get("since", "")
+        for entry in log
+        if entry.get("message") == "running config-changed hook"
+    }
+
+
+def configure(juju: jubilant.Juju, *settings: str) -> None:
+    """Apply "key=value" settings and wait for every unit to handle them.
+
+    Units that are already active stay active, so their status alone cannot
+    tell whether config-changed has run yet. Wait for a new config-changed run
+    on each unit and for the agents to go idle afterwards instead.
+    """
+    units = unit_names(juju)
+    before = {unit: config_changed_runs(juju, unit) for unit in units}
+    juju.cli("config", MICROCLOUD_CHARM, *settings)
+
+    deadline = time.monotonic() + DEPLOY_TIMEOUT_IN_SECONDS
+    pending = set(units)
+    while True:
+        pending = {unit for unit in pending if config_changed_runs(juju, unit) <= before[unit]}
+        if not pending:
+            break
+        assert time.monotonic() < deadline, f"config-changed never ran on {sorted(pending)}"
+        time.sleep(5)
+
+    juju.wait(
+        lambda status: jubilant.all_agents_idle(status, MICROCLOUD_CHARM),
+        error=lambda status: jubilant.any_error(status, MICROCLOUD_CHARM),
+        timeout=DEPLOY_TIMEOUT_IN_SECONDS,
+        delay=5,
+    )
+
+
 def ssh(juju: jubilant.Juju, unit: str, command: str) -> str:
     """Run ``command`` on ``unit`` and return its stdout.
 
