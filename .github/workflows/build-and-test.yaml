@@ -1,6 +1,7 @@
 name: Build & Test
 
-# Reusable workflow: static analysis, then pack the charm.
+# Reusable workflow: static analysis, pack the charm, then run integration
+# tests against the packed artifact.
 #
 # amd64 only for now. arm64 needs either GitHub's arm runners or self-hosted
 # ones; add an `arch` matrix here when that is available.
@@ -121,4 +122,70 @@ jobs:
           name: microcloud-charm-${{ matrix.base }}-${{ matrix.arch }}
           path: "*.charm"
           if-no-files-found: error
+          retention-days: 7
+
+  integration:
+    name: Integration tests
+    needs: [build]
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+
+      - name: Download packed charm
+        # Test the exact charm artifact produced by the build job.
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: microcloud-charm-26.04-amd64
+          path: ./artifacts
+
+      - name: Get runner address
+        # MicroK8s MetalLB needs an address from the runner's network.
+        run: |
+          echo "IPADDR=$(ip -4 -j route get 2.2.2.2 | jq -r '.[] | .prefsrc')" >> "${GITHUB_ENV}"
+
+      - name: Setup MicroK8s controller
+        uses: charmed-kubernetes/actions-operator@d8217ad61c15f746727a9d41563c13e9b9fe56e3 # main
+        with:
+          juju-channel: 3.6/stable
+          provider: microk8s
+          channel: 1.36-strict/stable
+          microk8s-addons: "hostpath-storage dns rbac metallb:${{ env.IPADDR }}-${{ env.IPADDR }}"
+          bootstrap-constraints: "cores=2 mem=4G"
+
+      - name: Save MicroK8s controller name
+        id: k8s-controller
+        run: echo "name=${CONTROLLER_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Setup LXD controller
+        uses: charmed-kubernetes/actions-operator@d8217ad61c15f746727a9d41563c13e9b9fe56e3 # main
+        with:
+          juju-channel: 3.6/stable
+          provider: lxd
+          bootstrap-constraints: "cores=1 mem=2G"
+
+      - name: Save LXD controller name
+        id: lxd-controller
+        run: echo "name=${CONTROLLER_NAME}" >> "${GITHUB_OUTPUT}"
+
+      - name: Run integration tests
+        env:
+          MICROCLOUD_CHARM_PATH: ${{ github.workspace }}/artifacts/microcloud_ubuntu@26.04-amd64.charm
+          LXD_CONTROLLER: ${{ steps.lxd-controller.outputs.name }}
+          K8S_CONTROLLER: ${{ steps.k8s-controller.outputs.name }}
+          MICROCLOUD_LOG_DIR: ${{ runner.temp }}/microcloud-integration-logs
+        run: bash tests/integration/run.sh
+
+      - name: Upload integration logs
+        if: failure()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: logs-integration
+          path: ${{ runner.temp }}/microcloud-integration-logs
+          if-no-files-found: warn
           retention-days: 7
