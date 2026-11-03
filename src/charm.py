@@ -23,8 +23,20 @@ install / config-changed / peer-relation-changed
       clears it and opens the next session if any unit is still waiting.
       Units added to a formed cluster join it the same way.
 
+Orchestrator and member applications
+------------------------------------
+    • Each hardware profile, such as an architecture, is its own application.
+      The one with ``orchestrator=true`` forms the cluster as above; every
+      other application relates its "orchestrator" endpoint to the
+      orchestrator's "members" endpoint (see ``cluster_relation``).
+    • A member unit installs the channels the cluster runs, waits for the
+      cluster to exist, and is joined to it in a grow session the
+      orchestrator leader opens for its application's units.
+
 Observe-only mode (MicroCloud already initialized out-of-band)
 --------------------------------------------------------------
+    • This exists to integrate an existing cluster with COS. It is not a way
+      to deploy one or to bring one under the charm's management.
     • No snaps are installed and no bootstrap is attempted.
     • The leader validates that every MicroCloud member has a corresponding
       Juju unit (matched on hostname) and blocks on any mismatch.
@@ -67,7 +79,17 @@ import lxd_cluster
 import microcloud
 import session
 import snap
-from cluster import ClusterCoordinator, PeerSystem, validate_membership
+from cluster import (
+    MODE_MEMBER,
+    MODE_ORCHESTRATOR,
+    ClusterCoordinator,
+    JoinSession,
+    PeerSystem,
+    identity_fields,
+    system_from_data,
+    validate_membership,
+)
+from cluster_relation import ClusterRelation, OrchestratorFacts
 from control_plane import ControlPlane
 from failure_domains import FailureDomains
 from network import UnitNetwork
@@ -113,6 +135,7 @@ class MicroCloudCharm(ops.CharmBase):
         )
 
         self._coordinator = ClusterCoordinator(self)
+        self._relations = ClusterRelation(self)
         self._control_plane = ControlPlane()
         self._failure_domains = FailureDomains()
         self._network = UnitNetwork(self.model, self.config)
@@ -124,6 +147,7 @@ class MicroCloudCharm(ops.CharmBase):
             self.charm_dir,
             self._stored,
             self._hold_status,
+            self._relations,
         )
         self._observability = Observability(self.config, self.app.name)
 
@@ -155,6 +179,17 @@ class MicroCloudCharm(ops.CharmBase):
         self.framework.observe(
             self.on.cluster_relation_departed, self._on_cluster_relation_changed
         )
+        self.framework.observe(self.on.leader_elected, self._on_cluster_relation_changed)
+        for endpoint in ("members", "orchestrator"):
+            relation_events = self.on[endpoint]
+            for event in (
+                relation_events.relation_created,
+                relation_events.relation_joined,
+                relation_events.relation_changed,
+                relation_events.relation_departed,
+                relation_events.relation_broken,
+            ):
+                self.framework.observe(event, self._on_cluster_relation_changed)
         self.framework.observe(self.on.stop, self._on_stop)
         self.framework.observe(self.on.remove, self._on_remove)
 
@@ -196,6 +231,9 @@ class MicroCloudCharm(ops.CharmBase):
     def _cos_related(self) -> bool:
         return bool(self.model.relations.get("cos-agent"))
 
+    def _is_orchestrator(self) -> bool:
+        return bool(self.config.get("orchestrator", False))
+
     # ------------------------------------------------------------------
     # Core hook handlers
     # ------------------------------------------------------------------
@@ -206,7 +244,7 @@ class MicroCloudCharm(ops.CharmBase):
     def _on_config_changed(self, event: ops.ConfigChangedEvent) -> None:
         self._reconcile()
 
-    def _on_cluster_relation_changed(self, event: ops.RelationEvent) -> None:
+    def _on_cluster_relation_changed(self, event: ops.EventBase) -> None:
         self._reconcile()
 
     def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
@@ -262,6 +300,12 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _reconcile(self) -> None:
         """Drive deployment or observe-only mode, then set status."""
+        initialized = microcloud.is_initialized()
+
+        # Before anything that can block this unit: the mode belongs to the
+        # application, and its other units wait for the leader to record it.
+        mode_problem = self._check_cluster_mode(initialized)
+
         ovn_uplink_interface, problem = self._network.ovn_uplink_interface()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -272,18 +316,43 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
-        initialized = microcloud.is_initialized()
-
         # Publish our identity for peers as early as possible.
-        self._coordinator.publish_identity(
-            microcloud.hostname(),
-            self._network.bind_address(),
-            ovn_uplink_interface=ovn_uplink_interface,
-            ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
-            storage_local_path=self._storage_local_path(),
-            storage_ceph_paths=storage_ceph_paths,
-            initialized=initialized,
-        )
+        system = {
+            "name": microcloud.hostname(),
+            "address": self._network.bind_address(),
+            "ovn_uplink_interface": ovn_uplink_interface,
+            "ovn_underlay_ip": self._network.space_bind_address("ovn-underlay"),
+            "storage_local_path": self._storage_local_path(),
+            "storage_ceph_paths": storage_ceph_paths,
+            "storage_wipe": bool(self.config.get("storage-wipe", False)),
+            "storage_encrypt": bool(self.config.get("storage-encrypt", False)),
+            "initialized": initialized,
+        }
+        self._coordinator.publish_identity(**system)
+
+        if mode_problem:
+            self.unit.status = ops.BlockedStatus(mode_problem)
+            return
+
+        if self._is_orchestrator():
+            if not self._reconcile_orchestrator(initialized):
+                return
+        else:
+            problem = self._reconcile_member(initialized, system)
+            if problem:
+                self.unit.status = ops.BlockedStatus(problem)
+                return
+
+        self._reconcile_clustered(initialized)
+
+    def _reconcile_orchestrator(self, initialized: bool) -> bool:
+        """Form or grow the cluster, or observe it.
+
+        Returns False once it has set a blocked status of its own.
+        """
+        session_open = self._coordinator.session() is not None
+        if self.unit.is_leader():
+            self._publish_to_members(initialized)
 
         # A unit that is not yet clustered runs the deploy path, whether that
         # forms the cluster or joins an existing one.
@@ -297,14 +366,18 @@ class MicroCloudCharm(ops.CharmBase):
         # retrying instead of sitting active.
         try:
             pending = self._sessions.pending(initialized)
+            # Member units are grown into the cluster by its clustered leader.
+            members_waiting = (
+                self.unit.is_leader() and initialized and self._sessions.has_member_candidates()
+            )
         except microcloud.MicroCloudError as exc:
             self.unit.status = ops.BlockedStatus(f"Cannot read MicroCloud members: {exc}")
-            return
+            return False
 
         # The leader also stays on the deploy path while its join session is
         # published, to pick up the result and clear it.
         initiating = self.unit.is_leader() and (
-            bool(pending) or self._coordinator.session() is not None
+            bool(pending) or members_waiting or self._coordinator.session() is not None
         )
 
         if initialized and not initiating:
@@ -312,11 +385,417 @@ class MicroCloudCharm(ops.CharmBase):
         else:
             problem = self._reconcile_deploy(initialized, pending)
 
+        # Nothing else wakes a leader with no peers once its session has ended,
+        # and member units are waiting for the storage pools it held back.
+        if self.unit.is_leader() and session_open and self._coordinator.session() is None:
+            # Unless that session formed the cluster, everything else was
+            # published at the start of this hook.
+            self._publish_to_members(microcloud.is_initialized(), held_back=initialized)
+
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return False
+        return True
+
+    # ---- Orchestrator and member applications ----
+
+    def _snap_channels(self) -> dict[str, str]:
+        return {
+            "lxd": self.config.get("snap-channel-lxd", "6/stable"),
+            "microceph": self.config.get("snap-channel-microceph", ""),
+            "microovn": self.config.get("snap-channel-microovn", ""),
+            "microcloud": self.config.get("snap-channel-microcloud", "3/stable"),
+        }
+
+    def _check_cluster_mode(self, initialized: bool) -> str | None:
+        """Pin which side of "microcloud_cluster" this application is on.
+
+        The leader records the mode until the cluster forms, after which it
+        cannot change: a formed cluster cannot move between applications.
+        Also rejects relations on the endpoint that does not match the
+        option. Returns a problem string to block on, or None.
+        """
+        orchestrator = self._is_orchestrator()
+        mode = MODE_ORCHESTRATOR if orchestrator else MODE_MEMBER
+        self._relations.publish_role(orchestrator)
+
+        recorded = self._coordinator.cluster_mode()
+        formed = initialized or self._coordinator.any_initialized()
+        if formed and recorded and recorded != mode:
+            return f"orchestrator cannot change after the cluster formed (formed as {recorded})"
+        # A cluster with no mode recorded formed before this charm recorded
+        # one, or outside Juju. It did not join as a member, which takes the
+        # relation and a recorded mode, so the option's default must not pin
+        # it as one: that could never be changed to orchestrator=true.
+        unpinned = (
+            formed
+            and not recorded
+            and not orchestrator
+            and self._relations.orchestrator_relation() is None
+        )
+        if self.unit.is_leader() and recorded != mode and not unpinned:
+            self._coordinator.record_cluster_mode(mode)
+
+        if orchestrator:
+            if self._relations.orchestrator_relation() is not None:
+                return "orchestrator endpoint needs orchestrator=false"
+            members = self._relations.members_relations()
+            for relation in members:
+                if self._relations.remote_role(relation) == "true" and relation.app is not None:
+                    return f"{relation.app.name} on members has orchestrator=true"
+            if members and not self.config.get("snap-channel-microceph", ""):
+                return "members relation needs MicroCeph (snap-channel-microceph)"
+        else:
+            if self._relations.members_relations():
+                return "members endpoint needs orchestrator=true"
+            relation = self._relations.orchestrator_relation()
+            if (
+                relation is not None
+                and relation.app is not None
+                and self._relations.remote_role(relation) == "false"
+            ):
+                return f"{relation.app.name} on orchestrator has orchestrator=false"
+        return None
+
+    def _publish_to_members(self, initialized: bool, *, held_back: bool = False) -> None:
+        """Leader publishes cluster facts on every "members" relation.
+
+        With ``held_back``, only what an open session kept from being
+        published: this hook has already published the rest.
+        """
+        relations = self._relations.members_relations()
+        if relations:
+            self._publish_facts(relations, initialized, held_back)
+        # Also once the last relation is gone: a detached member's entry has to
+        # go when its MicroCloud member is removed.
+        if initialized and (relations or self._coordinator.joined_units()):
+            self._sync_joined_units(relations)
+
+    def _publish_facts(
+        self, relations: list[ops.Relation], initialized: bool, held_back: bool = False
+    ) -> None:
+        """Publish what member units need to join on each of ``relations``.
+
+        With ``held_back``, the channels, versions and secret stay as this
+        hook already published them, which saves reading them twice.
+        """
+        # A leader that has not joined an existing cluster yet only knows what
+        # it would run itself, so what a clustered leader published stands.
+        cluster_exists = initialized or self._coordinator.any_initialized()
+        channels = None
+        versions = None
+        if not held_back and (initialized or not cluster_exists):
+            channels = self._cluster_channels(initialized)
+        if channels is not None:
+            names = [name for name, channel in channels.items() if channel]
+            own_versions = snap.service_versions(names)
+            # Publish only a full set, so members never match a partial one.
+            if set(own_versions) == set(names):
+                versions = own_versions
+
+        fingerprint: str | None = None
+        storage: list[str] | None = None
+        if initialized:
+            try:
+                if lxd_cluster.is_clustered():
+                    fingerprint = lxd_cluster.certificate_fingerprint()
+                    # LXD clusters before the bootstrap session creates the
+                    # pools, and member units take what is published as final.
+                    if self._coordinator.session() is None:
+                        storage = lxd_cluster.storage_pools()
+            except lxd_cluster.LXDClusterError as exc:
+                logger.warning("Cannot read the cluster facts for member units: %s", exc)
+
+        secret_ids = {} if held_back else self._coordinator.grant_passphrase(relations)
+        for relation in relations:
+            self._relations.publish_facts(
+                relation,
+                snap_channels=channels,
+                service_versions=versions,
+                initialized=cluster_exists,
+                fingerprint=fingerprint,
+                storage=storage,
+                secret_id=secret_ids.get(relation.id),
+                session_timeout=int(self.config.get("session-timeout", 300)),
+            )
+
+    def _cluster_channels(self, initialized: bool) -> dict[str, str] | None:
+        """Return the snap channels member units are to install, or None if unreadable.
+
+        These are the configured channels until the cluster forms, then the
+        ones this unit's snaps track: a clustered unit does not follow config
+        changes, so the config can differ from what the cluster runs. A snap
+        that tracks no channel keeps the configured one, and a snap that is not
+        installed is not part of the cluster.
+        """
+        configured = self._snap_channels()
+        if not initialized:
+            return configured
+        try:
+            tracked = snap.tracked_channels()
+        except snap.SnapError as exc:
+            logger.warning("Cannot read the tracked snap channels: %s", exc)
+            return None
+        return {
+            name: (tracked[name] or channel) if name in tracked else ""
+            for name, channel in configured.items()
+        }
+
+    def _sync_joined_units(self, relations: list[ops.Relation]) -> None:
+        """Record the member units that have joined the cluster.
+
+        A unit is dropped once its application lists it no longer, but kept
+        when the whole relation is gone, so its MicroCloud member stays
+        known as that of a detached member application.
+        """
+        try:
+            members = self._sessions.member_names()
+        except microcloud.MicroCloudError as exc:
+            logger.warning("Cannot read MicroCloud members: %s", exc)
+            return
+
+        joined = {
+            name: unit
+            for name, unit in self._coordinator.joined_units().items()
+            if name in members
+        }
+        for relation in relations:
+            for member in self._relations.member_systems(relation):
+                if member.system.name in members:
+                    joined[member.system.name] = member.unit
+            units = self._relations.member_units(relation)
+            if units is None or relation.app is None:
+                continue
+            prefix = f"{relation.app.name}/"
+            joined = {
+                name: unit
+                for name, unit in joined.items()
+                if not unit.startswith(prefix) or unit in units
+            }
+        if joined != self._coordinator.joined_units():
+            self._coordinator.record_joined_units(joined)
+
+    def _reconcile_member(self, initialized: bool, system: dict[str, Any]) -> str | None:
+        """Join this member unit to the orchestrator's cluster, or observe it.
+
+        Returns a problem string to block on, or None.
+        """
+        identity = identity_fields(**system)
+        relation = self._relations.orchestrator_relation()
+        self._relations.publish_member(identity)
+        if self.unit.is_leader() and relation is not None:
+            peer = self._coordinator.relation
+            units = [self.unit.name] + ([unit.name for unit in peer.units] if peer else [])
+            self._relations.publish_units(units)
+
+        if initialized:
+            return self._reconcile_member_clustered()
+
+        # A worker only runs for the session the orchestrator has published,
+        # whatever keeps this unit from joining below: no relation, a failed
+        # prerequisite, an exclusion, or a session that does not list it.
+        facts = self._relations.facts()
+        self._sessions.stand_down(facts.session if facts is not None else None)
+
+        if relation is None:
+            self._hold_status(
+                ops.WaitingStatus(
+                    "Waiting for orchestrator relation (set orchestrator=true to start a cluster)"
+                )
+            )
+            return None
+
+        # The orchestrator cannot list a unit that has no address.
+        own = system_from_data(identity)
+        if own is None:
+            self._relations.publish_member({}, ready=False)
+            self._hold_status(ops.WaitingStatus("Waiting for an address on the cluster binding"))
+            return None
+
+        problem, passphrase = self._member_prerequisites(facts, system)
+        # Withdrawn whenever a prerequisite fails, so the orchestrator never
+        # lists a unit that would not dial in.
+        self._relations.publish_member({}, ready=passphrase is not None)
+        if facts is None or passphrase is None:
+            return problem
+
+        # Checked after publishing ready: the orchestrator's failure count
+        # resets once a unit is added or changed, and it needs ready to see it.
+        if facts.failures.count >= session.SESSION_RETRIES:
+            return (
+                f"excluded after {facts.failures.count} failed join sessions: "
+                f"{facts.failures.error}"
+            )
+
+        return self._sessions.join_member(passphrase, facts, own)
+
+    def _member_prerequisites(
+        self, facts: OrchestratorFacts | None, system: dict[str, Any]
+    ) -> tuple[str | None, str | None]:
+        """Check what an unclustered member unit needs before it can join.
+
+        Returns ``(problem, passphrase)``. The passphrase is set only when
+        the unit is ready to be listed in a session; otherwise the problem is
+        the block message, or None when a waiting status was held.
+        """
+        if facts is None or facts.snap_channels is None:
+            self._hold_status(ops.WaitingStatus("Waiting for the orchestrator"))
+            return None, None
+        channels = facts.snap_channels
+
+        # The channels the cluster runs, not this application's own: MicroCloud
+        # only joins systems whose services report the same versions.
+        try:
+            snap.ensure_installed(channels)
+        except snap.SnapError as exc:
+            return f"Snap install: {exc}", None
+
+        if not microcloud.waitready(timeout=60):
+            self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
+            return None, None
+
+        problem, waiting = self._match_service_versions(channels, facts.service_versions)
+        if problem or waiting:
+            return problem, None
+
+        problem = self._member_storage_problem(system, facts.storage)
+        if problem:
+            return problem, None
+
+        if channels.get("microovn"):
+            interface = str(system.get("ovn_uplink_interface", ""))
+            problem = self._network.missing_uplink_interface(interface)
+            if problem:
+                return problem, None
+
+        if not facts.initialized:
+            self._hold_status(ops.WaitingStatus("Waiting for the orchestrator to bootstrap"))
+            return None, None
+
+        # LXD clusters shortly after MicroCloud initializes; the storage
+        # guards above need its pools.
+        if facts.storage is None:
+            self._hold_status(ops.WaitingStatus("Waiting for the cluster's storage pools"))
+            return None, None
+
+        passphrase = self._relations.passphrase(facts)
+        if not passphrase:
+            self._hold_status(ops.WaitingStatus("Waiting for session passphrase"))
+            return None, None
+
+        # Joining pins this application as a member, so the leader must have
+        # recorded that first.
+        if self._coordinator.cluster_mode() != MODE_MEMBER:
+            self._hold_status(
+                ops.WaitingStatus("Waiting for the leader to record the cluster mode")
+            )
+            return None, None
+
+        return None, passphrase
+
+    def _match_service_versions(
+        self, channels: dict[str, str], wanted: dict[str, str]
+    ) -> tuple[str | None, bool]:
+        """Publish this unit's service versions, refreshing snaps that differ.
+
+        Returns ``(problem, waiting)``: a problem string while a version still
+        differs, or waiting True, with a waiting status held, while a daemon
+        has not reported its version yet.
+        """
+        names = [name for name, channel in channels.items() if channel]
+        own = snap.service_versions(names)
+        mismatches = snap.version_mismatches(own, wanted) if wanted else {}
+        # Only a version that was read and differs calls for a refresh. A
+        # daemon that has not answered yet, as happens right after its snap
+        # is installed, is waited for below instead.
+        refresh = [name for name in mismatches if name in own and channels.get(name)]
+        if refresh:
+            try:
+                for name in refresh:
+                    snap.install(name, channels[name])
+                    snap.hold(name)
+            except snap.SnapError as exc:
+                return f"Snap refresh: {exc}", False
+            own = snap.service_versions(names)
+            mismatches = snap.version_mismatches(own, wanted)
+        self._relations.publish_member({}, service_versions=own)
+
+        missing = [name for name in names if name not in own]
+        if missing:
+            self._hold_status(
+                ops.WaitingStatus(
+                    f"Waiting for the {', '.join(missing)} daemon(s) to report a version"
+                )
+            )
+            return None, True
+        if mismatches:
+            differing = ", ".join(
+                f"{name} {version} (orchestrator {wanted[name]})"
+                for name, version in mismatches.items()
+            )
+            return f"service versions differ from the orchestrator: {differing}", False
+        return None, False
+
+    @staticmethod
+    def _member_storage_problem(system: dict[str, Any], storage: list[str] | None) -> str | None:
+        """Check this member unit's storage against the cluster's pools."""
+        if storage is None:
+            return None
+        if system.get("storage_ceph_paths") and not {"ceph", "cephfs"} & set(storage):
+            return "ceph storage attached but the cluster has no Ceph pools"
+        local_path = system.get("storage_local_path")
+        if "local" in storage and not local_path:
+            return "the cluster has a local pool; attach local storage"
+        if local_path and "local" not in storage:
+            return "local storage attached but the cluster has no local pool"
+        return None
+
+    def _reconcile_member_clustered(self) -> str | None:
+        """Check a clustered member unit against the orchestrator's cluster."""
+        facts = self._relations.facts()
+        if facts is not None:
+            fingerprint = ""
+            try:
+                if lxd_cluster.is_clustered():
+                    fingerprint = lxd_cluster.certificate_fingerprint()
+            except lxd_cluster.LXDClusterError as exc:
+                logger.warning("Cannot read the cluster certificate: %s", exc)
+            if fingerprint:
+                self._relations.publish_member({}, fingerprint=fingerprint)
+                if facts.fingerprint and fingerprint != facts.fingerprint:
+                    return "already a member of another MicroCloud"
+
+        # The orchestrator leader validates the whole cluster. This
+        # application's leader only checks that its own clustered units are
+        # members.
+        if not self.unit.is_leader():
+            return None
+        try:
+            members = {member.name for member in microcloud.list_members()}
+        except microcloud.MicroCloudError as exc:
+            return f"Cannot read MicroCloud members: {exc}"
+        clustered = {
+            system.name for system in self._coordinator.peer_systems() if system.initialized
+        }
+        problems = validate_membership(clustered, members, known=members)
+        return "; ".join(problems) or None
+
+    def _open_session(self) -> JoinSession | None:
+        """Return the join session this unit is joining through, if any."""
+        if self._is_orchestrator():
+            return self._coordinator.session()
+        facts = self._relations.facts()
+        return facts.session if facts is not None else None
+
+    def _reconcile_clustered(self, initialized: bool) -> None:
+        """Finish a clustered unit's setup, then set status."""
+        problem = None
         # Only a unit that was clustered when this hook started, and only once
         # its LXD has joined too. MicroCloud reports a joining unit as clustered
         # as soon as it has joined MicroCloud itself, before the initiator adds
-        # its LXD. The leader clearing its join session wakes it up again.
-        if not problem and initialized:
+        # its LXD, and LXD reads as clustered before its own join has ended. The
+        # leader clearing its join session wakes it up again.
+        if initialized:
             try:
                 lxd_clustered = lxd_cluster.is_clustered()
             except lxd_cluster.LXDClusterError as exc:
@@ -324,7 +803,9 @@ class MicroCloudCharm(ops.CharmBase):
             else:
                 if lxd_clustered:
                     self._stored.lxd_join_since = 0.0
-                    problem = self._failure_domains.reconcile()
+                    current = self._open_session()
+                    if current is None or microcloud.hostname() not in current.systems:
+                        problem = self._failure_domains.reconcile()
                 else:
                     problem = self._await_lxd_join()
 
@@ -364,7 +845,7 @@ class MicroCloudCharm(ops.CharmBase):
         # the end of it. Keep restarting the clock while one is open so the
         # grace below is measured from the session ending, not from the first
         # hook that noticed LXD missing.
-        if self._coordinator.session() is not None:
+        if self._open_session() is not None:
             self._stored.lxd_join_since = now
             self._hold_status(ops.WaitingStatus("Waiting for LXD to join the cluster"))
             return None
@@ -402,18 +883,16 @@ class MicroCloudCharm(ops.CharmBase):
 
         Returns a problem string to block on, or None.
         """
+        # A worker only runs for the published session, whatever keeps this
+        # unit from leading or joining one below.
+        self._sessions.stand_down(self._coordinator.session())
+
         # A clustered leader only gets here to run a join session. Its snaps
         # are already in place, and refreshing them now would upgrade this
         # one member ahead of the rest of the cluster.
         if not initialized:
-            channels = {
-                "lxd": self.config.get("snap-channel-lxd", "6/stable"),
-                "microceph": self.config.get("snap-channel-microceph", ""),
-                "microovn": self.config.get("snap-channel-microovn", ""),
-                "microcloud": self.config.get("snap-channel-microcloud", "3/stable"),
-            }
             try:
-                snap.ensure_snaps(channels)
+                snap.ensure_snaps(self._snap_channels())
             except snap.SnapError as exc:
                 return f"Snap install: {exc}"
 
@@ -502,14 +981,27 @@ class MicroCloudCharm(ops.CharmBase):
             return None
 
         try:
-            members = microcloud.list_members()
+            member_names = self._sessions.member_names()
         except microcloud.MicroCloudError as exc:
             return f"Cannot read MicroCloud members: {exc}"
 
-        member_names = {m.name for m in members}
         juju_hostnames = {name for name, _ in self._coordinator.all_members()}
+        # Member units are expected once they report being in this cluster,
+        # and allowed while joining or after their relation is gone.
+        known = set(self._coordinator.joined_units())
+        for relation in self._relations.members_relations():
+            cluster = self._relations.published_fingerprint(relation)
+            for member in self._relations.member_systems(relation):
+                known.add(member.system.name)
+                # A unit that is clustered elsewhere, or whose LXD has not
+                # joined or cannot be read, publishes another fingerprint or
+                # none, and blocks itself. It says nothing about this
+                # cluster, so it must not stop this leader's work.
+                here = bool(cluster) and member.fingerprint == cluster
+                if member.system.initialized and here:
+                    juju_hostnames.add(member.system.name)
 
-        problems = validate_membership(juju_hostnames, member_names)
+        problems = validate_membership(juju_hostnames, member_names, known)
         if problems:
             return "; ".join(problems)
         return None
@@ -531,6 +1023,12 @@ class MicroCloudCharm(ops.CharmBase):
             return
 
         message = "Cluster ready"
+        if not self._is_orchestrator() and self._relations.orchestrator_relation() is None:
+            if self._coordinator.cluster_mode() == MODE_MEMBER:
+                message += "; orchestrator relation removed"
+            else:
+                # Formed with no mode recorded. See _check_cluster_mode.
+                message += "; no orchestrator relation, set orchestrator=true"
         if self._cos_related():
             problems = self._observability.health_problems()
             if problems:
@@ -555,7 +1053,21 @@ class MicroCloudCharm(ops.CharmBase):
         result: dict[str, Any] = {
             "mode": "observe-only" if initialized else "deploy",
             "initialized": initialized,
+            "cluster-mode": self._coordinator.cluster_mode()
+            or (MODE_ORCHESTRATOR if self._is_orchestrator() else MODE_MEMBER),
         }
+        if self._is_orchestrator() and self.unit.is_leader():
+            related = {
+                relation.app.name
+                for relation in self._relations.members_relations()
+                if relation.app is not None
+            }
+            joined = {
+                name: unit if unit.split("/")[0] in related else f"{unit} (detached)"
+                for name, unit in self._coordinator.joined_units().items()
+            }
+            if joined:
+                result["joined-units"] = json.dumps(joined, sort_keys=True)
         if initialized:
             try:
                 cluster = lxd_cluster.members()

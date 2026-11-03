@@ -28,9 +28,17 @@ description: |
       distributed to peers via a Juju secret.
 
     - If MicroCloud IS already initialized (a cluster deployed out-of-band),
-      the charm does not install snaps or bootstrap. It instead validates
-      that every MicroCloud member has a corresponding Juju unit (matched on
-      hostname) and blocks if any member is missing.
+      the charm does not install snaps or bootstrap. This exists to integrate
+      an existing cluster with COS; it is not a way to deploy one or to bring
+      one under the charm's management.
+
+  Orchestrator and member applications
+  ------------------------------------
+  Each hardware profile, such as a CPU architecture, is its own application
+  of this charm. Exactly one has "orchestrator=true": it forms the cluster
+  and grows it. Every other application relates its "orchestrator" endpoint
+  to the orchestrator's "members" endpoint, installs the channels the cluster
+  runs, and has its units joined to the orchestrator's cluster.
 
   Observability (optional)
   ------------------------
@@ -90,8 +98,15 @@ peers:
 provides:
   cos-agent:
     interface: cos_agent
+  members:
+    interface: microcloud_cluster
+    optional: true
 
 requires:
+  orchestrator:
+    interface: microcloud_cluster
+    limit: 1
+    optional: true
   logging:
     interface: loki_push_api
     limit: 1
@@ -168,6 +183,16 @@ extra-bindings:
 
 config:
   options:
+    orchestrator:
+      type: boolean
+      default: false
+      description: >
+        Whether this application forms and grows the MicroCloud cluster.
+        Set it on exactly one application. Every other application relates
+        its "orchestrator" endpoint to this application's "members"
+        endpoint and joins the cluster. Cannot change once the cluster has
+        formed.
+
     # ------------------------------------------------------------------
     # Snap channels (deployment mode only)
     # ------------------------------------------------------------------
@@ -237,12 +262,16 @@ config:
     storage-wipe:
       type: boolean
       default: false
-      description: Wipe disks attached via Juju storage before use.
+      description: >
+        Wipe disks attached via Juju storage before use. Applies to this
+        application's disks only, including when it is a member application.
 
     storage-encrypt:
       type: boolean
       default: false
-      description: Encrypt disks attached via Juju storage.
+      description: >
+        Encrypt disks attached via Juju storage. Applies to this application's
+        disks only, including when it is a member application.
 
     # ------------------------------------------------------------------
     # OVN uplink preseed options
@@ -332,7 +361,10 @@ actions:
     description: >
       Print the detected charm mode and the cluster members as seen by this
       unit: a table of their names, database roles, failure domains and
-      architectures, LXD's control-plane mode, and the MicroCloud membership.
+      architectures, LXD's control-plane mode, the MicroCloud membership,
+      and whether this application is the orchestrator or a member. On the
+      orchestrator leader, also the joined member units, marking those whose
+      application is no longer related as detached.
 
   dump-metrics-config:
     description: >
