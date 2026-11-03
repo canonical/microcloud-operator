@@ -139,6 +139,11 @@ which is why `microcloud:logging` goes to the collector as well.
 
 ## Things that are easy to get wrong
 
+**The MicroCloud application is the orchestrator.** The module sets the
+charm's `orchestrator` option to `"true"` unless `microcloud.config` sets it.
+Member applications of other architectures come from the charm module, related
+to `microcloud:members`; see its README.
+
 **Offer URLs have no controller prefix.** The provider refuses
 `cos:admin/cos.loki-logging`. Write `admin/cos.loki-logging`, and name the
 controller with the integration's `controller`.
