@@ -35,6 +35,11 @@ class SystemEntry:
     # already resolved exactly which block device to use.
     storage_local_path: str = ""
     storage_ceph_paths: list[str] = field(default_factory=list)
+    # MicroCloud reads these per disk from the initiator's document, so they
+    # belong to the system that owns the disks: a member application's disks
+    # follow that application's options, not the orchestrator's.
+    storage_wipe: bool = False
+    storage_encrypt: bool = False
 
 
 @dataclass
@@ -60,11 +65,6 @@ class PreseedInputs:
     ovn_ipv6_gateway: str = ""
     ovn_dns_servers: str = ""
 
-    # Storage (applies to any Juju-attached "local"/"ceph" storage paths
-    # on the systems above)
-    storage_wipe: bool = False
-    storage_encrypt: bool = False
-
     extra_ports: dict = field(default_factory=dict)
 
 
@@ -80,10 +80,10 @@ def build_preseed(inputs: PreseedInputs) -> dict:
 
         storage: dict = {}
         if sys_entry.storage_local_path:
-            storage["local"] = _direct_storage(sys_entry.storage_local_path, inputs)
+            storage["local"] = _direct_storage(sys_entry.storage_local_path, sys_entry)
         if inputs.with_ceph and sys_entry.storage_ceph_paths:
             storage["ceph"] = [
-                _direct_storage(path, inputs) for path in sys_entry.storage_ceph_paths
+                _direct_storage(path, sys_entry) for path in sys_entry.storage_ceph_paths
             ]
         if storage:
             entry["storage"] = storage
@@ -128,12 +128,12 @@ def build_preseed(inputs: PreseedInputs) -> dict:
     return doc
 
 
-def _direct_storage(path: str, inputs: PreseedInputs) -> dict:
+def _direct_storage(path: str, system: SystemEntry) -> dict:
     """Build a "systems[*].storage.local"/"...ceph[*]" entry for a device path."""
     entry: dict = {"path": path}
-    if inputs.storage_wipe:
+    if system.storage_wipe:
         entry["wipe"] = True
-    if inputs.storage_encrypt:
+    if system.storage_encrypt:
         entry["encrypt"] = True
     return entry
 
