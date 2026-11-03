@@ -14,6 +14,11 @@ output "provides" {
       name     = juju_application.microcloud.name
       endpoint = "cos-agent"
     }
+    members = {
+      kind     = "endpoint"
+      name     = juju_application.microcloud.name
+      endpoint = "members"
+    }
   }
 }
 
@@ -24,6 +29,11 @@ output "requires" {
       kind     = "endpoint"
       name     = juju_application.microcloud.name
       endpoint = "logging"
+    }
+    orchestrator = {
+      kind     = "endpoint"
+      name     = juju_application.microcloud.name
+      endpoint = "orchestrator"
     }
   }
 }

@@ -9,7 +9,7 @@ module "microcloud" {
   app_name           = var.microcloud.app_name
   base               = var.microcloud.base
   channel            = local.channels.microcloud
-  config             = var.microcloud.config
+  config             = local.microcloud_config
   constraints        = var.microcloud.constraints
   endpoint_bindings  = var.microcloud.endpoint_bindings
   machines           = var.microcloud.machines

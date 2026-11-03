@@ -84,12 +84,12 @@ variable "endpoint_bindings" {
     condition = alltrue([
       for binding in var.endpoint_bindings :
       contains(
-        ["", "cluster", "cos-agent", "logging",
+        ["", "cluster", "cos-agent", "logging", "members", "orchestrator",
         "ceph-public", "ceph-internal", "ovn-underlay", "ovn-uplink"],
         binding.endpoint == null ? "" : binding.endpoint
       )
     ])
-    error_message = "endpoint must be \"\" or one of the charm's endpoints: cluster, cos-agent, logging, ceph-public, ceph-internal, ovn-underlay, ovn-uplink."
+    error_message = "endpoint must be \"\" or one of the charm's endpoints: cluster, cos-agent, logging, members, orchestrator, ceph-public, ceph-internal, ovn-underlay, ovn-uplink."
   }
 }
 
