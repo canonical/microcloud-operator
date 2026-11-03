@@ -22,6 +22,10 @@ locals {
     length(var.microcloud.machines) > 0 ? length(var.microcloud.machines) : 3
   )
 
+  # This module deploys the one application that forms the cluster. Member
+  # applications are deployed alongside it and related to its "members".
+  microcloud_config = merge({ orchestrator = "true" }, var.microcloud.config)
+
   # proxy and logging_config are model config underneath. An explicit
   # model.config wins, so a caller can still override a single key.
   model_config = merge(
