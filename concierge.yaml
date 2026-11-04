@@ -2,9 +2,16 @@
 #   sudo concierge prepare -c concierge.yaml
 #
 # Mirrors the lxd-dev workspace's config/concierge.yaml so that a local run on
-# the lxd-juju-dev VM and a CI run provision the same way. Based on concierge's
-# `machine` preset rather than `dev`/`k8s`: this is a machine charm and needs no
-# Kubernetes substrate.
+# the lxd-juju-dev VM and a CI run provision the same way. It bootstraps both an
+# LXD controller (for the machine charm and MicroCloud VMs) and a Canonical K8s
+# controller (for COS Lite).
+#
+# The LXD controller runs the MicroCloud VMs; the Canonical K8s controller runs
+# COS Lite. COS is consumed through cross-model relations. The load-balancer
+# feature (MetalLB in L2 mode) gives traefik an external LoadBalancer IP: the
+# MicroCloud VMs live on the LXD bridge and must reach Prometheus/Loki to push
+# and query observability data. Concierge opens the host FORWARD chain, so the
+# load-balancer range is reachable from the LXD VMs via the host.
 #
 # See https://github.com/canonical/concierge for the full schema.
 
@@ -12,9 +19,11 @@ juju:
   channel: 3.6/stable
   model-defaults:
     test-mode: "true"
-    # Left off deliberately: in CI a hook that only passes on retry is a flake
-    # worth seeing, not one worth papering over.
-    automatically-retry-hooks: "false"
+    # Enabled so COS Lite's third-party charms can self-heal: on Kubernetes they
+    # hit transient Pebble-socket races during pod restarts, which would
+    # otherwise brick the whole run on one flaky hook. Real flakes are caught by
+    # the test assertions, not by disabling retries.
+    automatically-retry-hooks: "true"
   # Bootstrapping into a nested LXD can be slow on a loaded runner.
   extra-bootstrap-args: --config bootstrap-timeout=1800
 
@@ -24,6 +33,21 @@ providers:
     bootstrap: true
     # `channel` is deliberately unset: concierge then refreshes the lxd snap on
     # its current channel instead of switching it.
+    controller-name: integration-lxd
+
+  k8s:
+    enable: true
+    bootstrap: true
+    controller-name: integration-k8s
+    features:
+      # L2-mode MetalLB: traefik claims an external IP from this range. The
+      # range is reachable from the LXD VMs because concierge opens the host
+      # FORWARD chain and the K8s node advertises it on the host.
+      load-balancer:
+        l2-mode: "true"
+        cidrs: "10.43.45.0/28"
+      local-storage: {}
+      network: {}
 
 host:
   snaps:
