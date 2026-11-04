@@ -44,3 +44,8 @@ ignore = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
+markers = [
+    "vm: requires LXD virtual machines",
+    "cos: requires a MicroK8s controller and COS Lite",
+]
