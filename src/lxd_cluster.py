@@ -106,6 +106,18 @@ def server_version() -> tuple[str, set[str]]:
     return environment.get("server_version", ""), set(server.get("api_extensions") or [])
 
 
+def storage_pools() -> dict[str, set[str]]:
+    """Return every storage pool's name and the members it is created on."""
+    pools = _query("/1.0/storage-pools?recursion=1")
+    if not isinstance(pools, list):
+        raise LXDClusterError("Unexpected response for /1.0/storage-pools: not a list")
+    return {
+        pool["name"]: set(pool.get("locations") or [])
+        for pool in pools
+        if isinstance(pool, dict) and pool.get("name")
+    }
+
+
 def own_name() -> str:
     """Return this server's name as an LXD cluster member.
 
