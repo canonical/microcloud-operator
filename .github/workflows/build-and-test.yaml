@@ -64,13 +64,13 @@ jobs:
       - name: Setup LXD
         # charmcraft builds inside LXD.
         uses: canonical/setup-lxd@8c6a87bfb56aa48f3fb9b830baa18562d8bfd4ee # v1
-        timeout-minutes: 10
+        timeout-minutes: 30
         with:
           channel: 6/stable
 
       - name: Install charmcraft
         run: sudo snap install --classic --channel=4.x/stable charmcraft
-        timeout-minutes: 10
+        timeout-minutes: 30
 
       - name: Cache charm build deps
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
