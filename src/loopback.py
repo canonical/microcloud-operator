@@ -111,3 +111,16 @@ def ensure(addresses: Mapping[ipaddress.IPv6Network, ipaddress.IPv6Address]) -> 
     except LoopbackError as exc:
         return f"Cannot put addresses on lo: {exc}"
     return None
+
+
+def reachable(source: str, target: str) -> bool:
+    """Return True if ``target`` answers a ping sent from ``source``.
+
+    An answer needs a route in both directions, so it shows that both
+    addresses are advertised.
+    """
+    try:
+        _run("ping", "-6", "-c", "1", "-W", "2", "-I", source, target)
+    except LoopbackError:
+        return False
+    return True

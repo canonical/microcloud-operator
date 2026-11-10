@@ -34,6 +34,7 @@ _KEY_OVN_UPLINK_INTERFACE = "microcloud-ovn-uplink-interface"
 _KEY_OVN_UNDERLAY_IP = "microcloud-ovn-underlay-ip"
 _KEY_STORAGE_LOCAL_PATH = "microcloud-storage-local-path"
 _KEY_STORAGE_CEPH_PATHS = "microcloud-storage-ceph-paths"
+_KEY_LOOPBACK_ADDRESSES = "microcloud-loopback-addresses"
 _KEY_READY = "microcloud-ready"
 _KEY_INITIALIZED = "microcloud-initialized"
 
@@ -54,6 +55,8 @@ class PeerSystem:
     ovn_underlay_ip: str = ""
     storage_local_path: str = ""
     storage_ceph_paths: list[str] = field(default_factory=list)
+    # Network CIDR to this unit's address in it, for networks whose addresses sit on "lo".
+    loopback_addresses: dict[str, str] = field(default_factory=dict)
     initialized: bool = False
 
 
@@ -103,6 +106,7 @@ class ClusterCoordinator:
         ovn_underlay_ip: str = "",
         storage_local_path: str = "",
         storage_ceph_paths: list[str] | None = None,
+        loopback_addresses: dict[str, str] | None = None,
         initialized: bool = False,
     ) -> None:
         """Publish this unit's MicroCloud identity on the peer databag.
@@ -123,6 +127,9 @@ class ClusterCoordinator:
         relation.data[self._charm.unit][_KEY_STORAGE_LOCAL_PATH] = storage_local_path
         relation.data[self._charm.unit][_KEY_STORAGE_CEPH_PATHS] = json.dumps(
             storage_ceph_paths or []
+        )
+        relation.data[self._charm.unit][_KEY_LOOPBACK_ADDRESSES] = json.dumps(
+            loopback_addresses or {}, sort_keys=True
         )
         # Whether this unit's own MicroCloud daemon is already clustered. The
         # leader reads this to tell a first bootstrap from growing an existing
@@ -161,6 +168,12 @@ class ClusterCoordinator:
                 storage_ceph_paths = json.loads(data.get(_KEY_STORAGE_CEPH_PATHS) or "[]")
             except (json.JSONDecodeError, TypeError):
                 storage_ceph_paths = []
+            try:
+                loopback_addresses = json.loads(data.get(_KEY_LOOPBACK_ADDRESSES) or "{}")
+            except (json.JSONDecodeError, TypeError):
+                loopback_addresses = {}
+            if not isinstance(loopback_addresses, dict):
+                loopback_addresses = {}
             if name and address:
                 members.append(
                     PeerSystem(
@@ -170,6 +183,7 @@ class ClusterCoordinator:
                         ovn_underlay_ip=ovn_underlay_ip,
                         storage_local_path=storage_local_path,
                         storage_ceph_paths=storage_ceph_paths,
+                        loopback_addresses=loopback_addresses,
                         initialized=initialized,
                     )
                 )
@@ -211,6 +225,11 @@ class ClusterCoordinator:
         if relation is None:
             return
         relation.data[self._charm.unit][_KEY_READY] = "true"
+
+    def published_ready(self) -> bool:
+        """Return True if this unit has already marked itself ready."""
+        relation = self.relation
+        return relation is not None and relation.data[self._charm.unit].get(_KEY_READY) == "true"
 
     def all_ready(self, pending: list[PeerSystem] | None = None) -> bool:
         """Return True once every unit that is to be listed has published ready.

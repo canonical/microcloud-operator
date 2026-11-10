@@ -152,3 +152,26 @@ class TestEnsure:
             "Cannot put addresses on lo: ip -json -6 address show scope global: "
             "RTNETLINK answers: denied"
         )
+
+
+class TestReachable:
+    def test_true_when_the_target_answers(self, ip):
+        assert loopback.reachable("fd2b:5d1a:7c93:3:0:1:0:5", "fd2b:5d1a:7c93:3:0:1:0:6")
+        assert ip.calls == [
+            [
+                "ping",
+                "-6",
+                "-c",
+                "1",
+                "-W",
+                "2",
+                "-I",
+                "fd2b:5d1a:7c93:3:0:1:0:5",
+                "fd2b:5d1a:7c93:3:0:1:0:6",
+            ]
+        ]
+
+    def test_false_when_the_target_does_not_answer(self):
+        error = subprocess.CalledProcessError(1, ["ping"], stderr="")
+        with patch("loopback.subprocess.run", side_effect=error):
+            assert not loopback.reachable("fd2b:5d1a:7c93:3:0:1:0:5", "fd2b:5d1a:7c93:3:0:1:0:6")
