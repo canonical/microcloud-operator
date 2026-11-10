@@ -163,6 +163,23 @@ class UnitNetwork:
             return ""
         return str(derive_address(network, source))
 
+    def derived_addresses(self) -> dict[ipaddress.IPv6Network, ipaddress.IPv6Address]:
+        """Return this unit's derived address in each network that has its option set.
+
+        Empty until the unit has an IPv6 cluster address to derive from.
+        """
+        try:
+            source = ipaddress.IPv6Address(self.bind_address())
+        except ValueError:
+            return {}
+
+        addresses = {}
+        for binding_name in NETWORK_OPTIONS:
+            network = self.configured_network(binding_name)
+            if network is not None:
+                addresses[network] = derive_address(network, source)
+        return addresses
+
     def space_cidr(self, binding_name: str) -> str:
         """Return the CIDR of the given space: its network option, or its binding's subnet."""
         network = self.configured_network(binding_name)

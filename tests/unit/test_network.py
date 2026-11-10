@@ -313,3 +313,22 @@ class TestSpaceCidr:
     def test_the_binding_subnet_when_the_option_is_unset(self):
         network = _network(binding=_bound("10.42.0.7", subnet="10.42.0.0/24"))
         assert network.space_cidr("ceph-public") == "10.42.0.0/24"
+
+
+class TestDerivedAddresses:
+    def test_one_address_per_configured_network(self):
+        network = _network(
+            config={"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY},
+            binding=_bound(OAM_ADDRESS),
+        )
+        assert network.derived_addresses() == {
+            ipaddress.IPv6Network(CEPH_PUBLIC): ipaddress.IPv6Address("fd2b:5d1a:7c93:3:0:1:0:5"),
+            ipaddress.IPv6Network(OVN_UNDERLAY): ipaddress.IPv6Address("fd2b:5d1a:7c93:1:0:1:0:5"),
+        }
+
+    def test_empty_when_no_option_is_set(self):
+        assert _network(binding=_bound(OAM_ADDRESS)).derived_addresses() == {}
+
+    def test_empty_without_an_ipv6_cluster_address(self):
+        network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound("10.0.0.1"))
+        assert network.derived_addresses() == {}
