@@ -1,8 +1,9 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""This unit's network: addresses and subnets from Juju space bindings, and its OVN uplink."""
+"""This unit's network: addresses and subnets from Juju space bindings or config, and its OVN uplink."""
 
+import ipaddress
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,22 @@ import ops
 import yaml
 
 import microcloud
+
+# The option that gives each space's /64 where its addresses sit on "lo".
+NETWORK_OPTIONS = {
+    "ceph-public": "ceph-public-network",
+    "ceph-internal": "ceph-internal-network",
+    "ovn-underlay": "ovn-underlay-network",
+}
+
+
+def derive_address(
+    network: ipaddress.IPv6Network, source: ipaddress.IPv6Address
+) -> ipaddress.IPv6Address:
+    """Return the address in ``network`` that has the host part of ``source``."""
+    return ipaddress.IPv6Address(
+        int(network.network_address) | (int(source) & int(network.hostmask))
+    )
 
 
 def per_host_value(raw: str, option: str) -> tuple[str, str | None]:
@@ -86,6 +103,72 @@ class UnitNetwork:
         if not network or not network.bind_address:
             return ""
         return str(network.bind_address)
+
+    def configured_network(self, binding_name: str) -> ipaddress.IPv6Network | None:
+        """Return the /64 configured for the given space, or None.
+
+        None also covers a value that is not an IPv6 /64, which
+        ``network_options_problem`` reports.
+        """
+        raw = str(self._config.get(NETWORK_OPTIONS.get(binding_name, ""), "")).strip()
+        if not raw:
+            return None
+        try:
+            network = ipaddress.ip_network(raw)
+        except ValueError:
+            return None
+        if network.version != 6 or network.prefixlen != 64:
+            return None
+        return network
+
+    def network_options_problem(self) -> str | None:
+        """Return a problem if a space's network option cannot be used.
+
+        Each option must be an IPv6 /64, and this unit's cluster address must
+        be IPv6, since its host part is what the addresses are derived from.
+        A unit with no cluster address yet has nothing to report.
+        """
+        configured = False
+        for binding_name, option in NETWORK_OPTIONS.items():
+            raw = str(self._config.get(option, "")).strip()
+            if not raw:
+                continue
+            if self.configured_network(binding_name) is None:
+                return f"{option}: {raw!r} is not an IPv6 /64"
+            configured = True
+
+        address = self.bind_address()
+        if not configured or not address:
+            return None
+        try:
+            ipaddress.IPv6Address(address)
+        except ValueError:
+            return f"Cluster address {address} is not IPv6: cannot derive addresses from it"
+        return None
+
+    def space_address(self, binding_name: str) -> str:
+        """Return this unit's address in the given space, if any.
+
+        With the space's network option set, this is that /64 with the host
+        part of the unit's cluster address: the space has no interface, so the
+        address sits on "lo" and no binding can report it. Otherwise it is the
+        binding's address.
+        """
+        network = self.configured_network(binding_name)
+        if network is None:
+            return self.space_bind_address(binding_name)
+        try:
+            source = ipaddress.IPv6Address(self.bind_address())
+        except ValueError:
+            return ""
+        return str(derive_address(network, source))
+
+    def space_cidr(self, binding_name: str) -> str:
+        """Return the CIDR of the given space: its network option, or its binding's subnet."""
+        network = self.configured_network(binding_name)
+        if network is None:
+            return self.space_network_cidr(binding_name)
+        return str(network)
 
     def space_network_cidr(self, binding_name: str) -> str:
         """Return the CIDR of the subnet bound to the given extra-binding, if any.
