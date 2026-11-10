@@ -63,6 +63,7 @@ import ops
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
+import loopback
 import lxd_cluster
 import microcloud
 import session
@@ -268,6 +269,13 @@ class MicroCloudCharm(ops.CharmBase):
             return
 
         problem = self._network.network_options_problem()
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
+
+        # Before anything names these addresses: MicroCloud looks for them on
+        # the host when it reads the preseed.
+        problem = loopback.ensure(self._network.derived_addresses())
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
             return

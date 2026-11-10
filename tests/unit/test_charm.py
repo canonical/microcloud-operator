@@ -804,6 +804,7 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
+        stub._network.derived_addresses.return_value = {}
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -842,6 +843,23 @@ class TestHeldStatus:
         )
         stub._coordinator.publish_identity.assert_not_called()
 
+    def test_a_loopback_problem_blocks(self):
+        import ops
+
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
+        stub._coordinator = MagicMock()
+
+        with patch("charm.loopback.ensure", return_value="Cannot put addresses on lo: boom"):
+            MicroCloudCharm._reconcile(stub)
+
+        assert stub.unit.status == ops.BlockedStatus("Cannot put addresses on lo: boom")
+        stub._coordinator.publish_identity.assert_not_called()
+
     def test_status_set_when_nothing_is_held(self):
         from charm import MicroCloudCharm
 
@@ -850,6 +868,7 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
+        stub._network.derived_addresses.return_value = {}
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -1235,6 +1254,7 @@ class TestGrowCharm:
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
+        stub._network.derived_addresses.return_value = {}
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
@@ -2250,6 +2270,7 @@ class TestFailureDomains:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
+        stub._network.derived_addresses.return_value = {}
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
@@ -2358,6 +2379,7 @@ class TestFailureDomains:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
+        stub._network.derived_addresses.return_value = {}
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()

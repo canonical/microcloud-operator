@@ -287,7 +287,10 @@ config:
     # Networks with no interface on the machines: each machine's address
     # in them sits on "lo" and is reached over BGP. Juju cannot place a
     # unit on a machine with no interface in a bound space, so name these
-    # networks here and leave their endpoints out of "--bind".
+    # networks here and leave their endpoints out of "--bind". The charm
+    # puts each unit's address on "lo" and in
+    # /etc/netplan/90-microcloud-lo.yaml; advertising it is left to the
+    # machine's routing daemon.
     # ------------------------------------------------------------------
     ceph-public-network:
       type: string
@@ -295,8 +298,8 @@ config:
       description: >
         IPv6 /64 of the Ceph public network, e.g. "fd00:3::/64". When set,
         it replaces the "ceph-public" binding. Each unit's address in it
-        is this /64 with the host part of the unit's cluster address, and
-        must be on "lo" before the unit bootstraps or joins.
+        is this /64 with the host part of the unit's cluster address. A
+        unit blocks if its machine holds another address in this /64.
 
     ceph-internal-network:
       type: string
@@ -312,8 +315,7 @@ config:
       description: >
         IPv6 /64 of the OVN underlay network. When set, it replaces the
         "ovn-underlay" binding: each unit's underlay address is this /64
-        with the host part of the unit's cluster address, and must be on
-        "lo" before the unit bootstraps or joins.
+        with the host part of the unit's cluster address.
 
     # ------------------------------------------------------------------
     # Observability options (used only when cos-agent is related)
