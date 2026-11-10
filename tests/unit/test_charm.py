@@ -549,6 +549,147 @@ peers:
             harness.cleanup()
 
 
+class TestClusterCoordinatorLoopbackAddresses:
+    def _harness(self):
+        import ops.testing
+
+        harness = ops.testing.Harness(
+            ops.testing.CharmBase,
+            meta="""
+name: test-charm
+peers:
+  cluster:
+    interface: microcloud-peer
+""",
+        )
+        harness.begin()
+        return harness
+
+    def test_addresses_are_published_with_the_identity(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            harness.add_relation_unit(rel_id, "test-charm/1")
+            harness.update_relation_data(
+                rel_id,
+                "test-charm/1",
+                {
+                    "microcloud-name": "node1",
+                    "microcloud-address": "fd00:2::2",
+                    "microcloud-loopback-addresses": '{"fd00:3::/64": "fd00:3::2"}',
+                },
+            )
+
+            coordinator.publish_identity(
+                "node0", "fd00:2::1", loopback_addresses={"fd00:3::/64": "fd00:3::1"}
+            )
+
+            by_name = {system.name: system for system in coordinator.all_systems()}
+            assert by_name["node0"].loopback_addresses == {"fd00:3::/64": "fd00:3::1"}
+            assert by_name["node1"].loopback_addresses == {"fd00:3::/64": "fd00:3::2"}
+        finally:
+            harness.cleanup()
+
+    def test_missing_or_malformed_addresses_are_empty(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            rel_id = harness.add_relation("cluster", "test-charm")
+            for unit, raw in (
+                ("test-charm/1", None),
+                ("test-charm/2", "[1, 2"),
+                ("test-charm/3", "[]"),
+            ):
+                harness.add_relation_unit(rel_id, unit)
+                data = {"microcloud-name": unit[-1], "microcloud-address": f"fd00:2::{unit[-1]}"}
+                if raw is not None:
+                    data["microcloud-loopback-addresses"] = raw
+                harness.update_relation_data(rel_id, unit, data)
+
+            assert [system.loopback_addresses for system in coordinator.all_systems()] == [{}] * 3
+        finally:
+            harness.cleanup()
+
+    def test_published_ready_follows_publish_ready(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            assert not coordinator.published_ready()
+            harness.add_relation("cluster", "test-charm")
+            assert not coordinator.published_ready()
+            coordinator.publish_ready()
+            assert coordinator.published_ready()
+        finally:
+            harness.cleanup()
+
+
+class TestUnreachablePeer:
+    NETWORK = "fd00:3::/64"
+
+    def _check(self, derived, systems, answers=True):
+        import ipaddress
+
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.derived_addresses.return_value = {
+            ipaddress.IPv6Network(network): ipaddress.IPv6Address(address)
+            for network, address in derived.items()
+        }
+        stub._coordinator = MagicMock()
+        stub._coordinator.all_systems.return_value = systems
+        with (
+            patch("charm.microcloud.hostname", return_value="node0"),
+            patch("charm.loopback.reachable", return_value=answers) as reachable,
+        ):
+            return MicroCloudCharm._unreachable_peer(stub), reachable
+
+    def _system(self, name, addresses):
+        from cluster import PeerSystem
+
+        return PeerSystem(name=name, address="fd00:2::9", loopback_addresses=addresses)
+
+    def test_nothing_to_wait_for_without_derived_addresses(self):
+        waiting, reachable = self._check({}, [self._system("node1", {self.NETWORK: "fd00:3::2"})])
+        assert waiting is None
+        reachable.assert_not_called()
+
+    def test_each_peer_is_pinged_from_this_units_address_in_the_same_network(self):
+        systems = [
+            self._system("node0", {self.NETWORK: "fd00:3::1"}),
+            self._system("node1", {self.NETWORK: "fd00:3::2"}),
+            self._system("node2", {self.NETWORK: "fd00:3::3", "fd00:4::/64": "fd00:4::3"}),
+        ]
+        waiting, reachable = self._check({self.NETWORK: "fd00:3::1"}, systems)
+
+        assert waiting is None
+        assert [call.args for call in reachable.call_args_list] == [
+            ("fd00:3::1", "fd00:3::2"),
+            ("fd00:3::1", "fd00:3::3"),
+        ]
+
+    def test_peers_are_checked_in_name_order(self):
+        systems = [
+            self._system("node2", {self.NETWORK: "fd00:3::3"}),
+            self._system("node1", {self.NETWORK: "fd00:3::2"}),
+        ]
+        waiting, _ = self._check({self.NETWORK: "fd00:3::1"}, systems, answers=False)
+        assert waiting == "Waiting for node1 to answer on fd00:3::2"
+
+    def test_a_peer_that_does_not_answer_is_named(self):
+        systems = [self._system("node1", {self.NETWORK: "fd00:3::2"})]
+        waiting, _ = self._check({self.NETWORK: "fd00:3::1"}, systems, answers=False)
+        assert waiting == "Waiting for node1 to answer on fd00:3::2"
+
+
 # ---------------------------------------------------------------------------
 # _preseed_inputs (ceph public/internal network only derived with Ceph disks)
 # ---------------------------------------------------------------------------
@@ -1324,6 +1465,48 @@ class TestGrowCharm:
 
         assert problem is None
         stub._network.missing_uplink_interface.assert_not_called()
+        stub._sessions.lead.assert_called_once()
+
+    def test_a_unit_waits_until_its_peers_answer(self):
+        import ops
+
+        stub = self._stub(leader=False)
+        stub._coordinator.published_ready.return_value = False
+        stub._unreachable_peer.return_value = "Waiting for node1 to answer on fd00:3::2"
+
+        problem, _ = self._deploy(stub, initialized=False, pending=[])
+
+        assert problem is None
+        assert stub.unit.status == ops.WaitingStatus("Waiting for node1 to answer on fd00:3::2")
+        stub._coordinator.publish_ready.assert_not_called()
+        stub._sessions.join.assert_not_called()
+
+    def test_a_unit_is_ready_once_its_peers_answer(self):
+        stub = self._stub(leader=False)
+        stub._coordinator.published_ready.return_value = False
+        stub._unreachable_peer.return_value = None
+
+        self._deploy(stub, initialized=False, pending=[])
+
+        stub._coordinator.publish_ready.assert_called_once()
+        stub._sessions.join.assert_called_once()
+
+    def test_a_ready_unit_does_not_check_its_peers_again(self):
+        stub = self._stub(leader=False)
+        stub._coordinator.published_ready.return_value = True
+
+        self._deploy(stub, initialized=False, pending=[])
+
+        stub._unreachable_peer.assert_not_called()
+        stub._coordinator.publish_ready.assert_called_once()
+
+    def test_a_clustered_leader_does_not_wait_for_peers(self):
+        stub = self._stub(leader=True)
+        stub._coordinator.published_ready.return_value = False
+
+        self._deploy(stub, initialized=True, pending=[])
+
+        stub._unreachable_peer.assert_not_called()
         stub._sessions.lead.assert_called_once()
 
     def test_clustered_leader_does_not_refresh_snaps(self):
