@@ -5,7 +5,7 @@ To make contributions to this charm, you'll need a working [development setup](h
 You can create an environment for development with `tox`:
 
 ```shell
-tox devenv -e integration
+tox devenv -e unit
 source venv/bin/activate
 ```
 
@@ -19,9 +19,32 @@ tox run -e format        # update your code according to linting rules
 tox run -e lint          # code style
 tox run -e static        # static type checking
 tox run -e unit          # unit tests
-tox run -e integration   # integration tests
 tox                      # runs 'format', 'lint', 'static', and 'unit' environments
 ```
+
+The integration tests use [`jubilant`](https://github.com/canonical/jubilant)
+and exercise a real MicroCloud cluster in LXD VMs. They need an LXD-backed Juju
+controller, a K8s-backed controller for the COS scenarios, and a packed
+charm:
+
+```shell
+sudo snap install --classic concierge
+sudo concierge prepare -c concierge.yaml --verbose
+
+charmcraft pack --platform=ubuntu@26.04:amd64
+tox -e integration -- \
+  --charm ./microcloud_ubuntu@26.04-amd64.charm \
+  --lxd-controller integration-lxd \
+  --k8s-controller integration-k8s
+```
+
+`concierge.yaml` uses the same controller names for local and CI runs. The VM
+image, snap channels and COS channels can be overridden with environment
+variables (see `tests/integration/vms.py` and `tests/integration/cos.py`).
+
+Use the usual `pytest-jubilant` options when iterating locally.
+`--juju-dump-logs logs/` writes the Juju debug logs before the models are torn
+down.
 
 ## Build the charm
 
@@ -40,11 +63,14 @@ workflow instead (see [Publishing](#publishing)). Both call the reusable
 
 1. **static** — `tox -e lint` and `tox -e unit`;
 2. **build** — one job per base and architecture, packing `ubuntu@<base>:<arch>`, running
-   `charmcraft analyse` on the result and uploading it as its own artifact.
+   `charmcraft analyse` on the result and uploading it as its own artifact;
+3. **integration** — deploys COS Lite, creates MicroCloud clusters in
+   `ubuntu-minimal-daily:26.04` LXD VMs and runs the jubilant scenarios in `tests/integration/`
+   against the packed `26.04`/`amd64` charm.
 
-`build` depends on `static`, so a lint error never reaches a charm build. Every job runs with
-`contents: read` and no other permission. The matrix covers every platform `charmcraft.yaml`
-declares.
+`build` depends on `static`, so a lint error never reaches a charm build. `integration` depends on
+`build` and tests the exact charm artifact produced there. Every job runs with `contents: read`
+and no other permission. The build matrix covers every platform `charmcraft.yaml` declares.
 
 ## Publishing
 
