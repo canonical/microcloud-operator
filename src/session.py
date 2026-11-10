@@ -366,16 +366,16 @@ class JoinSessions:
             ceph_cephfs=bool(self._config.get("ceph-cephfs", False)),
             # "microcloud preseed" rejects a public/internal network without
             # Ceph storage disks ("Cannot specify a Ceph public network
-            # without Ceph storage disks"), so only derive these from the
-            # ceph-public/ceph-internal bindings when at least one system
-            # has a "ceph" Juju storage volume attached. Otherwise Juju's
+            # without Ceph storage disks"), so only take these from the
+            # ceph-public/ceph-internal options or bindings when at least one
+            # system has a "ceph" Juju storage volume attached. Otherwise Juju's
             # default-space fallback for an unbound extra-binding would
             # still resolve to *some* subnet and produce an invalid
             # preseed.
-            ceph_public_network=self._network.space_network_cidr("ceph-public")
+            ceph_public_network=self._network.space_cidr("ceph-public")
             if with_ceph_storage
             else "",
-            ceph_internal_network=self._network.space_network_cidr("ceph-internal")
+            ceph_internal_network=self._network.space_cidr("ceph-internal")
             if with_ceph_storage
             else "",
             with_ovn=bool(self._config.get("snap-channel-microovn", "")),

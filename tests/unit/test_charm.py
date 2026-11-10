@@ -557,7 +557,7 @@ peers:
 class TestPreseedInputs:
     def _sessions(self, config: dict, cidrs: dict):
         network = MagicMock(spec=UnitNetwork)
-        network.space_network_cidr.side_effect = lambda name: cidrs.get(name, "")
+        network.space_cidr.side_effect = lambda name: cidrs.get(name, "")
         return session.JoinSessions(
             unit=MagicMock(),
             coordinator=MagicMock(),
@@ -582,7 +582,7 @@ class TestPreseedInputs:
         # fallback for an endpoint that was never explicitly --bind-ed),
         # the network must not be looked up at all without Ceph disks -
         # "microcloud preseed" would otherwise reject the whole document.
-        sessions._network.space_network_cidr.assert_not_called()
+        sessions._network.space_cidr.assert_not_called()
 
     def test_ceph_networks_derived_with_ceph_storage_disks(self):
         from preseed import SystemEntry
@@ -803,6 +803,7 @@ class TestHeldStatus:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -821,6 +822,26 @@ class TestHeldStatus:
 
         stub._set_status.assert_not_called()
 
+    def test_an_unusable_network_option_blocks(self):
+        import ops
+
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = (
+            "ceph-public-network: '10.0.0.0/24' is not an IPv6 /64"
+        )
+        stub._coordinator = MagicMock()
+
+        MicroCloudCharm._reconcile(stub)
+
+        assert stub.unit.status == ops.BlockedStatus(
+            "ceph-public-network: '10.0.0.0/24' is not an IPv6 /64"
+        )
+        stub._coordinator.publish_identity.assert_not_called()
+
     def test_status_set_when_nothing_is_held(self):
         from charm import MicroCloudCharm
 
@@ -828,6 +849,7 @@ class TestHeldStatus:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -1212,6 +1234,7 @@ class TestGrowCharm:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.bind_address.return_value = "10.0.0.1"
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
@@ -2226,6 +2249,7 @@ class TestFailureDomains:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
@@ -2333,6 +2357,7 @@ class TestFailureDomains:
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()

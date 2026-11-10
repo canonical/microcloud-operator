@@ -267,6 +267,11 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        problem = self._network.network_options_problem()
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
+
         storage_ceph_paths, problem = self._storage_ceph_paths()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -279,7 +284,7 @@ class MicroCloudCharm(ops.CharmBase):
             microcloud.hostname(),
             self._network.bind_address(),
             ovn_uplink_interface=ovn_uplink_interface,
-            ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
+            ovn_underlay_ip=self._network.space_address("ovn-underlay"),
             storage_local_path=self._storage_local_path(),
             storage_ceph_paths=storage_ceph_paths,
             initialized=initialized,
