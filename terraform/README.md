@@ -112,38 +112,29 @@ integers are `"300"`.
 same holds for `snap-channel-microovn`. An empty string is meaningful, not
 absent.
 
-**Two options take a mapping of hostname to value**, for hardware where the name
-differs per machine. Use `yamlencode`, and key it on the machine's hostname:
+**`ovn-uplink-interface` takes a mapping of hostname to value**, for hardware
+where the name differs per machine. Use `yamlencode`, and key it on the
+machine's hostname:
 
 ```hcl
 config = {
   "ovn-uplink-interface" = yamlencode({ node1 = "enp9s0", node2 = "eno1" })
-  "local-device"         = yamlencode({ node1 = "/dev/nvme0n1p3", node2 = "/dev/sda3" })
 }
 ```
 
 Every unit's hostname must appear in the mapping. A unit that is missing blocks
-rather than deploying without an uplink or local disk.
+rather than deploying without an uplink.
 
 **Local storage on MAAS comes from a partition pool.** Create a storage pool
 tagged `partition,<tag>` (e.g. `tags=partition,local`) and pass it in
-`storage_directives` as `local = "maas-local,1,2G"`, with no `local-device`
-config. Keep three caveats in mind:
+`storage_directives` as `local = "maas-local,1,2G"`. Without a `local`
+storage directive, MicroCloud gets no local pool. Keep three caveats in mind:
 1. MAAS selects the smallest tagged partition that fits the requested size,
    so tag exactly one partition per node.
 2. A partition that already has a filesystem in the MAAS layout never matches,
    and the storage sits `pending` forever.
 3. MAAS storage only attaches when Juju allocates the machine; placing units
    with `machines` or `--to` fails (see "MAAS storage needs Juju to allocate the machine" below).
-
-**Give `local-device` a stable path.** On clouds without partition pools where
-`local-device` is used, `/dev/sdX` names can change between boots. On MAAS
-(when not using a partition pool), the `/dev/disk/by-dname/` links that MAAS
-creates for the partitions it lays out (e.g. `/dev/disk/by-dname/sda-part3`)
-keep their names, and are the same on every node deployed with the same layout,
-so a single path covers them all. `local-device` is only understood by charm
-revisions that have it; an older revision fails the apply with an unknown
-config key.
 
 **Binding `ovn-uplink` only constrains placement.** The uplink NIC usually has
 no address, and Juju spaces only track addressed interfaces, so the interface
@@ -197,13 +188,13 @@ No modules.
 | <a name="input_app_name"></a> [app\_name](#input\_app\_name) | Name of the application in the Juju model. | `string` | `"microcloud"` | no |
 | <a name="input_base"></a> [base](#input\_base) | Operating system base to deploy on, e.g. ubuntu@24.04. | `string` | `"ubuntu@24.04"` | no |
 | <a name="input_channel"></a> [channel](#input\_channel) | Charm channel to deploy, as <track>/<risk>[/<branch>]. | `string` | `"3/edge"` | no |
-| <a name="input_config"></a> [config](#input\_config) | Charm config options, passed through unchanged. Every value is a string:<br/>"true" for booleans, "300" for integers. Options that take a mapping of<br/>hostname to value ("local-device", "ovn-uplink-interface") take a<br/>yamlencode(...) of that map. See the charm's charmcraft.yaml for the<br/>available options; this module deliberately does not restate them. | `map(string)` | `{}` | no |
+| <a name="input_config"></a> [config](#input\_config) | Charm config options, passed through unchanged. Every value is a string:<br/>"true" for booleans, "300" for integers. An option that takes a mapping<br/>of hostname to value ("ovn-uplink-interface") takes a yamlencode(...) of<br/>that map. See the charm's charmcraft.yaml for the available options; this<br/>module deliberately does not restate them. | `map(string)` | `{}` | no |
 | <a name="input_constraints"></a> [constraints](#input\_constraints) | Juju constraints for the application, e.g. "arch=amd64 tags=microcloud". | `string` | `null` | no |
 | <a name="input_endpoint_bindings"></a> [endpoint\_bindings](#input\_endpoint\_bindings) | Bindings of endpoints to Juju spaces. An entry with no endpoint sets the<br/>application's default space. On MAAS the extra-bindings are what put each<br/>MicroCloud network on its own space. | <pre>set(object({<br/>    endpoint = optional(string)<br/>    space    = string<br/>  }))</pre> | `[]` | no |
 | <a name="input_machines"></a> [machines](#input\_machines) | Machines to place units on, e.g. ["0", "1", "2"]. The unit count becomes<br/>the size of this set; "units" must be left at 1 or match it. | `set(string)` | `[]` | no |
 | <a name="input_model_uuid"></a> [model\_uuid](#input\_model\_uuid) | UUID of the Juju model to deploy into. | `string` | n/a | yes |
 | <a name="input_revision"></a> [revision](#input\_revision) | Charm revision to deploy. Defaults to the channel's latest. | `number` | `null` | no |
-| <a name="input_storage_directives"></a> [storage\_directives](#input\_storage\_directives) | Juju storage directives keyed by storage name, e.g.<br/>{ local = "maas,1,100G", ceph = "maas,3,100G" }. Both are optional: the<br/>charm accepts zero local disks and zero Ceph disks. Ceph disks are only<br/>allowed on units whose architecture is in the "ceph-osd-architectures"<br/>charm config (default "amd64"). | `map(string)` | `{}` | no |
+| <a name="input_storage_directives"></a> [storage\_directives](#input\_storage\_directives) | Juju storage directives keyed by storage name, e.g.<br/>{ local = "maas-local,1,100G", ceph = "maas-ceph,3,100G" }. Both are optional: the<br/>charm accepts zero local disks and zero Ceph disks. Ceph disks are only<br/>allowed on units whose architecture is in the "ceph-osd-architectures"<br/>charm config (default "amd64"). | `map(string)` | `{}` | no |
 | <a name="input_units"></a> [units](#input\_units) | Number of units to deploy. With "machines" set, the unit count is the<br/>number of machines, so this must be left at 1 or match it. | `number` | `1` | no |
 
 ## Outputs

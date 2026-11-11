@@ -65,7 +65,6 @@ from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import lxd_cluster
 import microcloud
-import network
 import session
 import snap
 from cluster import ClusterCoordinator, PeerSystem, validate_membership
@@ -268,11 +267,6 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
-        storage_local_path, problem = self._storage_local_path()
-        if problem:
-            self.unit.status = ops.BlockedStatus(problem)
-            return
-
         storage_ceph_paths, problem = self._storage_ceph_paths()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -286,7 +280,7 @@ class MicroCloudCharm(ops.CharmBase):
             self._network.bind_address(),
             ovn_uplink_interface=ovn_uplink_interface,
             ovn_underlay_ip=self._network.space_bind_address("ovn-underlay"),
-            storage_local_path=storage_local_path,
+            storage_local_path=self._storage_local_path(),
             storage_ceph_paths=storage_ceph_paths,
             initialized=initialized,
         )
@@ -453,30 +447,17 @@ class MicroCloudCharm(ops.CharmBase):
             return self._sessions.lead(initialized, pending, passphrase or "")
         return self._sessions.join(passphrase or "")
 
-    def _storage_local_path(self) -> tuple[str, str | None]:
-        """Return this unit's local storage device path.
+    def _storage_local_path(self) -> str:
+        """Return the device path of this unit's "local" Juju storage, or "".
 
-        An attached "local" Juju storage volume wins, and on MAAS this can be a
-        tagged partition from a ``partition,<tag>`` storage pool. When
-        "local-device" is also set, it is ignored and an INFO record is logged.
-        Otherwise, "local-device" names the device for clouds where Juju cannot
-        attach the device (clouds without partition pools, pre-placed machines,
-        or when using ``--to``).
-
-        The "local" storage volume is declared with ``multiple: range: 0-1``
-        in charmcraft.yaml, so at most one instance is ever attached.
-
-        Returns (path, problem). "path" is "" when this unit has no local
-        storage at all, which is allowed.
+        On MAAS this is a tagged partition or disk from a storage pool, for
+        example a ``partition,<tag>`` pool. The "local" storage is declared
+        with ``multiple: range: 0-1`` in charmcraft.yaml, so at most one
+        instance is ever attached; with none, this system has no local
+        storage, which is allowed.
         """
         storages = self.model.storages["local"]
-        if storages:
-            attached = str(storages[0].location)
-            if str(self.config.get("local-device", "")).strip():
-                logger.info("Ignoring local-device: %s is attached as Juju storage", attached)
-            return attached, None
-
-        return network.per_host_value(str(self.config.get("local-device", "")), "local-device")
+        return str(storages[0].location) if storages else ""
 
     def _storage_ceph_paths(self) -> tuple[list[str], str | None]:
         """Return device paths of this unit's attached "ceph" Juju storage.
