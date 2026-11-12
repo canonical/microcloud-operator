@@ -63,6 +63,7 @@ import ops
 from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
+import bgp
 import loopback
 import lxd_cluster
 import microcloud
@@ -281,6 +282,13 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        # On every hook once the snap is in: keeps BIRD alone and up to date.
+        if bgp.installed():
+            problem = self._ensure_bgp()
+            if problem:
+                self.unit.status = ops.BlockedStatus(problem)
+                return
+
         storage_ceph_paths, problem = self._storage_ceph_paths()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)
@@ -434,6 +442,11 @@ class MicroCloudCharm(ops.CharmBase):
             except snap.SnapError as exc:
                 return f"Snap install: {exc}"
 
+            # Before MicroCloud can see a running MicroOVN daemon.
+            problem = self._ensure_bgp()
+            if problem:
+                return problem
+
         if not microcloud.waitready(timeout=60):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
@@ -441,7 +454,7 @@ class MicroCloudCharm(ops.CharmBase):
         # Only where the uplink is actually used: with MicroOVN disabled the
         # interface name never reaches the preseed, and a stale value left in
         # the config must not stop the cluster forming.
-        if self.config.get("snap-channel-microovn", ""):
+        if self.config.get("snap-channel-microovn", "") and not self._bgp_uplinks():
             interface, _ = self._network.ovn_uplink_interface()
             problem = self._network.missing_uplink_interface(interface)
             if problem:
@@ -472,6 +485,28 @@ class MicroCloudCharm(ops.CharmBase):
         if self.unit.is_leader():
             return self._sessions.lead(initialized, pending, passphrase or "")
         return self._sessions.join(passphrase or "")
+
+    def _bgp_uplinks(self) -> list[str]:
+        return bgp.uplinks(str(self.config.get("bgp-uplinks", "")))
+
+    def _ensure_bgp(self) -> str | None:
+        """Advertise this unit's derived addresses over BGP, if asked to.
+
+        Returns a problem to block on, or None.
+        """
+        interfaces = self._bgp_uplinks()
+        if not interfaces:
+            return None
+        if not self.config.get("snap-channel-microovn", ""):
+            return "bgp-uplinks needs snap-channel-microovn for BIRD"
+        derived = self._network.derived_addresses()
+        if not derived:
+            return "bgp-uplinks needs a network option and an IPv6 cluster address"
+        try:
+            router_id, asn = bgp.identity(next(iter(derived.values())))
+        except ValueError as exc:
+            return str(exc)
+        return bgp.ensure(bgp.render(router_id, asn, interfaces, derived.keys()))
 
     def _unreachable_peer(self) -> str | None:
         """Return which peer does not answer on a derived address yet, or None.

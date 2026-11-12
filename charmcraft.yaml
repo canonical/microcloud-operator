@@ -317,6 +317,19 @@ config:
         "ovn-underlay" binding: each unit's underlay address is this /64
         with the host part of the unit's cluster address.
 
+    bgp-uplinks:
+      type: string
+      default: ""
+      description: >
+        Comma-separated interfaces that link the machine to a routed fabric,
+        e.g. "eth1,eth2". When set, the charm advertises each unit's
+        addresses in the networks above over BGP on these interfaces, with
+        BIRD from the MicroOVN snap, and runs nothing else from that snap:
+        MicroOVN is not added to the cluster. Each interface peers with the
+        router it finds from Router Advertisements. Needs
+        "snap-channel-microovn" for the snap, and at least one of the
+        network options above.
+
     # ------------------------------------------------------------------
     # Observability options (used only when cos-agent is related)
     # ------------------------------------------------------------------

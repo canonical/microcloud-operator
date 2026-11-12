@@ -741,6 +741,63 @@ class TestPreseedInputs:
         assert inputs.ceph_public_network == "10.42.0.0/24"
         assert inputs.ceph_internal_network == "10.42.1.0/24"
 
+    def test_ovn_is_in_the_preseed_with_a_microovn_channel(self):
+        sessions = self._sessions(config={"snap-channel-microovn": "latest/edge"}, cidrs={})
+
+        assert sessions._preseed_inputs("10.0.0.1", "secret", []).with_ovn is True
+
+    def test_ovn_is_left_out_with_bgp_uplinks(self):
+        sessions = self._sessions(
+            config={"snap-channel-microovn": "latest/edge", "bgp-uplinks": "eth1,eth2"},
+            cidrs={},
+        )
+
+        assert sessions._preseed_inputs("10.0.0.1", "secret", []).with_ovn is False
+
+
+class TestEnsureBGP:
+    def _stub(self, config: dict, derived: dict):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = config
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.derived_addresses.return_value = derived
+        stub._bgp_uplinks.side_effect = lambda: MicroCloudCharm._bgp_uplinks(stub)
+        return stub
+
+    def test_nothing_to_do_without_uplinks(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub({}, {})
+        with patch("charm.bgp.ensure") as ensure:
+            assert MicroCloudCharm._ensure_bgp(stub) is None
+        ensure.assert_not_called()
+
+    def test_uplinks_need_a_microovn_channel(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub({"bgp-uplinks": "eth1"}, {})
+        assert "snap-channel-microovn" in MicroCloudCharm._ensure_bgp(stub)
+
+    def test_renders_from_the_derived_address(self):
+        import ipaddress
+
+        from charm import MicroCloudCharm
+
+        network = ipaddress.IPv6Network("fd2b:5d1a:7c93:6::/64")
+        stub = self._stub(
+            {"bgp-uplinks": "eth1,eth2", "snap-channel-microovn": "latest/edge"},
+            {network: ipaddress.IPv6Address("fd2b:5d1a:7c93:6:0:1:0:7")},
+        )
+        with patch("charm.bgp.ensure", return_value=None) as ensure:
+            assert MicroCloudCharm._ensure_bgp(stub) is None
+
+        conf = ensure.call_args.args[0]
+        assert "router id 0.0.0.7;" in conf
+        assert "local as 4200000007;" in conf
+        assert 'interface "eth1"' in conf and 'interface "eth2"' in conf
+
 
 # ---------------------------------------------------------------------------
 # _storage_local_path / _storage_ceph_paths (device paths from Juju storage)
@@ -946,6 +1003,8 @@ class TestHeldStatus:
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
+        stub._ensure_bgp.return_value = None
+        stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -1010,6 +1069,8 @@ class TestHeldStatus:
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
+        stub._ensure_bgp.return_value = None
+        stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._cos_related.return_value = False
@@ -1396,6 +1457,8 @@ class TestGrowCharm:
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
+        stub._ensure_bgp.return_value = None
+        stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._hold_status.side_effect = lambda status: setattr(stub.unit, "status", status)
@@ -2454,6 +2517,8 @@ class TestFailureDomains:
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
+        stub._ensure_bgp.return_value = None
+        stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
@@ -2563,6 +2628,8 @@ class TestFailureDomains:
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
+        stub._ensure_bgp.return_value = None
+        stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
