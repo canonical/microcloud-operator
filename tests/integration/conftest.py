@@ -38,6 +38,20 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     parser.addoption(
+        "--prodstack",
+        action="store_true",
+        help=(
+            "Run the tests marked prodstack, which need MAAS machines with "
+            'disks (lxd-dev "just prodstack"). Skipped otherwise.'
+        ),
+    )
+    parser.addoption(
+        "--ceph-storage-pool",
+        default="maas",
+        action="store",
+        help="Juju storage pool the prodstack tests attach Ceph disks from.",
+    )
+    parser.addoption(
         "--num-units",
         default=2,
         type=int,
@@ -47,6 +61,19 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "exercises the initiator/joiner handshake; one skips it entirely."
         ),
     )
+
+
+def pytest_configure(config: pytest.Config) -> None:
+    config.addinivalue_line("markers", "prodstack: needs Prodstack MAAS machines with disks")
+
+
+def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
+    if config.getoption("--prodstack"):
+        return
+    skip = pytest.mark.skip(reason="needs --prodstack (tox -e integration-prodstack)")
+    for item in items:
+        if "prodstack" in item.keywords:
+            item.add_marker(skip)
 
 
 @pytest.fixture(scope="module")

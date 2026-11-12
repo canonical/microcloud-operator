@@ -106,6 +106,39 @@ def server_version() -> tuple[str, set[str]]:
     return environment.get("server_version", ""), set(server.get("api_extensions") or [])
 
 
+def certificate_fingerprint() -> str:
+    """Return the SHA-256 fingerprint of this server's certificate.
+
+    Every member of an LXD cluster shares the cluster certificate, so on a
+    clustered server this identifies the cluster.
+    """
+    server = _query("/1.0")
+    environment = server.get("environment") if isinstance(server, dict) else None
+    fingerprint = (
+        environment.get("certificate_fingerprint") if isinstance(environment, dict) else None
+    )
+    if not fingerprint:
+        raise LXDClusterError("Unexpected response for /1.0: no certificate fingerprint")
+    return str(fingerprint)
+
+
+def storage_pools() -> list[str]:
+    """Return the kinds of MicroCloud storage pool this cluster has.
+
+    "local" for MicroCloud's local pool, "ceph" for a Ceph RBD pool and
+    "cephfs" for a CephFS pool, sorted.
+    """
+    raw = _query("/1.0/storage-pools?recursion=1") or []
+    kinds: set[str] = set()
+    for pool in raw if isinstance(raw, list) else []:
+        driver = pool.get("driver", "")
+        if driver in ("ceph", "cephfs"):
+            kinds.add(driver)
+        elif pool.get("name") == "local":
+            kinds.add("local")
+    return sorted(kinds)
+
+
 def own_name() -> str:
     """Return this server's name as an LXD cluster member.
 

@@ -37,6 +37,11 @@ run "defaults_create_a_model_and_a_three_unit_cluster" {
   }
 
   assert {
+    condition     = module.microcloud.application.config["orchestrator"] == "true"
+    error_message = "the product's MicroCloud application should form the cluster"
+  }
+
+  assert {
     condition     = module.microcloud.application.model_uuid == juju_model.microcloud[0].uuid
     error_message = "MicroCloud should be deployed into the created model"
   }

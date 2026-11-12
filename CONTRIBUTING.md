@@ -43,10 +43,11 @@ MicroCloud can only add systems to a cluster that runs MicroCeph, so that model 
 without Ceph disks, which still fits in containers. Every model also checks that no join session,
 worker or passphrase is left behind once the cluster has converged.
 
-These tests cover the current single-application charm. Bounded join batches, cross-application
-roles, and interrupted-join recovery need implementation before they can become passing
-acceptance tests. MicroCeph storage and MicroOVN health require a separate VM-backed suite with
-disks and suitable networking.
+`test_multi_app.py` joins member applications to an orchestrator's cluster, again with MicroCeph
+and no Ceph disks. Bounded join batches and interrupted-join recovery need implementation before
+they can become passing acceptance tests. MicroCeph storage needs machines with disks:
+`tox -e integration-prodstack` runs `test_prodstack.py` against MAAS machines and is not part of
+CI. MicroOVN health still requires a separate VM-backed suite with suitable networking.
 
 It needs a bootstrapped Juju controller on a LXD cloud and a charm built with `charmcraft pack`.
 [`concierge`](https://github.com/canonical/concierge) provisions both from the `concierge.yaml` in
