@@ -91,10 +91,22 @@ def test_ensure_runs_bird_alone_and_writes_the_config(tmp_path):
         }
     )
     conf_path = tmp_path / "bird" / "bird.conf"
-    with patch.object(bgp, "BIRD_CONF", conf_path), patch("subprocess.run", side_effect=fake.run):
+    dropin = tmp_path / "networkd" / "90-microcloud-bgp.conf"
+    with (
+        patch.object(bgp, "BIRD_CONF", conf_path),
+        patch.object(bgp, "NETWORKD_DROPIN", dropin),
+        patch("subprocess.run", side_effect=fake.run),
+    ):
         assert bgp.ensure("conf v1\n") is None
 
     assert conf_path.read_text() == "conf v1\n"
+    # networkd leaves BIRD's routes alone, and is restarted to read that
+    # before BIRD starts.
+    assert "ManageForeignRoutes=no" in dropin.read_text()
+    assert "ManageForeignRoutingPolicyRules=no" in dropin.read_text()
+    restart = fake.calls.index(["systemctl", "restart", "systemd-networkd"])
+    start = next(i for i, c in enumerate(fake.calls) if c[:3] == ["snap", "start", "--enable"])
+    assert restart < start
     assert fake.services["microovn.bird"] == (True, True)
     for name in ("microovn.daemon", "microovn.chassis", "microovn.refresh-expiring-certs"):
         assert fake.services[name] == (False, False)
@@ -108,11 +120,17 @@ def test_ensure_reconfigures_a_running_bird_only_when_the_config_changes(tmp_pat
     fake = _Snap({"microovn.bird": (True, True), "microovn.daemon": (False, False)})
     conf_path = tmp_path / "bird.conf"
     conf_path.write_text("conf v1\n")
-    with patch.object(bgp, "BIRD_CONF", conf_path), patch("subprocess.run", side_effect=fake.run):
+    with (
+        patch.object(bgp, "BIRD_CONF", conf_path),
+        patch.object(bgp, "NETWORKD_DROPIN", tmp_path / "90.conf"),
+        patch("subprocess.run", side_effect=fake.run),
+    ):
         assert bgp.ensure("conf v1\n") is None
         assert ["microovn.birdc", "configure"] not in fake.calls
         assert bgp.ensure("conf v2\n") is None
         assert ["microovn.birdc", "configure"] in fake.calls
+    # The drop-in is written once, so networkd is restarted once.
+    assert fake.calls.count(["systemctl", "restart", "systemd-networkd"]) == 1
 
 
 def test_ensure_reports_a_failed_command(tmp_path):
@@ -121,6 +139,7 @@ def test_ensure_reports_a_failed_command(tmp_path):
 
     with (
         patch.object(bgp, "BIRD_CONF", tmp_path / "bird.conf"),
+        patch.object(bgp, "NETWORKD_DROPIN", tmp_path / "90.conf"),
         patch("subprocess.run", side_effect=fail),
     ):
         problem = bgp.ensure("conf\n")

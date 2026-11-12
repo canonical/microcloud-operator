@@ -24,6 +24,10 @@ from pathlib import Path
 SNAP = "microovn"
 BIRD_SERVICE = "microovn.bird"
 BIRD_CONF = Path("/var/snap/microovn/common/data/bird/bird.conf")
+# Keeps systemd-networkd from removing BIRD's routes and rules when
+# anything runs "netplan apply" or restarts it: they are protocol "bird".
+NETWORKD_DROPIN = Path("/etc/systemd/networkd.conf.d/90-microcloud-bgp.conf")
+NETWORKD_CONF = "[Network]\nManageForeignRoutes=no\nManageForeignRoutingPolicyRules=no\n"
 
 # The private four-byte ASN range (RFC 6996): 4200000000 to 4294967294.
 _ASN_BASE = 4200000000
@@ -188,9 +192,15 @@ def ensure(conf: str) -> str | None:
     """Run BIRD alone from the MicroOVN snap with ``conf``. Returns a problem or None.
 
     Every other service of the snap is stopped and disabled first, so that
-    MicroCloud does not add MicroOVN to the cluster.
+    MicroCloud does not add MicroOVN to the cluster. systemd-networkd is told
+    to leave BIRD's routes and rules alone.
     """
     try:
+        if _write(NETWORKD_DROPIN, NETWORKD_CONF):
+            # networkd reads networkd.conf only when it starts. With the
+            # setting in place, the restart keeps the routes already there.
+            _run("systemctl", "restart", "systemd-networkd")
+
         for name, (enabled, active) in services().items():
             if name != BIRD_SERVICE and (enabled or active):
                 _run("snap", "stop", "--disable", name)
