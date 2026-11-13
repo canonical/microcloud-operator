@@ -38,6 +38,7 @@ from typing import Any
 
 import ops
 
+import bgp
 import microcloud
 import snap
 from cluster import ClusterCoordinator, JoinSession, PeerSystem
@@ -366,19 +367,21 @@ class JoinSessions:
             ceph_cephfs=bool(self._config.get("ceph-cephfs", False)),
             # "microcloud preseed" rejects a public/internal network without
             # Ceph storage disks ("Cannot specify a Ceph public network
-            # without Ceph storage disks"), so only derive these from the
-            # ceph-public/ceph-internal bindings when at least one system
-            # has a "ceph" Juju storage volume attached. Otherwise Juju's
+            # without Ceph storage disks"), so only take these from the
+            # ceph-public/ceph-internal options or bindings when at least one
+            # system has a "ceph" Juju storage volume attached. Otherwise Juju's
             # default-space fallback for an unbound extra-binding would
             # still resolve to *some* subnet and produce an invalid
             # preseed.
-            ceph_public_network=self._network.space_network_cidr("ceph-public")
+            ceph_public_network=self._network.space_cidr("ceph-public")
             if with_ceph_storage
             else "",
-            ceph_internal_network=self._network.space_network_cidr("ceph-internal")
+            ceph_internal_network=self._network.space_cidr("ceph-internal")
             if with_ceph_storage
             else "",
-            with_ovn=bool(self._config.get("snap-channel-microovn", "")),
+            # With BGP uplinks the MicroOVN snap is there for BIRD only.
+            with_ovn=bool(self._config.get("snap-channel-microovn", ""))
+            and not bgp.uplinks(str(self._config.get("bgp-uplinks", ""))),
             ovn_ipv4_gateway=self._config.get("ovn-ipv4-gateway", ""),
             ovn_ipv4_range=self._config.get("ovn-ipv4-range", ""),
             ovn_ipv6_gateway=self._config.get("ovn-ipv6-gateway", ""),

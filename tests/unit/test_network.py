@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, patch
 import ops
 import pytest
 
-from network import UnitNetwork
+from network import UnitNetwork, derive_address
 
 
 def _network(*, config=None, binding=None):
@@ -195,3 +195,140 @@ class TestOvnUplinkInterface:
         ).ovn_uplink_interface()
         assert interface == ""
         assert problem is not None
+
+
+# ---------------------------------------------------------------------------
+# Network options (spaces with no interface: addresses derived, on "lo")
+# ---------------------------------------------------------------------------
+
+CEPH_PUBLIC = "fd2b:5d1a:7c93:3::/64"
+OVN_UNDERLAY = "fd2b:5d1a:7c93:1::/64"
+OAM_ADDRESS = "fd2b:5d1a:7c93:2:0:1:0:5"
+
+
+def _bound(address, subnet="fd2b:5d1a:7c93:2::/64"):
+    """Return a binding whose network reports ``address`` in ``subnet``."""
+    binding = MagicMock()
+    binding.network.bind_address = ipaddress.ip_address(address) if address else None
+    interface = MagicMock()
+    interface.subnet = ipaddress.ip_network(subnet)
+    binding.network.interfaces = [interface]
+    return binding
+
+
+class TestDeriveAddress:
+    def test_keeps_the_host_part_of_the_source(self):
+        derived = derive_address(
+            ipaddress.IPv6Network(CEPH_PUBLIC), ipaddress.IPv6Address(OAM_ADDRESS)
+        )
+        assert str(derived) == "fd2b:5d1a:7c93:3:0:1:0:5"
+
+    def test_two_sources_never_derive_the_same_address(self):
+        network = ipaddress.IPv6Network(CEPH_PUBLIC)
+        first = derive_address(network, ipaddress.IPv6Address("fd2b:5d1a:7c93:2:0:1::"))
+        second = derive_address(network, ipaddress.IPv6Address("fd2b:5d1a:7c93:2:0:1:0:1"))
+        assert first != second
+
+
+class TestConfiguredNetwork:
+    def test_none_when_unset(self):
+        assert _network().configured_network("ceph-public") is None
+
+    def test_returns_the_configured_network(self):
+        network = _network(config={"ceph-public-network": CEPH_PUBLIC})
+        assert network.configured_network("ceph-public") == ipaddress.IPv6Network(CEPH_PUBLIC)
+
+    def test_a_space_without_an_option_has_none(self):
+        network = _network(config={"ceph-public-network": CEPH_PUBLIC})
+        assert network.configured_network("ovn-uplink") is None
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "10.0.0.0/24",
+            "fd2b:5d1a:7c93::/48",
+            "fd2b:5d1a:7c93:3::1/64",
+            "fd2b:5d1a:7c93:3::",
+            "not a network",
+        ],
+    )
+    def test_none_when_not_an_ipv6_64(self, value):
+        network = _network(config={"ceph-public-network": value})
+        assert network.configured_network("ceph-public") is None
+
+
+class TestNetworkOptionsProblem:
+    def test_none_when_no_option_is_set(self):
+        assert _network(binding=_bound("10.0.0.1")).network_options_problem() is None
+
+    def test_none_when_the_options_and_cluster_address_are_usable(self):
+        network = _network(
+            config={"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY},
+            binding=_bound(OAM_ADDRESS),
+        )
+        assert network.network_options_problem() is None
+
+    def test_an_option_that_is_not_an_ipv6_64_is_named(self):
+        network = _network(
+            config={"ceph-internal-network": "10.0.0.0/24"}, binding=_bound(OAM_ADDRESS)
+        )
+        assert network.network_options_problem() == (
+            "ceph-internal-network: '10.0.0.0/24' is not an IPv6 /64"
+        )
+
+    def test_an_ipv4_cluster_address_cannot_be_derived_from(self):
+        network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound("10.0.0.1"))
+        assert network.network_options_problem() == (
+            "Cluster address 10.0.0.1 is not IPv6: cannot derive addresses from it"
+        )
+
+    def test_no_cluster_address_yet_is_not_a_problem(self):
+        network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound(""))
+        assert network.network_options_problem() is None
+
+
+class TestSpaceAddress:
+    def test_derived_from_the_cluster_address_when_the_option_is_set(self):
+        network = _network(
+            config={"ovn-underlay-network": OVN_UNDERLAY}, binding=_bound(OAM_ADDRESS)
+        )
+        assert network.space_address("ovn-underlay") == "fd2b:5d1a:7c93:1:0:1:0:5"
+
+    def test_binding_address_when_the_option_is_unset(self):
+        network = _network(binding=_bound("10.0.0.7"))
+        assert network.space_address("ovn-underlay") == "10.0.0.7"
+
+    def test_empty_without_a_usable_cluster_address(self):
+        network = _network(config={"ovn-underlay-network": OVN_UNDERLAY}, binding=_bound(""))
+        assert network.space_address("ovn-underlay") == ""
+
+
+class TestSpaceCidr:
+    def test_the_option_when_set(self):
+        network = _network(
+            config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound(OAM_ADDRESS)
+        )
+        assert network.space_cidr("ceph-public") == CEPH_PUBLIC
+
+    def test_the_binding_subnet_when_the_option_is_unset(self):
+        network = _network(binding=_bound("10.42.0.7", subnet="10.42.0.0/24"))
+        assert network.space_cidr("ceph-public") == "10.42.0.0/24"
+
+
+class TestDerivedAddresses:
+    def test_one_address_per_configured_network(self):
+        network = _network(
+            config={"ceph-public-network": CEPH_PUBLIC, "ovn-underlay-network": OVN_UNDERLAY},
+            binding=_bound(OAM_ADDRESS),
+        )
+        assert network.derived_addresses() == {
+            ipaddress.IPv6Network(CEPH_PUBLIC): ipaddress.IPv6Address("fd2b:5d1a:7c93:3:0:1:0:5"),
+            ipaddress.IPv6Network(OVN_UNDERLAY): ipaddress.IPv6Address("fd2b:5d1a:7c93:1:0:1:0:5"),
+        }
+
+    def test_empty_when_no_option_is_set(self):
+        assert _network(binding=_bound(OAM_ADDRESS)).derived_addresses() == {}
+
+    def test_empty_without_an_ipv6_cluster_address(self):
+        network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound("10.0.0.1"))
+        assert network.derived_addresses() == {}
