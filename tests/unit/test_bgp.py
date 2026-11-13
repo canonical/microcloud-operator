@@ -144,3 +144,37 @@ def test_ensure_reports_a_failed_command(tmp_path):
     ):
         problem = bgp.ensure("conf\n")
     assert problem is not None and problem.startswith("Cannot run BGP:")
+
+
+def test_service_sessions_filter_imports_and_exact_local_exports():
+    public = ipaddress.IPv6Network("fd2b:5d1a:7c93:400::/56")
+    internal = ipaddress.IPv6Network("fd2b:5d1a:7c93:300::/56")
+    public_address = ipaddress.IPv6Address("fd2b:5d1a:7c93:400:0:1:0:7")
+    internal_address = ipaddress.IPv6Address("fd2b:5d1a:7c93:300:0:1:0:7")
+    conf = bgp.render(
+        "0.0.0.7",
+        4200000007,
+        ["eth1.400", "eth2.300"],
+        [public, internal],
+        interface_networks={"eth1.400": [public], "eth2.300": [internal]},
+        local_addresses=[public_address, internal_address],
+    )
+    public_session = conf.split("protocol bgp uplink_eth1_400 {")[1].split("protocol bgp")[0]
+    internal_session = conf.split("protocol bgp uplink_eth2_300 {")[1].split("protocol radv")[0]
+    assert str(public) in public_session and str(internal) not in public_session
+    assert str(internal) in internal_session and str(public) not in internal_session
+    assert (
+        f"{public_address}/128" in public_session and str(internal_address) not in public_session
+    )
+    assert (
+        f"{internal_address}/128" in internal_session
+        and str(public_address) not in internal_session
+    )
+    assert "source = RTS_DEVICE" in public_session
+    assert "default lifetime 0;" in conf
+
+
+@pytest.mark.parametrize("names", [["eth1;bad"], ["eth1.100", "eth1_100"], ["eth1", "eth1"]])
+def test_render_rejects_unsafe_or_colliding_interface_names(names):
+    with pytest.raises(ValueError):
+        bgp.render("0.0.0.7", 4200000007, names, NETWORKS)

@@ -16,6 +16,7 @@ Advertisements, on link-local addresses. The machine advertises its derived
 
 import ipaddress
 import os
+import re
 import subprocess
 import tempfile
 from collections.abc import Iterable
@@ -61,9 +62,23 @@ def render(
     asn: int,
     interfaces: Iterable[str],
     networks: Iterable[ipaddress.IPv6Network],
+    *,
+    interface_networks: dict[str, list[ipaddress.IPv6Network]] | None = None,
+    local_addresses: Iterable[ipaddress.IPv6Address] | None = None,
 ) -> str:
     """Return the BIRD configuration that advertises the /128s in ``networks``."""
     interfaces = list(interfaces)
+    names = set()
+    for interface in interfaces:
+        if not re.fullmatch(r"[a-zA-Z0-9_.-]{1,15}", interface):
+            raise ValueError(f"Invalid BGP interface name {interface!r}")
+        identifier = re.sub(r"[^a-zA-Z0-9_]", "_", interface)
+        if identifier in names:
+            raise ValueError(f"Duplicate BGP protocol identifier for {interface!r}")
+        names.add(identifier)
+    addresses = list(local_addresses or [])
+    if interface_networks and set(interface_networks) != set(interfaces):
+        raise ValueError("Each BGP interface needs a service prefix")
     prefixes = ", ".join(f"{network}{{128,128}}" for network in sorted(networks))
 
     lines = [
@@ -88,14 +103,32 @@ def render(
         "}",
     ]
     for name in interfaces:
+        identifier = re.sub(r"[^a-zA-Z0-9_]", "_", name)
+        allowed = interface_networks.get(name, []) if interface_networks else []
+        peer_prefixes = (
+            ", ".join(f"{network}{{128,128}}" for network in sorted(allowed))
+            if allowed
+            else prefixes
+        )
+        if interface_networks:
+            own = ", ".join(
+                f"{address}/128"
+                for address in sorted(addresses)
+                if any(address in prefix for prefix in allowed)
+            )
+            if not own:
+                raise ValueError(f"{name} has no local service address to advertise")
+            export = f"if source = RTS_DEVICE && net ~ [ {own} ] then accept;"
+        else:
+            export = f"if source = RTS_DEVICE && net ~ [ {prefixes} ] then accept;"
         lines += [
             "",
-            f"protocol bgp uplink_{name} {{",
+            f"protocol bgp uplink_{identifier} {{",
             f"  local as {asn};",
             "  neighbor range fe80::/10 external;",
             f'  interface "{name}";',
             "  direct;",
-            f'  dynamic name "{name}_peer_";',
+            f'  dynamic name "{identifier}_peer_";',
             "  graceful restart off;",
             "  bfd on;",
             "  connect delay time 1;",
@@ -108,9 +141,9 @@ def render(
             "  };",
             "  ipv6 {",
             "    next hop self;",
-            f"    import filter {{ if net ~ [ {prefixes} ] then accept; reject; }};",
+            f"    import filter {{ if net ~ [ {peer_prefixes} ] then accept; reject; }};",
             "    export filter {",
-            f"      if source = RTS_DEVICE && net ~ [ {prefixes} ] then accept;",
+            f"      {export}",
             "      reject;",
             "    };",
             "  };",

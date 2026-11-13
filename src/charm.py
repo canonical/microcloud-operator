@@ -511,7 +511,23 @@ class MicroCloudCharm(ops.CharmBase):
             router_id, asn = bgp.identity(next(iter(derived.values())))
         except ValueError as exc:
             return str(exc)
-        return bgp.ensure(bgp.render(router_id, asn, interfaces, derived.keys()))
+        try:
+            interface_networks = self._network.bgp_interface_networks(interfaces)
+            conf = bgp.render(
+                router_id,
+                asn,
+                interfaces,
+                derived.keys(),
+                interface_networks=interface_networks,
+                local_addresses=derived.values(),
+            )
+        except ValueError as exc:
+            return str(exc)
+        if interface_networks:
+            problem = self._network.vlan_interfaces_problem(interfaces)
+            if problem:
+                return problem
+        return bgp.ensure(conf)
 
     def _unreachable_peer(self) -> str | None:
         """Return which peer does not answer on a derived address yet, or None.

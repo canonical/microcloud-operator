@@ -168,6 +168,16 @@ extra-bindings:
 
 config:
   options:
+    microcloud-access-network:
+      type: string
+      default: ""
+      description: IPv6 /64 for client-access loopback addresses, advertised on VLAN 100.
+
+    microcloud-internal-network:
+      type: string
+      default: ""
+      description: IPv6 /64 for internal loopback addresses, advertised on VLAN 101.
+
     # ------------------------------------------------------------------
     # Snap channels (deployment mode only)
     # ------------------------------------------------------------------
@@ -322,7 +332,11 @@ config:
       default: ""
       description: >
         Comma-separated interfaces that link the machine to a routed fabric,
-        e.g. "eth1,eth2". When set, the charm advertises each unit's
+        e.g. "dpu1p1,dpu2p1". For MAAS service VLANs use the existing VLAN
+        interface names, e.g. "dpu1p1.100,dpu2p1.100,dpu1p1.101,dpu2p1.101,
+        dpu1p1.300,dpu2p1.300,dpu1p1.400,dpu2p1.400". Each VLAN session imports
+        only its service prefix and exports its local loopback addresses.
+        Use snap-channel-microovn=latest/edge in the simulator. When set, the charm advertises each unit's
         addresses in the networks above over BGP on these interfaces, with
         BIRD from the MicroOVN snap, and runs nothing else from that snap:
         MicroOVN is not added to the cluster. Each interface peers with the

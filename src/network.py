@@ -4,6 +4,7 @@
 """This unit's network: addresses and subnets from Juju space bindings or config, and its OVN uplink."""
 
 import ipaddress
+import re
 from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,11 @@ import yaml
 import microcloud
 
 # Options describing the service /64s and Ceph /56 pools reached over BGP.
+VLAN_CONFIG_DIR = Path("/proc/net/vlan")
+
 NETWORK_OPTIONS = {
+    "microcloud-access": "microcloud-access-network",
+    "microcloud-internal": "microcloud-internal-network",
     "ceph-public": "ceph-public-network",
     "ceph-internal": "ceph-internal-network",
     "ovn-underlay": "ovn-underlay-network",
@@ -153,6 +158,46 @@ class UnitNetwork:
             ipaddress.IPv6Address(address)
         except ValueError:
             return f"Cluster address {address} is not IPv6: cannot derive addresses from it"
+        return None
+
+    def bgp_interface_networks(
+        self, interfaces: list[str]
+    ) -> dict[str, list[ipaddress.IPv6Network]]:
+        """Select the service prefix for each MAAS-created host VLAN interface."""
+        services = {
+            100: "microcloud-access",
+            101: "microcloud-internal",
+            300: "ceph-internal",
+            400: "ceph-public",
+        }
+        result = {}
+        for interface in interfaces:
+            parent, separator, tag = interface.rpartition(".")
+            if not separator:
+                continue
+            if not parent or not tag.isdigit() or int(tag) not in services:
+                raise ValueError(f"Unknown host BGP service VLAN interface {interface!r}")
+            binding = services[int(tag)]
+            prefix = self.configured_network(binding)
+            if prefix is None:
+                raise ValueError(f"{interface} needs {NETWORK_OPTIONS[binding]}")
+            result[interface] = [prefix]
+        if result and len(result) != len(interfaces):
+            raise ValueError("Do not mix service VLAN interfaces and untagged BGP uplinks")
+        return result
+
+    def vlan_interfaces_problem(self, interfaces: list[str]) -> str | None:
+        """Validate existing MAAS VLAN IDs and parents without changing them."""
+        for interface in interfaces:
+            parent, _, tag = interface.rpartition(".")
+            try:
+                description = (VLAN_CONFIG_DIR / interface).read_text()
+            except OSError:
+                return f"MAAS VLAN interface {interface} is unavailable"
+            vlan = re.search(r"VID:\s*(\d+)\b", description)
+            device = re.search(r"Device:\s*(\S+)", description)
+            if not vlan or not device or int(vlan[1]) != int(tag) or device[1] != parent:
+                return f"MAAS VLAN interface {interface} has an unexpected VLAN ID or parent"
         return None
 
     def space_address(self, binding_name: str) -> str:

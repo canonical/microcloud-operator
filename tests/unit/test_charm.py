@@ -763,6 +763,7 @@ class TestEnsureBGP:
         stub.config = config
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.derived_addresses.return_value = derived
+        stub._network.bgp_interface_networks.return_value = {}
         stub._bgp_uplinks.side_effect = lambda: MicroCloudCharm._bgp_uplinks(stub)
         return stub
 

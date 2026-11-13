@@ -341,3 +341,42 @@ def test_ceph_pool_derives_slot_zero_without_copying_oam_subnet_bits():
     unit_network = _network(config={"ceph-public-network": str(pool)}, binding=_bound(str(oam)))
     assert unit_network.space_cidr("ceph-public") == str(pool)
     assert unit_network.space_address("ceph-public") == "fd2b:5d1a:7c93:400:0:1:0:7"
+
+
+def test_service_vlan_mapping_uses_only_its_service_prefix():
+    unit_network = _network(
+        config={
+            "ceph-public-network": "fd2b:5d1a:7c93:400::/56",
+            "ceph-internal-network": "fd2b:5d1a:7c93:300::/56",
+        }
+    )
+    result = unit_network.bgp_interface_networks(["eth1.400", "eth2.300"])
+    assert result["eth1.400"] == [ipaddress.IPv6Network("fd2b:5d1a:7c93:400::/56")]
+    assert result["eth2.300"] == [ipaddress.IPv6Network("fd2b:5d1a:7c93:300::/56")]
+    with pytest.raises(ValueError, match="Do not mix"):
+        unit_network.bgp_interface_networks(["eth1.400", "eth2"])
+    with pytest.raises(ValueError, match="Unknown"):
+        unit_network.bgp_interface_networks(["eth1.301"])
+
+
+def test_existing_vlan_parent_and_tag_are_validated(tmp_path):
+    import network
+
+    unit_network = _network()
+    path = tmp_path / "eth1.100"
+    with patch.object(network, "VLAN_CONFIG_DIR", tmp_path):
+        assert "unavailable" in unit_network.vlan_interfaces_problem(["eth1.100"])
+        path.write_text("eth1.100 VID: 100 REORDER_HDR: 1\nDevice: eth1\n")
+        assert unit_network.vlan_interfaces_problem(["eth1.100"]) is None
+        path.write_text("eth1.100 VID: 101 REORDER_HDR: 1\nDevice: eth1\n")
+        assert "unexpected" in unit_network.vlan_interfaces_problem(["eth1.100"])
+
+
+def test_ceph_pool_cannot_overlap_another_service():
+    unit_network = _network(
+        config={
+            "ceph-public-network": "fd2b:5d1a:7c93:100::/56",
+            "microcloud-internal-network": "fd2b:5d1a:7c93:101::/64",
+        }
+    )
+    assert "overlaps" in unit_network.network_options_problem()
