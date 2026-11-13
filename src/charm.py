@@ -69,6 +69,7 @@ import lxd_cluster
 import microcloud
 import session
 import snap
+import storage_health
 from cluster import ClusterCoordinator, PeerSystem, validate_membership
 from control_plane import ControlPlane
 from failure_domains import FailureDomains
@@ -350,6 +351,10 @@ class MicroCloudCharm(ops.CharmBase):
                 if lxd_clustered:
                     self._stored.lxd_join_since = 0.0
                     problem = self._failure_domains.reconcile()
+                    # Not while a join is in flight: MicroCloud adds the disks
+                    # and creates the pools after the systems have joined.
+                    if not problem and not pending and self._coordinator.session() is None:
+                        problem = self._storage_problem()
                 else:
                     problem = self._await_lxd_join()
 
@@ -575,6 +580,34 @@ class MicroCloudCharm(ops.CharmBase):
             )
 
         return paths, None
+
+    def _storage_problem(self) -> str | None:
+        """Return what storage attached to this unit is missing from the cluster, or None.
+
+        MicroCloud reports a cluster as formed even when adding its disks
+        failed, so a unit that was given storage checks that it is in use.
+        """
+        local_path = self._storage_local_path()
+        ceph_paths, _ = self._storage_ceph_paths()
+        if not self.config.get("snap-channel-microceph", ""):
+            ceph_paths = []
+        if not local_path and not ceph_paths:
+            return None
+
+        hostname = microcloud.hostname()
+        try:
+            found = storage_health.problems(
+                hostname,
+                lxd_cluster.own_name(),
+                local=bool(local_path),
+                ceph_disks=len(ceph_paths),
+            )
+        except (storage_health.StorageHealthError, lxd_cluster.LXDClusterError) as exc:
+            return f"Cannot check the storage of {hostname}: {exc}"
+
+        if found:
+            return "Cluster formed without storage: " + "; ".join(found)
+        return None
 
     # ---- Observe-only mode ----
 

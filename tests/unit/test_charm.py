@@ -933,6 +933,57 @@ options:
             harness.cleanup()
 
 
+class TestStorageProblem:
+    def _check(self, *, local="", ceph=(), microceph="tentacle/stable", found=None, error=None):
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"snap-channel-microceph": microceph}
+        stub._storage_local_path.return_value = local
+        stub._storage_ceph_paths.return_value = (list(ceph), None)
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.lxd_cluster.own_name", return_value="member1"),
+            patch("charm.storage_health.problems", return_value=found or []) as problems,
+        ):
+            if error:
+                problems.side_effect = error
+            return MicroCloudCharm._storage_problem(stub), problems
+
+    def test_a_unit_without_storage_is_not_checked(self):
+        problem, problems = self._check()
+        assert problem is None
+        problems.assert_not_called()
+
+    def test_ceph_disks_are_not_expected_without_microceph(self):
+        problem, problems = self._check(ceph=["/dev/sdc"], microceph="")
+        assert problem is None
+        problems.assert_not_called()
+
+    def test_storage_in_place_is_no_problem(self):
+        problem, problems = self._check(local="/dev/sdb3", ceph=["/dev/sdc", "/dev/sdd"])
+        assert problem is None
+        problems.assert_called_once_with("node1", "member1", local=True, ceph_disks=2)
+
+    def test_missing_storage_is_listed(self):
+        problem, _ = self._check(
+            ceph=["/dev/sdc"],
+            found=["0 of 1 Ceph disks on node1 are in MicroCeph", 'no "remote" storage pool'],
+        )
+        assert problem == (
+            "Cluster formed without storage: 0 of 1 Ceph disks on node1 are in MicroCeph; "
+            'no "remote" storage pool'
+        )
+
+    def test_storage_that_cannot_be_read_is_reported(self):
+        import storage_health
+
+        problem, _ = self._check(
+            ceph=["/dev/sdc"], error=storage_health.StorageHealthError("microceph is down")
+        )
+        assert problem == "Cannot check the storage of node1: microceph is down"
+
+
 # ---------------------------------------------------------------------------
 # microcloud CLI wrappers
 # ---------------------------------------------------------------------------
@@ -2509,7 +2560,7 @@ class TestFailureDomains:
         stub._sessions = MagicMock()
         return stub
 
-    def _reconcile(self, stub, *, initialized=True, lxd_clustered=True):
+    def _reconcile(self, stub, *, initialized=True, lxd_clustered=True, session="open"):
         from charm import MicroCloudCharm
 
         stub._status_held = False
@@ -2522,6 +2573,7 @@ class TestFailureDomains:
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
         stub._coordinator = MagicMock()
+        stub._coordinator.session.return_value = session
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
         stub._cos_related.return_value = False
@@ -2537,6 +2589,27 @@ class TestFailureDomains:
             patch("charm.lxd_cluster.is_clustered", return_value=lxd_clustered),
         ):
             MicroCloudCharm._reconcile(stub)
+
+    def test_a_clustered_unit_missing_its_storage_blocks(self):
+        import ops
+
+        stub = self._stub()
+        stub._sessions.pending.return_value = []
+        stub._storage_problem.return_value = "Cluster formed without storage: boom"
+
+        self._reconcile(stub, session=None)
+
+        assert stub.unit.status == ops.BlockedStatus("Cluster formed without storage: boom")
+
+    @pytest.mark.parametrize("pending, session", [(["node2"], None), ([], "open")])
+    def test_storage_is_not_checked_while_a_join_is_in_flight(self, pending, session):
+        """MicroCloud adds the disks after the systems have joined."""
+        stub = self._stub()
+        stub._sessions.pending.return_value = pending
+
+        self._reconcile(stub, session=session)
+
+        stub._storage_problem.assert_not_called()
 
     @pytest.mark.parametrize("initialized", [True, False])
     def test_only_a_unit_clustered_when_the_hook_starts_sets_its_failure_domain(self, initialized):
