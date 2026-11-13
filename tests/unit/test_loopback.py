@@ -62,17 +62,27 @@ def ip(netplan):
     def run(command, **kwargs):
         calls.append(list(command))
         if list(command) == ["netplan", "apply"] and run.apply_works:
-            on_lo = [
+            run.pending = [
                 line.split()[1].split("/")[0]
                 for line in netplan.read_text().splitlines()
                 if "/128" in line
             ]
-            run.links = _links(eth0=[OAM_ADDRESS], lo=on_lo)
+            run.countdown = run.delay
+        if "show" in command and run.pending is not None:
+            # networkd adds the addresses some listings after netplan returns.
+            if run.countdown == 0:
+                run.links = _links(eth0=[OAM_ADDRESS], lo=run.pending)
+                run.pending = None
+            else:
+                run.countdown -= 1
         output = run.links if "show" in command else ""
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
     run.links = _links(eth0=[OAM_ADDRESS])
     run.apply_works = True
+    run.delay = 0
+    run.pending = None
+    run.countdown = 0
     run.calls = calls
     with patch("loopback.subprocess.run", side_effect=run):
         yield run
@@ -166,10 +176,22 @@ class TestEnsure:
         assert loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS}) is None
         assert _applied(ip) == 2
 
+    def test_addresses_that_arrive_after_netplan_apply_returns(self, netplan, ip):
+        ip.delay = 3
+
+        with patch("loopback.time.sleep") as sleep:
+            assert loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS}) is None
+
+        assert sleep.call_count == 3
+
     def test_an_address_netplan_did_not_add_is_reported(self, netplan, ip):
         ip.apply_works = False
 
-        problem = loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
+        with (
+            patch.object(loopback, "APPLY_WAIT", 0),
+            patch("loopback.time.sleep"),
+        ):
+            problem = loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
 
         assert problem == "netplan apply left fd2b:5d1a:7c93:3:0:1:0:5 off lo"
 

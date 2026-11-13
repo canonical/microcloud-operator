@@ -15,10 +15,13 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 from collections.abc import Mapping
 from pathlib import Path
 
 NETPLAN_FILE = Path("/etc/netplan/90-microcloud-lo.yaml")
+# "netplan apply" returns before systemd-networkd has added the addresses.
+APPLY_WAIT = 30
 # Keeps systemd-networkd from removing the routes and rules of a routing
 # daemon, such as BIRD's (protocol "bird"), when netplan is applied or
 # networkd restarts.
@@ -103,6 +106,17 @@ def keep_foreign_routes() -> None:
         _run("systemctl", "restart", "systemd-networkd", timeout=60)
 
 
+def _wait_for_lo(wanted: list[ipaddress.IPv6Address]) -> list[str]:
+    """Wait up to APPLY_WAIT seconds for ``wanted`` on "lo". Returns those still missing."""
+    deadline = time.monotonic() + APPLY_WAIT
+    while True:
+        on_lo = host_addresses().get("lo", set())
+        missing = [str(address) for address in wanted if address not in on_lo]
+        if not missing or time.monotonic() >= deadline:
+            return missing
+        time.sleep(1)
+
+
 def ensure(addresses: Mapping[ipaddress.IPv6Network, ipaddress.IPv6Address]) -> str | None:
     """Put this unit's address in each network on "lo". Returns a problem or None.
 
@@ -130,8 +144,7 @@ def ensure(addresses: Mapping[ipaddress.IPv6Network, ipaddress.IPv6Address]) -> 
         changed = _write(NETPLAN_FILE, render(wanted))
         if changed or any(address not in present.get("lo", set()) for address in wanted):
             _run("netplan", "apply", timeout=120)
-            on_lo = host_addresses().get("lo", set())
-            missing = [str(address) for address in wanted if address not in on_lo]
+            missing = _wait_for_lo(wanted)
             if missing:
                 return f"netplan apply left {', '.join(missing)} off lo"
     except LoopbackError as exc:
