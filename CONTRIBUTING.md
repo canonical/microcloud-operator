@@ -1,6 +1,6 @@
 # Contributing
 
-To make contributions to this charm, you'll need a working [development setup](https://juju.is/docs/sdk/dev-setup).
+To make contributions to this charm, you'll need a working [development setup](https://canonical.com/juju/docs/ops/latest/).
 
 You can create an environment for development with `tox`:
 
@@ -17,9 +17,8 @@ that can be used for linting and formatting code when you're preparing contribut
 ```shell
 tox run -e format        # update your code according to linting rules
 tox run -e lint          # code style
-tox run -e static        # static type checking
 tox run -e unit          # unit tests
-tox                      # runs 'format', 'lint', 'static', and 'unit' environments
+tox                      # runs 'lint' and 'unit' environments
 ```
 
 The integration tests use [`jubilant`](https://github.com/canonical/jubilant)
