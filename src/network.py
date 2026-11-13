@@ -13,7 +13,7 @@ import yaml
 
 import microcloud
 
-# The option that gives each space's /64 where its addresses sit on "lo".
+# Options describing the service /64s and Ceph /56 pools reached over BGP.
 NETWORK_OPTIONS = {
     "ceph-public": "ceph-public-network",
     "ceph-internal": "ceph-internal-network",
@@ -24,10 +24,8 @@ NETWORK_OPTIONS = {
 def derive_address(
     network: ipaddress.IPv6Network, source: ipaddress.IPv6Address
 ) -> ipaddress.IPv6Address:
-    """Return the address in ``network`` that has the host part of ``source``."""
-    return ipaddress.IPv6Address(
-        int(network.network_address) | (int(source) & int(network.hostmask))
-    )
+    """Copy the 64-bit host part into a service prefix or Ceph slot-0 /64."""
+    return ipaddress.IPv6Address(int(network.network_address) | (int(source) & ((1 << 64) - 1)))
 
 
 def per_host_value(raw: str, option: str) -> tuple[str, str | None]:
@@ -105,9 +103,9 @@ class UnitNetwork:
         return str(network.bind_address)
 
     def configured_network(self, binding_name: str) -> ipaddress.IPv6Network | None:
-        """Return the /64 configured for the given space, or None.
+        """Return the configured IPv6 service prefix or Ceph pool, or None.
 
-        None also covers a value that is not an IPv6 /64, which
+        None also covers a value with an unsupported address family or prefix length, which
         ``network_options_problem`` reports.
         """
         raw = str(self._config.get(NETWORK_OPTIONS.get(binding_name, ""), "")).strip()
@@ -117,24 +115,35 @@ class UnitNetwork:
             network = ipaddress.ip_network(raw)
         except ValueError:
             return None
-        if network.version != 6 or network.prefixlen != 64:
+        if network.version != 6 or (
+            network.prefixlen != 64
+            and not (binding_name in {"ceph-public", "ceph-internal"} and network.prefixlen == 56)
+        ):
             return None
         return network
 
     def network_options_problem(self) -> str | None:
         """Return a problem if a space's network option cannot be used.
 
-        Each option must be an IPv6 /64, and this unit's cluster address must
+        Service options must be IPv6 /64s; Ceph also accepts /56 pools. The cluster address must
         be IPv6, since its host part is what the addresses are derived from.
         A unit with no cluster address yet has nothing to report.
         """
         configured = False
+        prefixes = []
         for binding_name, option in NETWORK_OPTIONS.items():
             raw = str(self._config.get(option, "")).strip()
             if not raw:
                 continue
             if self.configured_network(binding_name) is None:
-                return f"{option}: {raw!r} is not an IPv6 /64"
+                return f"{option}: {raw!r} is not an IPv6 /64" + (
+                    " or aligned /56" if binding_name in {"ceph-public", "ceph-internal"} else ""
+                )
+            prefix = self.configured_network(binding_name)
+            for other_option, other_prefix in prefixes:
+                if prefix.overlaps(other_prefix):
+                    return f"{option} overlaps {other_option}"
+            prefixes.append((option, prefix))
             configured = True
 
         address = self.bind_address()

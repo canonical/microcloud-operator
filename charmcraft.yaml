@@ -296,16 +296,16 @@ config:
       type: string
       default: ""
       description: >
-        IPv6 /64 of the Ceph public network, e.g. "fd00:3::/64". When set,
+        IPv6 /64 or aligned /56 of the Ceph public network. When set,
         it replaces the "ceph-public" binding. Each unit's address in it
-        is this /64 with the host part of the unit's cluster address. A
-        unit blocks if its machine holds another address in this /64.
+        uses the low 64 bits of the unit's cluster address; a /56 selects its slot-0 /64. A
+        unit blocks if its machine holds another address in this range.
 
     ceph-internal-network:
       type: string
       default: ""
       description: >
-        IPv6 /64 of the Ceph internal (cluster) network. When set, it
+        IPv6 /64 or aligned /56 of the Ceph internal (cluster) network. When set, it
         replaces the "ceph-internal" binding, as "ceph-public-network"
         does for the public network.
 

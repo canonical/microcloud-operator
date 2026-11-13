@@ -273,7 +273,7 @@ class TestNetworkOptionsProblem:
             config={"ceph-internal-network": "10.0.0.0/24"}, binding=_bound(OAM_ADDRESS)
         )
         assert network.network_options_problem() == (
-            "ceph-internal-network: '10.0.0.0/24' is not an IPv6 /64"
+            "ceph-internal-network: '10.0.0.0/24' is not an IPv6 /64 or aligned /56"
         )
 
     def test_an_ipv4_cluster_address_cannot_be_derived_from(self):
@@ -332,3 +332,12 @@ class TestDerivedAddresses:
     def test_empty_without_an_ipv6_cluster_address(self):
         network = _network(config={"ceph-public-network": CEPH_PUBLIC}, binding=_bound("10.0.0.1"))
         assert network.derived_addresses() == {}
+
+
+def test_ceph_pool_derives_slot_zero_without_copying_oam_subnet_bits():
+    pool = ipaddress.IPv6Network("fd2b:5d1a:7c93:400::/56")
+    oam = ipaddress.IPv6Address("fd2b:5d1a:7c93:1:0:1:0:7")
+    assert derive_address(pool, oam) == ipaddress.IPv6Address("fd2b:5d1a:7c93:400:0:1:0:7")
+    unit_network = _network(config={"ceph-public-network": str(pool)}, binding=_bound(str(oam)))
+    assert unit_network.space_cidr("ceph-public") == str(pool)
+    assert unit_network.space_address("ceph-public") == "fd2b:5d1a:7c93:400:0:1:0:7"
