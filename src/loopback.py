@@ -3,10 +3,11 @@
 
 """This unit's addresses on "lo", for networks with no interface on the machine.
 
-Such an address is reached over BGP, which advertises what sits on "lo". Each
-address is added at once and written to netplan, so that it returns on boot.
-"netplan apply" is never run: it has systemd-networkd remove the routes and
-policy rules it did not create, and those are the routing daemon's.
+Such an address is reached over BGP, which advertises what sits on "lo". The
+addresses are written to netplan and applied with "netplan apply", so netplan
+is the one place they come from, now and on boot. systemd-networkd removes the
+routes and policy rules it did not create when netplan is applied, and those
+belong to the routing daemon, so it is told to leave them alone first.
 """
 
 import ipaddress
@@ -18,16 +19,21 @@ from collections.abc import Mapping
 from pathlib import Path
 
 NETPLAN_FILE = Path("/etc/netplan/90-microcloud-lo.yaml")
+# Keeps systemd-networkd from removing the routes and rules of a routing
+# daemon, such as BIRD's (protocol "bird"), when netplan is applied or
+# networkd restarts.
+NETWORKD_DROPIN = Path("/etc/systemd/networkd.conf.d/90-microcloud-bgp.conf")
+NETWORKD_CONF = "[Network]\nManageForeignRoutes=no\nManageForeignRoutingPolicyRules=no\n"
 
 
 class LoopbackError(Exception):
     """Raised when the machine's addresses cannot be read or changed."""
 
 
-def _run(*command: str) -> str:
+def _run(*command: str, timeout: int = 30) -> str:
     try:
         return subprocess.run(
-            command, capture_output=True, check=True, text=True, timeout=30
+            command, capture_output=True, check=True, text=True, timeout=timeout
         ).stdout
     except subprocess.CalledProcessError as exc:
         raise LoopbackError(f"{' '.join(command)}: {exc.stderr.strip()}") from exc
@@ -63,22 +69,38 @@ def render(addresses: list[ipaddress.IPv6Address]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _write(path: Path, content: str) -> None:
-    """Replace ``path`` with ``content``, readable by root only as netplan expects."""
+def _write(path: Path, content: str, mode: int = 0o600) -> bool:
+    """Replace ``path`` with ``content``. Returns True if it changed.
+
+    The default mode is root only, as netplan expects of its files.
+    """
     try:
         if path.read_text() == content:
-            return
+            return False
     except OSError:
         pass
 
     try:
+        path.parent.mkdir(parents=True, exist_ok=True)
         fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
         with os.fdopen(fd, "w") as handle:
             handle.write(content)
-        os.chmod(tmp, 0o600)
+        os.chmod(tmp, mode)
         os.replace(tmp, path)
     except OSError as exc:
         raise LoopbackError(f"Cannot write {path}: {exc}") from exc
+    return True
+
+
+def keep_foreign_routes() -> None:
+    """Tell systemd-networkd to leave routes and rules it did not create alone.
+
+    networkd reads its own configuration only when it starts, so it is
+    restarted when the setting is new. With the setting in place, the restart
+    keeps the routes already there.
+    """
+    if _write(NETWORKD_DROPIN, NETWORKD_CONF, mode=0o644):
+        _run("systemctl", "restart", "systemd-networkd", timeout=60)
 
 
 def ensure(addresses: Mapping[ipaddress.IPv6Network, ipaddress.IPv6Address]) -> str | None:
@@ -104,10 +126,14 @@ def ensure(addresses: Mapping[ipaddress.IPv6Network, ipaddress.IPv6Address]) -> 
                         )
 
         wanted = sorted(addresses.values())
-        _write(NETPLAN_FILE, render(wanted))
-        for address in wanted:
-            if address not in present.get("lo", set()):
-                _run("ip", "-6", "address", "replace", f"{address}/128", "dev", "lo")
+        keep_foreign_routes()
+        changed = _write(NETPLAN_FILE, render(wanted))
+        if changed or any(address not in present.get("lo", set()) for address in wanted):
+            _run("netplan", "apply", timeout=120)
+            on_lo = host_addresses().get("lo", set())
+            missing = [str(address) for address in wanted if address not in on_lo]
+            if missing:
+                return f"netplan apply left {', '.join(missing)} off lo"
     except LoopbackError as exc:
         return f"Cannot put addresses on lo: {exc}"
     return None

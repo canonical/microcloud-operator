@@ -8,6 +8,7 @@ from unittest.mock import patch
 import pytest
 
 import bgp
+import loopback
 
 NETWORKS = [
     ipaddress.IPv6Network("fd2b:5d1a:7c93:7::/64"),
@@ -94,7 +95,7 @@ def test_ensure_runs_bird_alone_and_writes_the_config(tmp_path):
     dropin = tmp_path / "networkd" / "90-microcloud-bgp.conf"
     with (
         patch.object(bgp, "BIRD_CONF", conf_path),
-        patch.object(bgp, "NETWORKD_DROPIN", dropin),
+        patch.object(loopback, "NETWORKD_DROPIN", dropin),
         patch("subprocess.run", side_effect=fake.run),
     ):
         assert bgp.ensure("conf v1\n") is None
@@ -122,7 +123,7 @@ def test_ensure_reconfigures_a_running_bird_only_when_the_config_changes(tmp_pat
     conf_path.write_text("conf v1\n")
     with (
         patch.object(bgp, "BIRD_CONF", conf_path),
-        patch.object(bgp, "NETWORKD_DROPIN", tmp_path / "90.conf"),
+        patch.object(loopback, "NETWORKD_DROPIN", tmp_path / "90.conf"),
         patch("subprocess.run", side_effect=fake.run),
     ):
         assert bgp.ensure("conf v1\n") is None
@@ -139,7 +140,7 @@ def test_ensure_reports_a_failed_command(tmp_path):
 
     with (
         patch.object(bgp, "BIRD_CONF", tmp_path / "bird.conf"),
-        patch.object(bgp, "NETWORKD_DROPIN", tmp_path / "90.conf"),
+        patch.object(loopback, "NETWORKD_DROPIN", tmp_path / "90.conf"),
         patch("subprocess.run", side_effect=fail),
     ):
         problem = bgp.ensure("conf\n")

@@ -41,29 +41,45 @@ def _links(**interfaces):
 
 @pytest.fixture
 def netplan(tmp_path):
-    path = tmp_path / "90-microcloud-lo.yaml"
-    with patch.object(loopback, "NETPLAN_FILE", path):
+    path = tmp_path / "netplan" / "90-microcloud-lo.yaml"
+    path.parent.mkdir()
+    with (
+        patch.object(loopback, "NETPLAN_FILE", path),
+        patch.object(loopback, "NETWORKD_DROPIN", tmp_path / "networkd" / "90.conf"),
+    ):
         yield path
 
 
 @pytest.fixture
-def ip():
-    """Fake ``ip``: answers the listing from ``ip.links`` and records every call."""
+def ip(netplan):
+    """Fake ``ip`` and ``netplan``: records every call.
+
+    The listing comes from ``ip.links``. ``netplan apply`` puts the addresses
+    of the netplan file on "lo", unless ``ip.apply_works`` is False.
+    """
     calls = []
 
     def run(command, **kwargs):
         calls.append(list(command))
+        if list(command) == ["netplan", "apply"] and run.apply_works:
+            on_lo = [
+                line.split()[1].split("/")[0]
+                for line in netplan.read_text().splitlines()
+                if "/128" in line
+            ]
+            run.links = _links(eth0=[OAM_ADDRESS], lo=on_lo)
         output = run.links if "show" in command else ""
         return subprocess.CompletedProcess(command, 0, stdout=output, stderr="")
 
     run.links = _links(eth0=[OAM_ADDRESS])
+    run.apply_works = True
     run.calls = calls
     with patch("loopback.subprocess.run", side_effect=run):
         yield run
 
 
-def _added(ip):
-    return [call[4] for call in ip.calls if "replace" in call]
+def _applied(ip):
+    return ip.calls.count(["netplan", "apply"])
 
 
 class TestRender:
@@ -106,30 +122,56 @@ class TestEnsure:
         assert ip.calls == []
         assert not netplan.exists()
 
-    def test_adds_the_addresses_and_writes_netplan(self, netplan, ip):
+    def test_writes_netplan_and_applies_it(self, netplan, ip):
         problem = loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS, OVN_UNDERLAY: UNDERLAY_ADDRESS})
 
         assert problem is None
-        assert _added(ip) == ["fd2b:5d1a:7c93:1:0:1:0:5/128", "fd2b:5d1a:7c93:3:0:1:0:5/128"]
         assert netplan.read_text() == loopback.render([UNDERLAY_ADDRESS, PUBLIC_ADDRESS])
         assert stat.S_IMODE(netplan.stat().st_mode) == 0o600
+        assert _applied(ip) == 1
+        # The addresses come from netplan only.
+        assert not any("replace" in call for call in ip.calls)
 
-    def test_an_address_already_on_lo_is_not_added_again(self, netplan, ip):
-        ip.links = _links(eth0=[OAM_ADDRESS], lo=[str(PUBLIC_ADDRESS)])
+    def test_networkd_keeps_foreign_routes_before_netplan_is_applied(self, netplan, ip):
+        loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
 
-        assert loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS}) is None
-        assert _added(ip) == []
-        assert netplan.exists()
+        dropin = loopback.NETWORKD_DROPIN.read_text()
+        assert "ManageForeignRoutes=no" in dropin
+        assert "ManageForeignRoutingPolicyRules=no" in dropin
+        assert stat.S_IMODE(loopback.NETWORKD_DROPIN.stat().st_mode) == 0o644
+        restart = ip.calls.index(["systemctl", "restart", "systemd-networkd"])
+        assert restart < ip.calls.index(["netplan", "apply"])
 
-    def test_netplan_is_left_alone_when_current(self, netplan, ip):
+    def test_networkd_is_restarted_only_when_the_dropin_is_new(self, netplan, ip):
+        loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
+        loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS, OVN_UNDERLAY: UNDERLAY_ADDRESS})
+
+        assert ip.calls.count(["systemctl", "restart", "systemd-networkd"]) == 1
+
+    def test_netplan_is_not_applied_when_current(self, netplan, ip):
         loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
         before = netplan.stat().st_mtime_ns
 
         with patch("loopback.os.replace") as replace:
-            loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
+            assert loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS}) is None
 
         replace.assert_not_called()
         assert netplan.stat().st_mtime_ns == before
+        assert _applied(ip) == 1
+
+    def test_netplan_is_applied_again_when_an_address_went_missing(self, netplan, ip):
+        loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
+        ip.links = _links(eth0=[OAM_ADDRESS])
+
+        assert loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS}) is None
+        assert _applied(ip) == 2
+
+    def test_an_address_netplan_did_not_add_is_reported(self, netplan, ip):
+        ip.apply_works = False
+
+        problem = loopback.ensure({CEPH_PUBLIC: PUBLIC_ADDRESS})
+
+        assert problem == "netplan apply left fd2b:5d1a:7c93:3:0:1:0:5 off lo"
 
     def test_another_address_in_the_network_blocks(self, netplan, ip):
         ip.links = _links(eth0=[OAM_ADDRESS], lo=["fd2b:5d1a:7c93:3::7"])
@@ -140,7 +182,7 @@ class TestEnsure:
             "fd2b:5d1a:7c93:3::7 on lo is in fd2b:5d1a:7c93:3::/64, "
             "which fd2b:5d1a:7c93:3:0:1:0:5 on lo is derived for"
         )
-        assert _added(ip) == []
+        assert _applied(ip) == 0
         assert not netplan.exists()
 
     def test_a_failing_ip_command_is_reported(self, netplan):
