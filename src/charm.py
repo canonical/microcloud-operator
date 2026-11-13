@@ -72,6 +72,7 @@ import snap
 import storage_health
 from cluster import ClusterCoordinator, PeerSystem, validate_membership
 from control_plane import ControlPlane
+from dpu import DPURole
 from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
@@ -114,6 +115,29 @@ class MicroCloudCharm(ops.CharmBase):
         self._stored.set_default(
             session_failures=0, worker_pid=0, worker_session="", lxd_join_since=0.0
         )
+
+        self._stored.set_default(node_role="")
+        role = str(self.config.get("node-role", "host"))
+        self._role_problem = ""
+        if role not in {"host", "dpu"}:
+            self._role_problem = "node-role must be host or dpu"
+        elif self._stored.node_role and self._stored.node_role != role:
+            self._role_problem = (
+                "node-role cannot change on an existing deployment; redeploy the application"
+            )
+        if self._role_problem:
+            for event in (
+                self.on.install,
+                self.on.upgrade_charm,
+                self.on.config_changed,
+                self.on.update_status,
+            ):
+                self.framework.observe(event, self._on_role_error)
+            return
+        self._stored.node_role = role
+        if role == "dpu":
+            self._dpu = DPURole(self)
+            return
 
         self._coordinator = ClusterCoordinator(self)
         self._control_plane = ControlPlane()
@@ -192,6 +216,9 @@ class MicroCloudCharm(ops.CharmBase):
             self.on.remove_control_plane_role_action, self._on_remove_control_plane
         )
 
+    def _on_role_error(self, event: ops.EventBase) -> None:
+        self.unit.status = ops.BlockedStatus(self._role_problem)
+
     # ------------------------------------------------------------------
     # Mode detection
     # ------------------------------------------------------------------
@@ -265,6 +292,11 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _reconcile(self) -> None:
         """Drive deployment or observe-only mode, then set status."""
+        if str(self.config.get("node-role", "host")) != "host":
+            self.unit.status = ops.BlockedStatus(
+                "node-role cannot change on an existing deployment; redeploy the application"
+            )
+            return
         ovn_uplink_interface, problem = self._network.ovn_uplink_interface()
         if problem:
             self.unit.status = ops.BlockedStatus(problem)

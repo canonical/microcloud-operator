@@ -168,6 +168,30 @@ extra-bindings:
 
 config:
   options:
+    node-role:
+      type: string
+      default: host
+      description: >
+        Machine role: host or dpu. Deploy separate applications for each
+        role. The DPU role configures a standard system OVS bridge and
+        does not install MicroOVN, MicroCloud, LXD or MicroCeph.
+        Changing roles after deployment requires redeployment.
+
+    dpu-bridge:
+      type: string
+      default: br-dpu
+      description: DPU OVS bridge joining the MAAS bond and host representor.
+
+    dpu-bond:
+      type: string
+      default: bond0
+      description: MAAS-created active-backup bond in the DPU role.
+
+    dpu-host-representor:
+      type: string
+      default: pf0hpf
+      description: Host PF representor attached to the DPU bridge.
+
     microcloud-access-network:
       type: string
       default: ""

@@ -67,6 +67,7 @@ class TestLokiRelationHandlers:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._observability = MagicMock(spec=Observability)
         stub._loki_consumer = MagicMock()
         return stub
@@ -639,6 +640,7 @@ class TestUnreachablePeer:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.derived_addresses.return_value = {
             ipaddress.IPv6Network(network): ipaddress.IPv6Address(address)
@@ -760,6 +762,7 @@ class TestEnsureBGP:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub.config = config
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.derived_addresses.return_value = derived
@@ -939,6 +942,7 @@ class TestStorageProblem:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub.config = {"snap-channel-microceph": microceph}
         stub._storage_local_path.return_value = local
         stub._storage_ceph_paths.return_value = (list(ceph), None)
@@ -1050,6 +1054,7 @@ class TestHeldStatus:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
@@ -1081,6 +1086,7 @@ class TestHeldStatus:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = (
@@ -1101,6 +1107,7 @@ class TestHeldStatus:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
@@ -1116,6 +1123,7 @@ class TestHeldStatus:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._status_held = False
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
@@ -1498,6 +1506,7 @@ class TestGrowCharm:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub.unit.is_leader.return_value = leader
         stub.unit.name = "microcloud/0"
         stub.charm_dir = Path("/charm")
@@ -2556,6 +2565,7 @@ class TestFailureDomains:
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._failure_domains = MagicMock(spec=FailureDomains)
         stub._failure_domains.reconcile.return_value = None
         stub._sessions = MagicMock()
@@ -2725,6 +2735,7 @@ class TestFailureDomains:
         from control_plane import ControlPlane
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub.unit.is_leader.return_value = leader
         stub._cos_related.return_value = False
         stub._control_plane = MagicMock(spec=ControlPlane)
@@ -2762,6 +2773,7 @@ class TestFailureDomains:
         from microcloud import Member
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub.config = {"node-role": "host"}
         stub._control_plane = MagicMock(spec=ControlPlane)
         stub._control_plane.mode.return_value = "inactive (0 of 3 role holders)"
         stub._control_plane.mode.side_effect = mode_side_effect
@@ -2792,3 +2804,46 @@ class TestFailureDomains:
         assert "members" in results
         assert "control-plane-mode" not in results
         assert results["control-plane-mode-error"] == "boom"
+
+
+class TestDPURole:
+    def test_dpu_installs_no_host_services_or_snaps(self):
+        import ops.testing
+
+        import dpu
+        from charm import MicroCloudCharm
+
+        harness = ops.testing.Harness(MicroCloudCharm)
+        harness.update_config({"node-role": "dpu"})
+        try:
+            with (
+                patch.object(dpu, "ensure_bridge") as bridge,
+                patch("snap.ensure_snaps") as snaps,
+                patch("microcloud.is_initialized") as mc,
+            ):
+                harness.begin()
+                harness.charm.on.install.emit()
+                bridge.assert_called_once_with("br-dpu", "bond0", "pf0hpf")
+                snaps.assert_not_called()
+                mc.assert_not_called()
+                assert harness.model.unit.status.name == "active"
+                assert not hasattr(harness.charm, "_coordinator")
+        finally:
+            harness.cleanup()
+
+    def test_dpu_failure_blocks_without_host_fallback(self):
+        import ops.testing
+
+        import dpu
+        from charm import MicroCloudCharm
+
+        harness = ops.testing.Harness(MicroCloudCharm)
+        harness.update_config({"node-role": "dpu"})
+        try:
+            with patch.object(dpu, "ensure_bridge", side_effect=dpu.DPUError("missing MAAS bond")):
+                harness.begin()
+                harness.charm.on.install.emit()
+                assert harness.model.unit.status.name == "blocked"
+                assert "missing MAAS bond" in harness.model.unit.status.message
+        finally:
+            harness.cleanup()
