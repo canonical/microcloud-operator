@@ -368,6 +368,29 @@ class TestPreseed:
         ]
         assert "storage" not in doc["systems"][1]
 
+    def test_storage_without_wipe(self):
+        from preseed import SystemEntry, build_preseed
+
+        doc = build_preseed(
+            self._inputs(
+                systems=[
+                    SystemEntry(
+                        name="node1",
+                        address="10.0.0.1",
+                        storage_local_path="/dev/nvme0n1",
+                    ),
+                ],
+                storage_wipe=False,
+            )
+        )
+        assert doc["systems"][0]["storage"]["local"] == {"path": "/dev/nvme0n1"}
+
+    def test_storage_wipe_is_on_by_default(self):
+        import yaml
+
+        charmcraft = yaml.safe_load((Path(__file__).parents[2] / "charmcraft.yaml").read_text())
+        assert charmcraft["config"]["options"]["storage-wipe"]["default"] is True
+
     def test_storage_omitted_without_paths(self):
         from preseed import build_preseed
 
@@ -934,11 +957,20 @@ options:
 
 
 class TestStorageProblem:
-    def _check(self, *, local="", ceph=(), microceph="tentacle/stable", found=None, error=None):
+    def _check(
+        self,
+        *,
+        local="",
+        ceph=(),
+        microceph="tentacle/stable",
+        cephfs=False,
+        found=None,
+        error=None,
+    ):
         from charm import MicroCloudCharm
 
         stub = MagicMock(spec=MicroCloudCharm)
-        stub.config = {"snap-channel-microceph": microceph}
+        stub.config = {"snap-channel-microceph": microceph, "ceph-cephfs": cephfs}
         stub._storage_local_path.return_value = local
         stub._storage_ceph_paths.return_value = (list(ceph), None)
         with (
@@ -963,7 +995,15 @@ class TestStorageProblem:
     def test_storage_in_place_is_no_problem(self):
         problem, problems = self._check(local="/dev/sdb3", ceph=["/dev/sdc", "/dev/sdd"])
         assert problem is None
-        problems.assert_called_once_with("node1", "member1", local=True, ceph_disks=2)
+        problems.assert_called_once_with(
+            "node1", "member1", local=True, ceph_disks=2, cephfs=False
+        )
+
+    def test_cephfs_is_passed_on(self):
+        _, problems = self._check(ceph=["/dev/sdc"], cephfs=True)
+        problems.assert_called_once_with(
+            "node1", "member1", local=False, ceph_disks=1, cephfs=True
+        )
 
     def test_missing_storage_is_listed(self):
         problem, _ = self._check(

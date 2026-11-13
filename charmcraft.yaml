@@ -236,8 +236,13 @@ config:
 
     storage-wipe:
       type: boolean
-      default: false
-      description: Wipe disks attached via Juju storage before use.
+      default: true
+      description: |
+        Wipe disks attached via Juju storage before MicroCloud uses them.
+        MicroCloud refuses a disk that still holds data, such as the OSD of
+        an earlier deployment on a redeployed machine, and the cluster then
+        forms without it. Applies only to disks added when a unit forms or
+        joins the cluster.
 
     storage-encrypt:
       type: boolean

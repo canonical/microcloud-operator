@@ -601,6 +601,7 @@ class MicroCloudCharm(ops.CharmBase):
                 lxd_cluster.own_name(),
                 local=bool(local_path),
                 ceph_disks=len(ceph_paths),
+                cephfs=bool(self.config.get("ceph-cephfs", False)),
             )
         except (storage_health.StorageHealthError, lxd_cluster.LXDClusterError) as exc:
             return f"Cannot check the storage of {hostname}: {exc}"

@@ -386,7 +386,7 @@ class JoinSessions:
             ovn_ipv4_range=self._config.get("ovn-ipv4-range", ""),
             ovn_ipv6_gateway=self._config.get("ovn-ipv6-gateway", ""),
             ovn_dns_servers=self._config.get("ovn-dns-servers", ""),
-            storage_wipe=bool(self._config.get("storage-wipe", False)),
+            storage_wipe=bool(self._config.get("storage-wipe", True)),
             storage_encrypt=bool(self._config.get("storage-encrypt", False)),
         )
 
