@@ -92,6 +92,26 @@ class TestProblems:
                 'no "local" storage pool on node1'
             ]
 
+    def test_a_missing_cephfs_pool(self):
+        with _pools({"local": {"node1"}, "remote": {"node1"}}), _microceph(DISKS):
+            assert storage_health.problems(
+                "node1", "node1", local=True, ceph_disks=2, cephfs=True
+            ) == ['no "remote-fs" storage pool']
+
+    def test_cephfs_is_not_checked_without_ceph_disks(self):
+        with _pools({"local": {"node1"}}):
+            assert (
+                storage_health.problems("node1", "node1", local=True, ceph_disks=0, cephfs=True)
+                == []
+            )
+
+    def test_the_cephfs_pool_is_found(self):
+        with _pools(POOLS), _microceph(DISKS):
+            assert (
+                storage_health.problems("node1", "node1", local=True, ceph_disks=2, cephfs=True)
+                == []
+            )
+
     def test_the_member_name_can_differ_from_the_hostname(self):
         with _pools({"local": {"member-a"}, "remote": {"member-a"}}), _microceph(DISKS):
             assert storage_health.problems("node1", "member-a", local=True, ceph_disks=2) == []
