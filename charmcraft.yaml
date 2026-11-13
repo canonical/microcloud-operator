@@ -17,9 +17,9 @@ description: |
   it may install the ovn-exporter snap.
 
 links:
-  source: https://github.com/canonical/charm-microcloud
-  issues: https://github.com/canonical/charm-microcloud/issues
-  documentation: https://canonical.com/microcloud/docs/latest/
+  source: https://github.com/canonical/microcloud-operator
+  issues: https://github.com/canonical/microcloud-operator/issues
+  documentation: https://canonical.com/microcloud/docs/latest/how-to/charm_metrics/
 
 assumes:
   - juju >= 3.6
@@ -37,6 +37,11 @@ charm-libs:
     version: "1"
 
 parts:
+  icon:
+    plugin: dump
+    source: .
+    stage:
+      - icon.svg
   charm:
     source: .
     plugin: uv
@@ -56,6 +61,7 @@ provides:
   cos-agent:
     interface: cos_agent
     limit: 1
+    optional: true
 
 requires:
   logging:
@@ -101,7 +107,9 @@ config:
       type: string
       default: "latest/edge"
       description: >
-        Snap Store channel for the ovn-exporter snap.
+        Snap Store channel for the ovn-exporter snap, including the track
+        (e.g. "latest/edge"). If the installed snap tracks a different
+        channel it is reinstalled.
 
     lxd-metrics-listen-port:
       type: int
@@ -115,8 +123,10 @@ actions:
     description: >
       Print the current MicroCloud cluster membership and whether this
       unit's own hostname is a MicroCloud member, as seen by this unit.
+    additionalProperties: false
 
   dump-metrics-config:
     description: >
       Print the cos-agent scrape configs this unit is advertising. Useful for
       debugging observability integration.
+    additionalProperties: false

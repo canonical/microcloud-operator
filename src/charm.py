@@ -87,7 +87,6 @@ class MicroCloudCharm(ops.CharmBase):
         self.framework.observe(self.on.upgrade_charm, self._on_install)
         self.framework.observe(self.on.config_changed, self._on_config_changed)
         self.framework.observe(self.on.update_status, self._on_update_status)
-        self.framework.observe(self.on.stop, self._on_stop)
         self.framework.observe(self.on.remove, self._on_remove)
 
         self.framework.observe(
@@ -169,10 +168,6 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _on_update_status(self, event: ops.UpdateStatusEvent) -> None:
         self._reconcile()
-
-    def _on_stop(self, event: ops.StopEvent) -> None:
-        if self._cos_related():
-            self._teardown_observability(full_cleanup=False)
 
     def _on_remove(self, event: ops.RemoveEvent) -> None:
         # Never destroy the MicroCloud cluster itself; only clean up

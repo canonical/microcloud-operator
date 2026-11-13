@@ -66,9 +66,20 @@ class OVNExporter:
         """
         if is_installed(SNAP_NAME):
             logger.debug("%s snap is already installed", SNAP_NAME)
-            # Still re-verify the connections in case they were manually removed.
-            self._ensure_connections()
-            return
+            try:
+                current = snap.list_one(SNAP_NAME).tracking
+            except snap.Error as exc:
+                raise OVNExporterError(f"Cannot query {SNAP_NAME} snap: {exc.message}") from exc
+            if current == self._channel:
+                self._ensure_connections()
+                return
+            logger.info(
+                "Reinstalling %s snap: channel changed from %s to %s",
+                SNAP_NAME,
+                current,
+                self._channel,
+            )
+            self.remove()
 
         logger.info("Installing %s snap from channel %s", SNAP_NAME, self._channel)
         try:
@@ -121,7 +132,7 @@ class OVNExporter:
         for plug, slot in _CONNECTIONS:
             try:
                 snap.connect((SNAP_NAME, plug), slot)
-                logger.info("Connected %s:%s -> %s:%s", SNAP_NAME, plug, *slot)
+                logger.debug("Connected %s:%s -> %s:%s", SNAP_NAME, plug, *slot)
             except snap.Error as exc:
                 raise OVNExporterError(
                     f"Cannot connect {SNAP_NAME}:{plug} to {slot[0]}:{slot[1]}: {exc.message}"
@@ -134,7 +145,7 @@ class OVNExporter:
         shells out to `snap services` directly.
         """
         result = subprocess.run(
-            ["snap", "services", SERVICE_NAME],
+            ["/usr/bin/snap", "services", SERVICE_NAME],
             capture_output=True,
             text=True,
             check=False,
