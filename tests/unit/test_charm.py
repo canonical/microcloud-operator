@@ -368,6 +368,29 @@ class TestPreseed:
         ]
         assert "storage" not in doc["systems"][1]
 
+    def test_storage_without_wipe(self):
+        from preseed import SystemEntry, build_preseed
+
+        doc = build_preseed(
+            self._inputs(
+                systems=[
+                    SystemEntry(
+                        name="node1",
+                        address="10.0.0.1",
+                        storage_local_path="/dev/nvme0n1",
+                    ),
+                ],
+                storage_wipe=False,
+            )
+        )
+        assert doc["systems"][0]["storage"]["local"] == {"path": "/dev/nvme0n1"}
+
+    def test_storage_wipe_is_on_by_default(self):
+        import yaml
+
+        charmcraft = yaml.safe_load((Path(__file__).parents[2] / "charmcraft.yaml").read_text())
+        assert charmcraft["config"]["options"]["storage-wipe"]["default"] is True
+
     def test_storage_omitted_without_paths(self):
         from preseed import build_preseed
 
