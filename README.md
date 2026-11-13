@@ -74,7 +74,7 @@ prodstack-hosts:
   microcloud-internal-network: fd2b:5d1a:7c93:101::/64
   ceph-public-network: fd2b:5d1a:7c93:400::/56
   ceph-internal-network: fd2b:5d1a:7c93:300::/56
-  bgp-uplinks: eth1.100,eth2.100,eth1.101,eth2.101,eth1.300,eth2.300,eth1.400,eth2.400
+  bgp-uplinks: dpu1p1.100,dpu2p1.100,dpu1p1.101,dpu2p1.101,dpu1p1.300,dpu2p1.300,dpu1p1.400,dpu2p1.400
 ```
 
 Deploy the host application with the existing storage pool options, using
