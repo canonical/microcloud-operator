@@ -82,12 +82,12 @@ def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
 def ssh(juju: jubilant.Juju, unit: str, command: str) -> str:
     """Run ``command`` on ``unit`` and return its stdout.
 
-    "juju ssh" allocates a pseudo-terminal whenever a terminal is attached,
-    which prefixes the output with control bytes, rewrites the line endings and
-    appends "Connection to <ip> closed.". Whether that happens depends on how
-    pytest was started, so force it off and get the same bytes everywhere.
+    Uses "juju exec" rather than "juju ssh": Juju 4 no longer adds SSH keys to
+    new models, and "juju exec" needs none on 3.6 or 4.x. It also allocates no
+    pseudo-terminal, so the output is the same however pytest was started.
+    Raises jubilant.TaskError if the command fails.
     """
-    return juju.cli("ssh", "--pty=false", unit, command)
+    return juju.exec(command, unit=unit).stdout
 
 
 def unit_names(juju: jubilant.Juju, app: str = MICROCLOUD_CHARM) -> list[str]:
