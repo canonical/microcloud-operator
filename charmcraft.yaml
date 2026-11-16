@@ -301,10 +301,11 @@ config:
       type: string
       default: ""
       description: >
-        IPv6 /64 of the Ceph public network, e.g. "fd00:3::/64". When set,
-        it replaces the "ceph-public" binding. Each unit's address in it
-        is this /64 with the host part of the unit's cluster address. A
-        unit blocks if its machine holds another address in this /64.
+        IPv6 /64 of the Ceph public network, e.g. "fd00:3::/64", or a /56
+        pool, e.g. "fd00:400::/56", whose first /64 (slot 0) is used. When
+        set, it replaces the "ceph-public" binding. Each unit's address in
+        it is that /64 with the host part of the unit's cluster address. A
+        unit blocks if its machine holds another address in that /64.
 
     ceph-internal-network:
       type: string
