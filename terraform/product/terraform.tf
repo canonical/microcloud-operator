@@ -9,9 +9,9 @@ terraform {
   required_providers {
     juju = {
       source = "juju/juju"
-      # 1.2.0 is the first with juju_model's target_controller, which this
-      # module sets; the charm module it calls accepts 1.0.0 and up.
-      version = ">= 1.2.0, < 3.0.0"
+      # v2.0.0 is the first that supports Juju 4 controllers, and it keeps
+      # juju_model's target_controller (added in 1.2.0), which this module sets.
+      version = ">= 2.0.0, < 3.0.0"
     }
   }
 }
