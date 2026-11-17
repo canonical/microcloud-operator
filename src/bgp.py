@@ -21,6 +21,8 @@ import tempfile
 from collections.abc import Iterable
 from pathlib import Path
 
+import snap
+
 SNAP = "microovn"
 BIRD_SERVICE = "microovn.bird"
 BIRD_CONF = Path("/var/snap/microovn/common/data/bird/bird.conf")
@@ -150,13 +152,15 @@ def _run(*command: str) -> str:
         raise BGPError(f"{' '.join(command)}: {exc}") from exc
 
 
-def installed() -> bool:
-    """Return True if the MicroOVN snap is installed."""
+def present() -> bool:
+    """Return whether the MicroOVN snap is installed.
+
+    Raises BGPError if snapd cannot tell, for example while it restarts.
+    """
     try:
-        _run("snap", "list", SNAP)
-    except BGPError:
-        return False
-    return True
+        return snap.present(SNAP)
+    except snap.SnapError as exc:
+        raise BGPError(str(exc)) from exc
 
 
 def services() -> dict[str, tuple[bool, bool]]:

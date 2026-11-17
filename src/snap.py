@@ -9,6 +9,7 @@ holds refreshes to avoid uncoordinated auto-updates.
 """
 
 import logging
+import os
 import subprocess
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,31 @@ def is_installed(name: str) -> bool:
         check=False,
     )
     return result.returncode == 0
+
+
+def present(name: str) -> bool:
+    """Return whether the named snap is installed.
+
+    Unlike is_installed, this raises SnapError when snapd cannot tell, for
+    example while it restarts. snapd's message is matched in the C locale,
+    since it is translated.
+    """
+    try:
+        result = subprocess.run(
+            ["snap", "list", name],
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+            env={**os.environ, "LC_ALL": "C"},
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise SnapError(f"snap list {name}: {exc}") from exc
+    if result.returncode == 0:
+        return True
+    if "no matching snaps installed" in result.stderr:
+        return False
+    raise SnapError(f"snap list {name}: {result.stderr.strip()}")
 
 
 def install(name: str, channel: str) -> None:

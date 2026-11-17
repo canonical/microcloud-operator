@@ -1095,6 +1095,7 @@ class TestHeldStatus:
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
         stub._ensure_bgp.return_value = None
+        stub._ensure_boot_order.return_value = None
         stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
@@ -1161,6 +1162,7 @@ class TestHeldStatus:
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
         stub._ensure_bgp.return_value = None
+        stub._ensure_boot_order.return_value = None
         stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
@@ -1549,6 +1551,7 @@ class TestGrowCharm:
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
         stub._ensure_bgp.return_value = None
+        stub._ensure_boot_order.return_value = None
         stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
@@ -1588,6 +1591,24 @@ class TestGrowCharm:
         ):
             problem = MicroCloudCharm._reconcile_deploy(stub, initialized, pending)
         return problem, ensure_snaps
+
+    def test_the_boot_order_is_set_once_the_snaps_are_in(self):
+        """A reboot before the next hook must still start Ceph after BGP."""
+        stub = self._stub(leader=True)
+        calls = []
+        stub._ensure_bgp.side_effect = lambda: calls.append("bgp")
+        stub._ensure_boot_order.side_effect = lambda *args: calls.append(("boot", args))
+
+        with patch("charm.bgp.present", return_value=True):
+            _, ensure_snaps = self._deploy(stub, initialized=False, pending=[])
+
+        ensure_snaps.assert_called_once()
+        assert calls == ["bgp", ("boot", (True, ""))]
+
+    def test_a_clustered_leader_does_not_reorder_the_boot(self):
+        stub = self._stub(leader=True)
+        self._deploy(stub, initialized=True, pending=[])
+        stub._ensure_boot_order.assert_not_called()
 
     def test_an_uplink_nic_that_is_missing_blocks_the_deploy(self):
         """A cluster formed with an unknown uplink has no external network at all."""
@@ -2609,6 +2630,7 @@ class TestFailureDomains:
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
         stub._ensure_bgp.return_value = None
+        stub._ensure_boot_order.return_value = None
         stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
@@ -2742,6 +2764,7 @@ class TestFailureDomains:
         stub._network.network_options_problem.return_value = None
         stub._network.derived_addresses.return_value = {}
         stub._ensure_bgp.return_value = None
+        stub._ensure_boot_order.return_value = None
         stub._bgp_uplinks.return_value = []
         stub._storage_local_path.return_value = ""
         stub._storage_ceph_paths.return_value = ([], None)
@@ -2831,3 +2854,113 @@ class TestFailureDomains:
         assert "members" in results
         assert "control-plane-mode" not in results
         assert results["control-plane-mode-error"] == "boom"
+
+
+class TestBootOrder:
+    """When the charm orders MicroCeph after BGP."""
+
+    def _run(
+        self,
+        *,
+        microovn=True,
+        microovn_error="",
+        microceph=True,
+        bird=(True, True),
+        services_error=None,
+    ):
+        import snap as snap_module
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        services = (
+            {"side_effect": services_error}
+            if services_error
+            else {"return_value": {"microovn.bird": bird, "microovn.switch": (False, False)}}
+        )
+        present = (
+            {"side_effect": microceph}
+            if isinstance(microceph, snap_module.SnapError)
+            else {"return_value": microceph}
+        )
+        with (
+            patch("charm.snap.present", **present) as snap_present,
+            patch("charm.bgp.services", **services),
+            patch("charm.boot_order.ensure") as ensure,
+        ):
+            problem = MicroCloudCharm._ensure_boot_order(stub, microovn, microovn_error)
+        snap_present.assert_called_once_with("microceph")
+        return problem, ensure
+
+    def test_orders_ceph_after_bird_when_bird_is_enabled(self):
+        problem, ensure = self._run()
+        assert problem is None
+        ensure.assert_called_once_with(True)
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"bird": (False, False)},
+            {"microovn": False},
+            {"microceph": False},
+            # Without MicroCeph, whether MicroOVN is installed does not matter.
+            {"microceph": False, "microovn": None, "microovn_error": "timed out"},
+        ],
+    )
+    def test_removes_the_ordering_otherwise(self, kwargs):
+        problem, ensure = self._run(**kwargs)
+        assert problem is None
+        ensure.assert_called_once_with(False)
+
+    def test_unreadable_services_keep_the_ordering_and_block(self):
+        import bgp
+
+        problem, ensure = self._run(services_error=bgp.BGPError("snap services: boom"))
+        assert problem == "Cannot tell whether MicroOVN runs BIRD: snap services: boom"
+        ensure.assert_not_called()
+
+    def test_an_unknown_microovn_keeps_the_ordering_and_blocks(self):
+        problem, ensure = self._run(microovn=None, microovn_error="snap list microovn: timed out")
+        assert problem == "Cannot tell whether MicroOVN runs BIRD: snap list microovn: timed out"
+        ensure.assert_not_called()
+
+    def test_an_unknown_microceph_keeps_the_ordering_and_blocks(self):
+        import snap as snap_module
+
+        problem, ensure = self._run(
+            microceph=snap_module.SnapError("snap list microceph: timed out")
+        )
+        assert (
+            problem == "Cannot tell whether MicroCeph is installed: snap list microceph: timed out"
+        )
+        ensure.assert_not_called()
+
+    def test_a_failure_to_write_blocks(self):
+        import boot_order
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        with patch("charm.boot_order.ensure", side_effect=boot_order.BootOrderError("no")):
+            assert (
+                MicroCloudCharm._ensure_boot_order(stub, False)
+                == "Cannot order Ceph after BGP: no"
+            )
+
+    def test_reconcile_asks_snapd_about_microovn_once(self):
+        """BGP and the boot ordering share one answer, so they cannot disagree."""
+        from charm import MicroCloudCharm
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.ovn_uplink_interface.return_value = ("", None)
+        stub._network.network_options_problem.return_value = None
+        stub._network.derived_addresses.return_value = {}
+        stub._ensure_bgp.return_value = None
+        stub._ensure_boot_order.return_value = "stop here"
+        with (
+            patch("charm.loopback.ensure", return_value=None),
+            patch("charm.bgp.present", return_value=True) as present,
+        ):
+            MicroCloudCharm._reconcile(stub)
+        present.assert_called_once_with()
+        stub._ensure_bgp.assert_called_once_with()
+        stub._ensure_boot_order.assert_called_once_with(True, "")

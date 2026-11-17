@@ -64,6 +64,7 @@ from charms.grafana_agent.v0.cos_agent import COSAgentProvider
 from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 
 import bgp
+import boot_order
 import loopback
 import lxd_cluster
 import microcloud
@@ -77,6 +78,15 @@ from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
 
 logger = logging.getLogger(__name__)
+
+
+def _microovn_state() -> tuple[bool | None, str]:
+    """Return whether MicroOVN is installed, or None and why snapd cannot tell."""
+    try:
+        return bgp.present(), ""
+    except bgp.BGPError as exc:
+        return None, str(exc)
+
 
 # Kernel machine names (uname -m) mapped to Debian/snap architecture names.
 _MACHINE_TO_ARCH = {
@@ -283,12 +293,20 @@ class MicroCloudCharm(ops.CharmBase):
             self.unit.status = ops.BlockedStatus(problem)
             return
 
+        # One snapd query, so that BGP and the boot ordering agree on it.
+        microovn, microovn_error = _microovn_state()
+
         # On every hook once the snap is in: keeps BIRD alone and up to date.
-        if bgp.installed():
+        if microovn:
             problem = self._ensure_bgp()
             if problem:
                 self.unit.status = ops.BlockedStatus(problem)
                 return
+
+        problem = self._ensure_boot_order(microovn, microovn_error)
+        if problem:
+            self.unit.status = ops.BlockedStatus(problem)
+            return
 
         storage_ceph_paths, problem = self._storage_ceph_paths()
         if problem:
@@ -452,6 +470,12 @@ class MicroCloudCharm(ops.CharmBase):
             if problem:
                 return problem
 
+            # Again now that the snaps are in and BIRD may be enabled, so a
+            # reboot before the next hook still starts Ceph after BGP.
+            problem = self._ensure_boot_order(*_microovn_state())
+            if problem:
+                return problem
+
         if not microcloud.waitready(timeout=60):
             self._hold_status(ops.WaitingStatus("Waiting for microcloud daemon"))
             return None
@@ -512,6 +536,37 @@ class MicroCloudCharm(ops.CharmBase):
         except ValueError as exc:
             return str(exc)
         return bgp.ensure(bgp.render(router_id, asn, interfaces, derived.keys()))
+
+    def _ensure_boot_order(self, microovn: bool | None, microovn_error: str = "") -> str | None:
+        """Start MicroCeph after BGP is up whenever BIRD runs on this host.
+
+        BIRD may be run by this charm ("bgp-uplinks") or by the machine's
+        deployment. ``microovn`` is whether the MicroOVN snap is installed,
+        or None when snapd cannot tell, with ``microovn_error`` saying why.
+        Returns a problem to block on, or None.
+        """
+        # Whether MicroCeph is installed, not whether its channel is set: the
+        # charm never removes the snap, so Ceph keeps running when the option
+        # is cleared. When snapd cannot tell, keep the files as they are:
+        # removing them would leave Ceph unordered if the host rebooted now.
+        try:
+            microceph = snap.present("microceph")
+        except snap.SnapError as exc:
+            return f"Cannot tell whether MicroCeph is installed: {exc}"
+        enabled = False
+        if microceph:
+            if microovn is None:
+                return f"Cannot tell whether MicroOVN runs BIRD: {microovn_error}"
+            if microovn:
+                try:
+                    enabled = bgp.services().get(bgp.BIRD_SERVICE, (False, False))[0]
+                except bgp.BGPError as exc:
+                    return f"Cannot tell whether MicroOVN runs BIRD: {exc}"
+        try:
+            boot_order.ensure(enabled)
+        except boot_order.BootOrderError as exc:
+            return f"Cannot order Ceph after BGP: {exc}"
+        return None
 
     def _unreachable_peer(self) -> str | None:
         """Return which peer does not answer on a derived address yet, or None.

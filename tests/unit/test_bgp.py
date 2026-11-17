@@ -1,6 +1,7 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
+import contextlib
 import ipaddress
 import subprocess
 from unittest.mock import patch
@@ -8,6 +9,11 @@ from unittest.mock import patch
 import pytest
 
 import bgp
+import snap
+
+# conftest stubs these out for every test; the tests below need the real ones.
+_PRESENT = bgp.present
+_SNAP_PRESENT = snap.present
 
 NETWORKS = [
     ipaddress.IPv6Network("fd2b:5d1a:7c93:7::/64"),
@@ -56,6 +62,51 @@ def test_render_peers_on_each_uplink_and_advertises_only_the_derived_addresses()
     assert f"import filter {{ if net ~ [ {prefixes} ] then accept; reject; }};" in conf
     # No default route is taken from the fabric.
     assert "::/0" not in conf
+
+
+@contextlib.contextmanager
+def _snap_list(stderr=None):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(kwargs)
+        if stderr is not None:
+            return subprocess.CompletedProcess(command, 1, stdout="", stderr=stderr)
+        return subprocess.CompletedProcess(command, 0, stdout="", stderr="")
+
+    with (
+        patch("snap.subprocess.run", side_effect=run),
+        patch.object(bgp, "present", _PRESENT),
+        patch.object(snap, "present", _SNAP_PRESENT),
+    ):
+        yield calls
+
+
+def test_present_when_the_snap_is_listed():
+    with _snap_list() as calls:
+        assert bgp.present() is True
+    # snapd's messages are translated; present() matches the C locale's.
+    assert calls[0]["env"]["LC_ALL"] == "C"
+
+
+def test_not_present_when_snapd_says_it_is_not_installed():
+    with _snap_list("error: no matching snaps installed\n"):
+        assert bgp.present() is False
+
+
+def test_present_raises_when_snapd_cannot_tell():
+    with _snap_list("error: cannot communicate with server: timeout\n"):
+        with pytest.raises(bgp.BGPError, match="cannot communicate"):
+            bgp.present()
+
+
+def test_present_raises_when_snap_cannot_run():
+    with (
+        patch("snap.subprocess.run", side_effect=subprocess.TimeoutExpired("snap", 60)),
+        patch.object(snap, "present", _SNAP_PRESENT),
+    ):
+        with pytest.raises(snap.SnapError, match="snap list microceph"):
+            snap.present("microceph")
 
 
 class _Snap:
