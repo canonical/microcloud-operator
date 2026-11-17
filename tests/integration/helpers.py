@@ -262,12 +262,16 @@ def assert_no_session_state(juju: jubilant.Juju) -> None:
         time.sleep(5)
     assert not any(workers.values()), workers
 
+    # "juju exec" runs this command from a script under /tmp/juju-exec*, and
+    # that script holds the passphrase, so the search skips those directories.
+    # Juju refuses a command that contains "juju-exec", hence the brackets.
     pattern = shlex.quote(session_passphrase(juju))
     for unit in unit_names(juju):
         found = ssh(
             juju,
             unit,
-            f"sudo grep -rlF -e {pattern} /var/lib/charm-microcloud /tmp 2>/dev/null || true",
+            f"sudo grep -rlF --exclude-dir='juju-exe[c]*' -e {pattern} "
+            "/var/lib/charm-microcloud /tmp 2>/dev/null || true",
         )
         assert not found.strip(), (unit, found)
 
