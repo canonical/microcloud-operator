@@ -1123,14 +1123,14 @@ class TestHeldStatus:
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = (
-            "ceph-public-network: '10.0.0.0/24' is not an IPv6 /64"
+            "ceph-public-network: '10.0.0.0/24' is not an IPv6 /64 or /56"
         )
         stub._coordinator = MagicMock()
 
         MicroCloudCharm._reconcile(stub)
 
         assert stub.unit.status == ops.BlockedStatus(
-            "ceph-public-network: '10.0.0.0/24' is not an IPv6 /64"
+            "ceph-public-network: '10.0.0.0/24' is not an IPv6 /64 or /56"
         )
         stub._coordinator.publish_identity.assert_not_called()
 

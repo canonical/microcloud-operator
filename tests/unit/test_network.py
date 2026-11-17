@@ -230,6 +230,35 @@ class TestDeriveAddress:
         assert first != second
 
 
+class TestCephPool:
+    def test_a_56_pool_uses_its_slot_0_64(self):
+        network = _network(config={"ceph-internal-network": "fd2b:5d1a:7c93:300::/56"})
+        assert network.configured_network("ceph-internal") == ipaddress.IPv6Network(
+            "fd2b:5d1a:7c93:300::/64"
+        )
+
+    def test_the_slot_0_address_matches_the_pool_base(self):
+        network = _network(
+            config={"ceph-public-network": "fd2b:5d1a:7c93:400::/56"},
+            binding=_bound("fd2b:5d1a:7c93:1:0:1:0:5"),
+        )
+        assert network.space_address("ceph-public") == "fd2b:5d1a:7c93:400:0:1:0:5"
+        assert network.space_cidr("ceph-public") == "fd2b:5d1a:7c93:400::/64"
+
+    def test_ovn_underlay_does_not_take_a_pool(self):
+        network = _network(config={"ovn-underlay-network": "fd2b:5d1a:7c93:200::/56"})
+        assert network.configured_network("ovn-underlay") is None
+        assert network.network_options_problem() == (
+            "ovn-underlay-network: 'fd2b:5d1a:7c93:200::/56' is not an IPv6 /64"
+        )
+
+    def test_other_prefix_lengths_are_rejected(self):
+        network = _network(config={"ceph-public-network": "fd2b:5d1a:7c93:400::/60"})
+        assert network.network_options_problem() == (
+            "ceph-public-network: 'fd2b:5d1a:7c93:400::/60' is not an IPv6 /64 or /56"
+        )
+
+
 class TestConfiguredNetwork:
     def test_none_when_unset(self):
         assert _network().configured_network("ceph-public") is None
@@ -273,7 +302,7 @@ class TestNetworkOptionsProblem:
             config={"ceph-internal-network": "10.0.0.0/24"}, binding=_bound(OAM_ADDRESS)
         )
         assert network.network_options_problem() == (
-            "ceph-internal-network: '10.0.0.0/24' is not an IPv6 /64"
+            "ceph-internal-network: '10.0.0.0/24' is not an IPv6 /64 or /56"
         )
 
     def test_an_ipv4_cluster_address_cannot_be_derived_from(self):

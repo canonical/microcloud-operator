@@ -20,6 +20,12 @@ NETWORK_OPTIONS = {
     "ovn-underlay": "ovn-underlay-network",
 }
 
+# Spaces whose option may also be a /56 pool. The host's own addresses use
+# the pool's first /64, its slot 0; the other 255 /64s are left for per-OSD
+# addresses.
+POOL_BINDINGS = frozenset({"ceph-public", "ceph-internal"})
+POOL_PREFIXLEN = 56
+
 
 def derive_address(
     network: ipaddress.IPv6Network, source: ipaddress.IPv6Address
@@ -107,7 +113,8 @@ class UnitNetwork:
     def configured_network(self, binding_name: str) -> ipaddress.IPv6Network | None:
         """Return the /64 configured for the given space, or None.
 
-        None also covers a value that is not an IPv6 /64, which
+        A Ceph space's option may instead be a /56 pool; its slot-0 /64 is
+        returned. None also covers a value that is neither, which
         ``network_options_problem`` reports.
         """
         raw = str(self._config.get(NETWORK_OPTIONS.get(binding_name, ""), "")).strip()
@@ -117,15 +124,20 @@ class UnitNetwork:
             network = ipaddress.ip_network(raw)
         except ValueError:
             return None
-        if network.version != 6 or network.prefixlen != 64:
+        if network.version != 6:
+            return None
+        if network.prefixlen == POOL_PREFIXLEN and binding_name in POOL_BINDINGS:
+            return next(network.subnets(new_prefix=64))
+        if network.prefixlen != 64:
             return None
         return network
 
     def network_options_problem(self) -> str | None:
         """Return a problem if a space's network option cannot be used.
 
-        Each option must be an IPv6 /64, and this unit's cluster address must
-        be IPv6, since its host part is what the addresses are derived from.
+        Each option must be an IPv6 /64 (a Ceph one may be a /56 pool), and
+        this unit's cluster address must be IPv6, since its host part is what
+        the addresses are derived from.
         A unit with no cluster address yet has nothing to report.
         """
         configured = False
@@ -134,7 +146,8 @@ class UnitNetwork:
             if not raw:
                 continue
             if self.configured_network(binding_name) is None:
-                return f"{option}: {raw!r} is not an IPv6 /64"
+                accepted = "/64 or /56" if binding_name in POOL_BINDINGS else "/64"
+                return f"{option}: {raw!r} is not an IPv6 {accepted}"
             configured = True
 
         address = self.bind_address()
