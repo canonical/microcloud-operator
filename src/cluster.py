@@ -49,6 +49,7 @@ APP_KEY_SESSION = "join-session"
 _APP_KEY_CLUSTER_MODE = "cluster-mode"
 _APP_KEY_JOINED_UNITS = "joined-units"
 _APP_KEY_SNAP_CHANNELS = "snap-channels"
+_APP_KEY_LXD_PROXY = "lxd-proxy-applied"
 
 # Values of "cluster-mode": which side of the "microcloud_cluster" relation
 # this application formed or joined its cluster as.
@@ -419,6 +420,30 @@ class ClusterCoordinator:
             app_data.pop(APP_KEY_SESSION, None)
             return
         app_data[APP_KEY_SESSION] = session.to_json()
+
+    def lxd_proxy_applied(self) -> dict[str, str]:
+        """Return the LXD proxy values the charm last set (see lxd_proxy)."""
+        relation = self.relation
+        raw = relation.data[self._charm.app].get(_APP_KEY_LXD_PROXY) if relation else None
+        try:
+            data = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            logger.warning("Ignoring malformed LXD proxy data: %r", raw)
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return {str(key): str(value) for key, value in data.items()}
+
+    def publish_lxd_proxy_applied(self, applied: dict[str, str]) -> None:
+        """Leader records the LXD proxy values it set, so a new leader can unset them."""
+        relation = self.relation
+        if relation is None or not self._charm.unit.is_leader():
+            return
+        app_data = relation.data[self._charm.app]
+        if applied:
+            app_data[_APP_KEY_LXD_PROXY] = json.dumps(applied, sort_keys=True)
+        else:
+            app_data.pop(_APP_KEY_LXD_PROXY, None)
 
     def session(self) -> JoinSession | None:
         """Return the published join session, or None if there is none."""

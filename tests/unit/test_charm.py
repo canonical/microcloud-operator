@@ -50,6 +50,7 @@ sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
 # Now import the modules under test.
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
+import lxd_cluster
 import session
 from ceph_mgr import CephMgrPrometheus
 from cluster_relation import ClusterRelation
@@ -1256,6 +1257,23 @@ peers:
 
             coordinator.publish_session(None)
             assert coordinator.session() is None
+        finally:
+            harness.cleanup()
+
+    def test_lxd_proxy_applied_round_trips(self):
+        from cluster import ClusterCoordinator
+
+        harness = self._harness()
+        try:
+            coordinator = ClusterCoordinator(harness.charm)
+            harness.add_relation("cluster", "test-charm")
+            assert coordinator.lxd_proxy_applied() == {}
+
+            coordinator.publish_lxd_proxy_applied({"core.proxy_https": "http://proxy"})
+            assert coordinator.lxd_proxy_applied() == {"core.proxy_https": "http://proxy"}
+
+            coordinator.publish_lxd_proxy_applied({})
+            assert coordinator.lxd_proxy_applied() == {}
         finally:
             harness.cleanup()
 
@@ -2825,6 +2843,7 @@ class TestFailureDomains:
         stub._reconcile_deploy.return_value = None
         stub._reconcile_observe_only.return_value = None
         stub._cos_related.return_value = False
+        stub._ensure_lxd_proxy.return_value = None
 
         def hold(status):
             stub.unit.status = status
@@ -2879,6 +2898,59 @@ class TestFailureDomains:
         self._reconcile(stub)
 
         assert stub._failure_domains.reconcile.called is reconciled
+
+    @pytest.mark.parametrize("leader", [True, False])
+    def test_only_the_leader_sets_the_cluster_wide_lxd_proxy(self, leader):
+        stub = self._stub()
+        stub.unit.is_leader.return_value = leader
+        stub._sessions.pending.return_value = []
+
+        self._reconcile(stub, session=None)
+
+        assert stub._ensure_lxd_proxy.called is leader
+
+    def test_a_member_application_leaves_the_lxd_proxy_to_the_orchestrator(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub._is_orchestrator.return_value = False
+        stub._open_session.return_value = None
+        stub._join_pending = False
+        stub._status_held = False
+        stub._storage_problem.return_value = None
+        stub._cos_related.return_value = False
+        with (
+            patch("charm.microcloud.is_initialized", return_value=True),
+            patch("charm.lxd_cluster.is_clustered", return_value=True),
+        ):
+            MicroCloudCharm._reconcile_clustered(stub, True)
+
+        stub._ensure_lxd_proxy.assert_not_called()
+
+    def test_an_lxd_proxy_that_cannot_be_set_blocks(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub._coordinator = MagicMock()
+        stub._coordinator.lxd_proxy_applied.return_value = {}
+        with patch("charm.lxd_proxy.reconcile", side_effect=lxd_cluster.LXDClusterError("boom")):
+            problem = MicroCloudCharm._ensure_lxd_proxy(stub)
+
+        assert problem == "Cannot set the LXD proxy: boom"
+        stub._coordinator.publish_lxd_proxy_applied.assert_not_called()
+
+    def test_the_leader_records_the_lxd_proxy_it_set(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub._coordinator = MagicMock()
+        stub._coordinator.lxd_proxy_applied.return_value = {"core.proxy_http": "http://old"}
+        applied = {"core.proxy_http": "http://new"}
+        with patch("charm.lxd_proxy.reconcile", return_value=applied) as reconcile:
+            assert MicroCloudCharm._ensure_lxd_proxy(stub) is None
+
+        reconcile.assert_called_once_with({"core.proxy_http": "http://old"})
+        stub._coordinator.publish_lxd_proxy_applied.assert_called_once_with(applied)
 
     def _await_stub(self, *, since=0.0, session=None, now=1000.0):
         from charm import MicroCloudCharm
