@@ -66,6 +66,7 @@ from charms.loki_k8s.v1.loki_push_api import LokiPushApiConsumer
 import bgp
 import loopback
 import lxd_cluster
+import lxd_proxy
 import microcloud
 import session
 import snap
@@ -351,6 +352,8 @@ class MicroCloudCharm(ops.CharmBase):
                 if lxd_clustered:
                     self._stored.lxd_join_since = 0.0
                     problem = self._failure_domains.reconcile()
+                    if not problem and self.unit.is_leader():
+                        problem = self._ensure_lxd_proxy()
                     # Not while a join is in flight: MicroCloud adds the disks
                     # and creates the pools after the systems have joined.
                     if not problem and not pending and self._coordinator.session() is None:
@@ -493,6 +496,18 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _bgp_uplinks(self) -> list[str]:
         return bgp.uplinks(str(self.config.get("bgp-uplinks", "")))
+
+    def _ensure_lxd_proxy(self) -> str | None:
+        """Give LXD the model's proxy.
+
+        Returns a problem to block on, or None.
+        """
+        try:
+            applied = lxd_proxy.reconcile(self._coordinator.lxd_proxy_applied())
+        except lxd_cluster.LXDClusterError as exc:
+            return f"Cannot set the LXD proxy: {exc}"
+        self._coordinator.publish_lxd_proxy_applied(applied)
+        return None
 
     def _ensure_bgp(self) -> str | None:
         """Advertise this unit's derived addresses over BGP, if asked to.
