@@ -102,7 +102,7 @@ def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
             or (not recovering and jubilant.any_blocked(status, MICROCLOUD_CHARM))
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
 
 
@@ -231,7 +231,7 @@ def wait_units_active(juju: jubilant.Juju, count: int) -> None:
             or jubilant.any_blocked(status, MICROCLOUD_CHARM)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
 
 

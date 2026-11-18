@@ -101,7 +101,7 @@ def wait_apps_active(juju: jubilant.Juju, counts: dict[str, int]) -> None:
             or jubilant.any_blocked(status, *counts)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
 
 
@@ -162,7 +162,7 @@ def wait_for_roles(
         if check(current):
             return current
         assert time.monotonic() < deadline, f"timed out waiting for {what}: {current}"
-        time.sleep(10)
+        time.sleep(5)
 
 
 def members_relation_data(juju: jubilant.Juju, member_app: str) -> dict[str, str]:
@@ -297,7 +297,7 @@ def test_orchestrator_cannot_change_after_the_cluster_formed(juju: jubilant.Juju
             jubilant.any_error(status, ORCHESTRATOR) or agent_lost(status, ORCHESTRATOR)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
 
 
@@ -346,7 +346,7 @@ def test_member_joins_when_the_orchestrator_leaders_agent_stops(juju: jubilant.J
             ),
             error=lambda status: jubilant.any_error(status, MEMBER) or agent_lost(status, MEMBER),
             timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-            delay=10,
+            delay=5,
         )
     finally:
         machine_agent(juju, machine, "start")
@@ -357,7 +357,7 @@ def test_member_joins_when_the_orchestrator_leaders_agent_stops(juju: jubilant.J
             jubilant.all_active(status, ORCHESTRATOR) and not agent_lost(status, ORCHESTRATOR)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
     juju.model_config(reset="automatically-retry-hooks")
     wait_apps_active(juju, {ORCHESTRATOR: ORCHESTRATOR_UNITS, MEMBER: count})
@@ -390,7 +390,7 @@ def test_a_failing_member_is_excluded_until_the_relation_is_readded(
         if failures.get("count", 0) >= 3:
             break
         assert time.monotonic() < deadline, failures
-        time.sleep(10)
+        time.sleep(5)
 
     ssh(juju, "flaky/0", f"sudo ip route del blackhole {address}")
     message = wait_message(juju, "flaky/0", lambda m: m.startswith("excluded after"))

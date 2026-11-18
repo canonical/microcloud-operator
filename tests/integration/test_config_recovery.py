@@ -49,7 +49,7 @@ def wait_missing_uplink(juju: jubilant.Juju, num_units: int) -> None:
             jubilant.any_error(status, MICROCLOUD_CHARM) or agent_lost(status, MICROCLOUD_CHARM)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
     hostnames = unit_hostnames(juju)
     status = juju.status()

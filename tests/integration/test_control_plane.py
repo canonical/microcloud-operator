@@ -65,7 +65,7 @@ def wait_for_roles(
         if check(current):
             return current
         assert time.monotonic() < deadline, f"timed out waiting for {what}: {current}"
-        time.sleep(10)
+        time.sleep(5)
 
 
 def database_members(current: dict[str, set[str]]) -> set[str]:
@@ -183,7 +183,7 @@ def test_spare_role_holder_is_promoted(juju: jubilant.Juju) -> None:
     deadline = time.monotonic() + ROLE_TIMEOUT_IN_SECONDS
     while any(member["status"] != "Online" for member in lxd_members(juju).values()):
         assert time.monotonic() < deadline, lxd_members(juju)
-        time.sleep(10)
+        time.sleep(5)
     for unit in unit_names(juju):
         run_update_status(juju, unit)
     wait_active(juju, recovering=True)
