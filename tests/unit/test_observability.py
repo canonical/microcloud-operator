@@ -324,6 +324,7 @@ def _all_rules() -> list[dict]:
 class TestAlertRules:
     def test_rule_files(self):
         assert sorted(p.name for p in _RULES_DIR.iterdir()) == [
+            "lxd.rules",
             "microceph.rules",
             "microovn.rules",
         ]
