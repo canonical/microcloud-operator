@@ -54,9 +54,9 @@ rules before the tests, which load them the way the `cos_agent` library does. Al
 The suite deploys a multi-unit, **LXD-only MicroCloud** (MicroCeph and MicroOVN are disabled by
 setting their snap channels to the empty string) and asserts that the charm forms the cluster and
 that MicroCloud, LXD and the Juju units all agree on membership. It also checks repeated
-status actions on every unit. A separate model tests invalid configuration before bootstrap,
-correction through `juju config`, and repeated configuration failure/recovery after bootstrap
-without changing cluster membership.
+status actions on every unit. The same model starts with invalid configuration, which blocks
+before bootstrap until `juju config` corrects it, and ends by breaking the configuration again and
+checking the cluster recovers without changing membership.
 
 `test_control_plane.py` grows a three unit cluster by adding two units at once with
 `juju add-unit`, then moves LXD's control-plane role between them. MicroCloud can only add systems
