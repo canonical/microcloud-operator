@@ -58,9 +58,10 @@ status actions on every unit. A separate model tests invalid configuration befor
 correction through `juju config`, and repeated configuration failure/recovery after bootstrap
 without changing cluster membership.
 
-A third model grows a two unit cluster by adding two units at once with `juju add-unit`.
-MicroCloud can only add systems to a cluster that runs MicroCeph, so that model enables MicroCeph
-without Ceph disks, which still fits in containers. Every model also checks that no join session,
+`test_control_plane.py` grows a three unit cluster by adding two units at once with
+`juju add-unit`, then moves LXD's control-plane role between them. MicroCloud can only add systems
+to a cluster that runs MicroCeph, so that model enables MicroCeph without Ceph disks, which still
+fits in containers. Every model also checks that no join session,
 worker or passphrase is left behind once the cluster has converged.
 
 `test_multi_app.py` joins member applications to an orchestrator's cluster, again with MicroCeph

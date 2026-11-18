@@ -28,6 +28,7 @@ from tests.integration.helpers import (
     machine_zones,
     member_addresses,
     run_action,
+    run_update_status,
     snap_installed,
     ssh,
     unit_hostnames,
@@ -156,14 +157,7 @@ def test_failure_domain_is_restored(juju: jubilant.Juju) -> None:
     ssh(juju, unit, f"sudo lxc cluster failure-domain set {hostname} not-{zone}")
     assert lxd_members(juju)[hostname]["failure_domain"] == f"not-{zone}"
 
-    charm_dir = f"/var/lib/juju/agents/unit-{unit.replace('/', '-')}/charm"
-    juju.cli(
-        "exec",
-        "--unit",
-        unit,
-        "--",
-        f"JUJU_DISPATCH_PATH=hooks/update-status {charm_dir}/dispatch",
-    )
+    run_update_status(juju, unit)
 
     assert lxd_members(juju)[hostname]["failure_domain"] == zone
 

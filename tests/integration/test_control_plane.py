@@ -1,95 +1,58 @@
-"""Assigning LXD's control-plane role with the charm's actions.
+"""Growing a formed cluster, and LXD's control-plane role.
 
-Growing the cluster needs MicroCeph, so this module deploys it without disks,
-as test_grow.py does. Tests share one model and run in file order: 3 units
-take the role, a fourth joins as a spare, then takes the role and stands in
-for a stopped voter. The charm's failure-domain write keeps the role, and
-removing roles until 2 holders remain turns the mode off.
+MicroCloud can only add systems to a cluster that runs MicroCeph: without it,
+"microcloud preseed" panics looking up the cluster's Ceph networks. This module
+therefore deploys MicroCeph alongside LXD. No Ceph disks are attached, so the
+units still fit in containers; only MicroCeph's own services run on them.
+
+Tests share one model and run in file order: 3 units form the cluster and
+take the role, then 2 units added at once join it as spares. One of them takes
+the role and stands in for a stopped voter. The charm's failure-domain write
+keeps the role, and removing roles until 2 holders remain turns the mode off.
 """
 
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
 from pathlib import Path
 
 import jubilant
 import pytest
-import yaml
 
 from tests.integration.helpers import (
+    DATABASE_ROLES,
     MICROCLOUD_CHARM,
+    ROLE,
+    ROLE_TIMEOUT_IN_SECONDS,
     as_bool,
+    assert_membership,
+    assert_no_session_state,
+    database_members,
     deploy_microcloud,
     leader_unit,
     lxd_members,
     machine_zones,
+    member_addresses,
+    microceph_config,
+    microceph_members,
+    role_holders,
+    roles,
     run_action,
+    run_update_status,
     ssh,
     unit_hostnames,
     unit_names,
     wait_active,
+    wait_for_roles,
     wait_units_active,
 )
 
 INITIAL_UNITS = 3
-ROLE = "control-plane"
-DATABASE_ROLES = {"database-leader", "database-voter", "database-standby"}
-
-# LXD applies role changes on its heartbeat and marks a member offline after
-# its offline threshold, both well under a minute by default.
-ROLE_TIMEOUT_IN_SECONDS = 5 * 60
-
-
-def microceph_config() -> dict[str, str]:
-    """Enable MicroCeph at the charm's default channel, without CephFS."""
-    options = yaml.safe_load(Path("charmcraft.yaml").read_text())["config"]["options"]
-    return {
-        "snap-channel-microceph": options["snap-channel-microceph"]["default"],
-        "ceph-cephfs": "false",
-    }
-
-
-def roles(juju: jubilant.Juju) -> dict[str, set[str]]:
-    """Map each LXD member to its roles."""
-    return {name: set(member["roles"]) for name, member in lxd_members(juju).items()}
-
-
-def wait_for_roles(
-    juju: jubilant.Juju, check: Callable[[dict[str, set[str]]], bool], what: str
-) -> dict[str, set[str]]:
-    """Poll LXD until ``check`` holds for the members' roles."""
-    deadline = time.monotonic() + ROLE_TIMEOUT_IN_SECONDS
-    while True:
-        current = roles(juju)
-        if check(current):
-            return current
-        assert time.monotonic() < deadline, f"timed out waiting for {what}: {current}"
-        time.sleep(5)
-
-
-def database_members(current: dict[str, set[str]]) -> set[str]:
-    return {name for name, member_roles in current.items() if member_roles & DATABASE_ROLES}
-
-
-def holders(current: dict[str, set[str]]) -> set[str]:
-    return {name for name, member_roles in current.items() if ROLE in member_roles}
+ADDED_UNITS = 2
 
 
 def run_on(juju: jubilant.Juju, units: list[str], action: str) -> list[dict]:
     return [run_action(juju, action, unit) for unit in units]
-
-
-def run_update_status(juju: jubilant.Juju, unit: str) -> None:
-    """Run the update-status hook on ``unit`` now, instead of waiting for Juju."""
-    charm_dir = f"/var/lib/juju/agents/unit-{unit.replace('/', '-')}/charm"
-    juju.cli(
-        "exec",
-        "--unit",
-        unit,
-        "--",
-        f"JUJU_DISPATCH_PATH=hooks/update-status {charm_dir}/dispatch",
-    )
 
 
 def wait_leader_message(juju: jubilant.Juju, message: str) -> None:
@@ -103,8 +66,21 @@ def wait_leader_message(juju: jubilant.Juju, message: str) -> None:
     )
 
 
+def assert_grown(juju: jubilant.Juju, count: int, before: dict[str, str]) -> None:
+    """Check every service agrees on ``count`` members and none were replaced."""
+    assert_membership(juju, count)
+    assert microceph_members(juju) == set(unit_hostnames(juju).values())
+    assert_no_session_state(juju)
+
+    after = member_addresses(juju)
+    assert {name: after.get(name) for name in before} == before, (before, after)
+
+
 @pytest.mark.juju_setup
-def test_deploy(juju: jubilant.Juju, charm_path: Path, constraints: dict[str, str]) -> None:
+def test_deploy_with_microceph(
+    juju: jubilant.Juju, charm_path: Path, constraints: dict[str, str]
+) -> None:
+    """The cluster forms with MicroCeph running on every unit."""
     deploy_microcloud(
         juju,
         charm_path,
@@ -114,6 +90,8 @@ def test_deploy(juju: jubilant.Juju, charm_path: Path, constraints: dict[str, st
     )
     wait_units_active(juju, INITIAL_UNITS)
 
+    assert_grown(juju, INITIAL_UNITS, before={})
+
 
 def test_activation(juju: jubilant.Juju) -> None:
     """3 role holders turn control-plane mode on."""
@@ -122,7 +100,7 @@ def test_activation(juju: jubilant.Juju) -> None:
 
     assert all(as_bool(result["changed"]) for result in results), results
     assert results[-1]["control-plane-mode"] == "active (3 role holders)"
-    assert holders(roles(juju)) == set(unit_hostnames(juju).values())
+    assert role_holders(roles(juju)) == set(unit_hostnames(juju).values())
     assert run_action(juju, "status")["control-plane-mode"] == "active (3 role holders)"
 
 
@@ -134,18 +112,22 @@ def test_idempotency(juju: jubilant.Juju) -> None:
     assert result["control-plane-mode"] == "active (3 role holders)"
 
 
-def test_scale_out_joins_as_spare(juju: jubilant.Juju) -> None:
-    """A member that joins while the mode is on gets no database role."""
-    before = set(unit_names(juju))
-    juju.cli("add-unit", MICROCLOUD_CHARM)
-    wait_units_active(juju, INITIAL_UNITS + 1)
+def test_units_added_at_once_join_as_spares(juju: jubilant.Juju) -> None:
+    """Units added together join the existing cluster, and get no database role."""
+    before = member_addresses(juju)
+    units_before = set(unit_names(juju))
+    count = INITIAL_UNITS + ADDED_UNITS
 
-    [new_unit] = set(unit_names(juju)) - before
-    new_member = unit_hostnames(juju)[new_unit]
+    juju.cli("add-unit", MICROCLOUD_CHARM, "--num-units", str(ADDED_UNITS))
+    wait_units_active(juju, count)
+
+    assert_grown(juju, count, before)
+    hostnames = unit_hostnames(juju)
     current = roles(juju)
-    assert ROLE not in current[new_member], current
-    assert not current[new_member] & DATABASE_ROLES, current
-    assert database_members(current) <= holders(current), current
+    for unit in set(unit_names(juju)) - units_before:
+        assert ROLE not in current[hostnames[unit]], current
+        assert not current[hostnames[unit]] & DATABASE_ROLES, current
+    assert database_members(current) <= role_holders(current), current
 
 
 def test_spare_role_holder_is_promoted(juju: jubilant.Juju) -> None:
@@ -153,7 +135,7 @@ def test_spare_role_holder_is_promoted(juju: jubilant.Juju) -> None:
     leader = leader_unit(juju)
     hostnames = unit_hostnames(juju)
     current = roles(juju)
-    [spare_unit] = [unit for unit, name in hostnames.items() if ROLE not in current[name]]
+    spare_unit = next(unit for unit, name in hostnames.items() if ROLE not in current[name])
     spare = hostnames[spare_unit]
 
     ssh(juju, leader, "sudo lxc config set cluster.max_standby=0")
@@ -161,7 +143,7 @@ def test_spare_role_holder_is_promoted(juju: jubilant.Juju) -> None:
         run_on(juju, [spare_unit], "add-control-plane-role")
         current = wait_for_roles(
             juju,
-            lambda r: len(holders(r)) == 4 and len(database_members(r)) == 3,
+            lambda r: len(role_holders(r)) == 4 and len(database_members(r)) == 3,
             "3 voters among 4 role holders",
         )
         assert spare not in database_members(current), current
@@ -213,7 +195,10 @@ def test_removal_turns_the_mode_off(juju: jubilant.Juju) -> None:
     """Below 3 role holders, members without the role get database roles again."""
     hostnames = unit_hostnames(juju)
     leader = leader_unit(juju)
-    first, second = [unit for unit in unit_names(juju) if unit != leader][:2]
+    current = roles(juju)
+    first, second = [
+        unit for unit in unit_names(juju) if unit != leader and ROLE in current[hostnames[unit]]
+    ][:2]
     demoted = hostnames[first]
 
     # With 3 role holders left the mode stays on, so LXD demotes the first

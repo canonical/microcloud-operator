@@ -2,7 +2,7 @@
 
 All test machines are amd64, so a second application stands in for a second
 architecture. Growing the cluster needs MicroCeph, so every application runs
-it without disks, as test_grow.py does, and the units fit in containers.
+it without disks, as test_control_plane.py does, and the units fit in containers.
 
 Tests share one model and run in file order:
 
@@ -35,22 +35,25 @@ from pathlib import Path
 
 import jubilant
 import pytest
-import yaml
 
 from tests.integration.helpers import (
     DEPLOY_TIMEOUT_IN_SECONDS,
     MICROCLOUD_CHARM,
     agent_lost,
     cluster_members,
+    database_members,
     deploy_microcloud,
     leader_unit,
     lxd_members,
     machine_error,
     member_addresses,
+    microceph_config,
+    roles,
     run_action,
     ssh,
     unit_hostnames,
     unit_names,
+    wait_for_roles,
 )
 
 ORCHESTRATOR = MICROCLOUD_CHARM
@@ -58,19 +61,7 @@ MEMBER = "member"
 ORCHESTRATOR_UNITS = 3
 MEMBER_UNITS = 2
 
-ROLE = "control-plane"
-DATABASE_ROLES = {"database-leader", "database-voter", "database-standby"}
-ROLE_TIMEOUT_IN_SECONDS = 5 * 60
 BLOCKED_TIMEOUT_IN_SECONDS = 10 * 60
-
-
-def microceph_config() -> dict[str, str]:
-    """Enable MicroCeph at the charm's default channel, without CephFS."""
-    options = yaml.safe_load(Path("charmcraft.yaml").read_text())["config"]["options"]
-    return {
-        "snap-channel-microceph": options["snap-channel-microceph"]["default"],
-        "ceph-cephfs": "false",
-    }
 
 
 def relate(juju: jubilant.Juju, member: str = MEMBER, orchestrator: str = ORCHESTRATOR) -> None:
@@ -143,26 +134,6 @@ def assert_one_cluster(juju: jubilant.Juju) -> None:
     lxd = lxd_members(juju)
     assert set(lxd) == hostnames, lxd
     assert all(member["status"] == "Online" for member in lxd.values()), lxd
-
-
-def roles(juju: jubilant.Juju) -> dict[str, set[str]]:
-    return {name: set(member["roles"]) for name, member in lxd_members(juju).items()}
-
-
-def database_members(current: dict[str, set[str]]) -> set[str]:
-    return {name for name, member_roles in current.items() if member_roles & DATABASE_ROLES}
-
-
-def wait_for_roles(
-    juju: jubilant.Juju, check: Callable[[dict[str, set[str]]], bool], what: str
-) -> dict[str, set[str]]:
-    deadline = time.monotonic() + ROLE_TIMEOUT_IN_SECONDS
-    while True:
-        current = roles(juju)
-        if check(current):
-            return current
-        assert time.monotonic() < deadline, f"timed out waiting for {what}: {current}"
-        time.sleep(5)
 
 
 def members_relation_data(juju: jubilant.Juju, member_app: str) -> dict[str, str]:
