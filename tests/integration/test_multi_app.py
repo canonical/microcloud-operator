@@ -40,6 +40,7 @@ import yaml
 from tests.integration.helpers import (
     DEPLOY_TIMEOUT_IN_SECONDS,
     MICROCLOUD_CHARM,
+    agent_lost,
     cluster_members,
     deploy_microcloud,
     leader_unit,
@@ -96,6 +97,7 @@ def wait_apps_active(juju: jubilant.Juju, counts: dict[str, int]) -> None:
         error=lambda status: (
             jubilant.any_error(status, *counts)
             or machine_error(status)
+            or agent_lost(status, *counts)
             or jubilant.any_blocked(status, *counts)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
@@ -118,7 +120,11 @@ def wait_message(
     name = unit if isinstance(unit, str) else unit()
     # One success: a session's messages can pass before a second poll.
     juju.wait(
-        lambda status: check(unit_message(status, name)), timeout=timeout, delay=5, successes=1
+        lambda status: check(unit_message(status, name)),
+        error=lambda status: agent_lost(status, name.split("/")[0]),
+        timeout=timeout,
+        delay=5,
+        successes=1,
     )
     return unit_message(juju.status(), name)
 
@@ -287,7 +293,9 @@ def test_orchestrator_cannot_change_after_the_cluster_formed(juju: jubilant.Juju
     juju.config(ORCHESTRATOR, {"orchestrator": "true"})
     juju.wait(
         lambda status: jubilant.all_active(status, ORCHESTRATOR),
-        error=lambda status: jubilant.any_error(status, ORCHESTRATOR),
+        error=lambda status: (
+            jubilant.any_error(status, ORCHESTRATOR) or agent_lost(status, ORCHESTRATOR)
+        ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
         delay=10,
     )
@@ -336,15 +344,18 @@ def test_member_joins_when_the_orchestrator_leaders_agent_stops(juju: jubilant.J
             lambda status: (
                 len(status.apps[MEMBER].units) == count and jubilant.all_active(status, MEMBER)
             ),
-            error=lambda status: jubilant.any_error(status, MEMBER),
+            error=lambda status: jubilant.any_error(status, MEMBER) or agent_lost(status, MEMBER),
             timeout=DEPLOY_TIMEOUT_IN_SECONDS,
             delay=10,
         )
     finally:
         machine_agent(juju, machine, "start")
 
+    # The stopped agent reads "lost" until it reconnects, so wait for that too.
     juju.wait(
-        lambda status: jubilant.all_active(status, ORCHESTRATOR),
+        lambda status: (
+            jubilant.all_active(status, ORCHESTRATOR) and not agent_lost(status, ORCHESTRATOR)
+        ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
         delay=10,
     )

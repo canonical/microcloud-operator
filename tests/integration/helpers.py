@@ -75,6 +75,20 @@ def machine_error(status: jubilant.Status) -> bool:
     )
 
 
+def agent_lost(status: jubilant.Status, *apps: str) -> bool:
+    """Return True if a unit of ``apps`` has lost its Juju agent.
+
+    Such a unit never settles, so without this a wait runs its full timeout
+    before failing.
+    """
+    return any(
+        unit.juju_status.current == "lost"
+        for app in apps
+        if app in status.apps
+        for unit in status.apps[app].units.values()
+    )
+
+
 def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
     """Wait for convergence, allowing an old blocked status during recovery."""
     juju.wait(
@@ -84,6 +98,7 @@ def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
         error=lambda status: (
             jubilant.any_error(status, MICROCLOUD_CHARM)
             or machine_error(status)
+            or agent_lost(status, MICROCLOUD_CHARM)
             or (not recovering and jubilant.any_blocked(status, MICROCLOUD_CHARM))
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
@@ -212,6 +227,7 @@ def wait_units_active(juju: jubilant.Juju, count: int) -> None:
         error=lambda status: (
             jubilant.any_error(status, MICROCLOUD_CHARM)
             or machine_error(status)
+            or agent_lost(status, MICROCLOUD_CHARM)
             or jubilant.any_blocked(status, MICROCLOUD_CHARM)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,

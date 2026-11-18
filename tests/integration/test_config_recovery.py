@@ -14,6 +14,7 @@ import pytest
 from tests.integration.helpers import (
     DEPLOY_TIMEOUT_IN_SECONDS,
     MICROCLOUD_CHARM,
+    agent_lost,
     as_bool,
     assert_membership,
     deploy_microcloud,
@@ -44,7 +45,9 @@ def wait_missing_uplink(juju: jubilant.Juju, num_units: int) -> None:
 
     juju.wait(
         blocked,
-        error=lambda status: jubilant.any_error(status, MICROCLOUD_CHARM),
+        error=lambda status: (
+            jubilant.any_error(status, MICROCLOUD_CHARM) or agent_lost(status, MICROCLOUD_CHARM)
+        ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
         delay=10,
     )
