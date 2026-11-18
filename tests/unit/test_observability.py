@@ -17,6 +17,7 @@ from ceph_mgr import CephMgrPrometheus
 from observability import (
     _LXD_METRICS_ADDRESS,
     ALERT_RULES_DIR,
+    DASHBOARD_DIRS,
     LXDConfigError,
     Observability,
     _lxc_config_set,
@@ -296,11 +297,12 @@ class TestScrapeConfigs:
 
 
 # ---------------------------------------------------------------------------
-# Alert rules
+# Alert rules and the cluster overview dashboard
 # ---------------------------------------------------------------------------
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _RULES_DIR = _REPO_ROOT / ALERT_RULES_DIR
+_OVERVIEW = _REPO_ROOT / "src/dashboards/microcloud/microcloud-overview.json"
 _JOB_MATCHER = re.compile(r'job=~"([^"]+)"')
 
 
@@ -376,3 +378,31 @@ class TestAlertRules:
         assert patterns
         for pattern in patterns:
             assert any(re.fullmatch(pattern, job) for job in renamed), pattern
+
+
+class TestOverviewDashboard:
+    def _dashboard(self) -> dict:
+        return json.loads(_OVERVIEW.read_text())
+
+    def test_directory_is_bundled(self):
+        assert "./src/dashboards/microcloud" in DASHBOARD_DIRS
+
+    def test_tags_and_title(self):
+        dashboard = self._dashboard()
+        assert "microcloud" in dashboard["tags"]
+        assert dashboard["title"]
+
+    def test_uses_the_prometheus_datasource_variable(self):
+        dashboard = self._dashboard()
+        variables = {v["name"]: v for v in dashboard["templating"]["list"]}
+        assert variables["prometheusds"]["type"] == "datasource"
+        assert variables["prometheusds"]["query"] == "prometheus"
+        for panel in dashboard["panels"]:
+            assert panel["datasource"]["uid"] == "${prometheusds}", panel["title"]
+            for target in panel["targets"]:
+                assert target["datasource"]["uid"] == "${prometheusds}", panel["title"]
+                assert target["expr"], panel["title"]
+
+    def test_panel_ids_are_unique(self):
+        ids = [panel["id"] for panel in self._dashboard()["panels"]]
+        assert len(ids) == len(set(ids))
