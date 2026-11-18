@@ -1,98 +1,149 @@
 #!/usr/bin/env python3
+# Copyright 2026 Canonical Ltd.
+# See LICENSE file for licensing details.
 
-"""Fetch upstream Prometheus alert rules at charmcraft pack time.
+"""Fetch the upstream MicroCeph and MicroOVN alert rules at charmcraft pack time.
 
-This script fetches Prometheus alert rule YAML files and writes them into
-src/prometheus_alert_rules/{microceph,microovn}/.
+charmcraft.yaml runs this before ``craftctl default``, and ``tox -e unit``
+runs it before the tests. It downloads the rules from the upstream charms at
+pinned commits, applies the changes listed in RULES and writes them to
+src/prometheus_alert_rules/, where cos_agent picks them up. The generated
+files are not committed; src/prometheus_alert_rules/lxd.rules is, since it is
+written for this charm.
 
-The alert rule YAML files are NOT committed to the repository.
+Every change names what it expects to find upstream. If a bump removes a
+dropped group or changes a rewritten expression, the script fails instead of
+shipping rules nobody has checked.
 
-Sources
--------
-Alert rule sources:
-* MicroCeph
-    https://github.com/canonical/charm-microceph/blob/{rev}/files/prometheus_alert_rules/prometheus_alerts.yaml
-* MicroOVN
-    https://github.com/canonical/microovn-operator/blob/{rev}/src/prometheus_alert_rules/alerts.yaml
+Bump the commits below to pick up upstream changes.
 """
 
 import pathlib
+import re
 import sys
 import urllib.error
 import urllib.request
 
-# ---------------------------------------------------------------------------
-# Pinned upstream revisions
-# ---------------------------------------------------------------------------
+import yaml
 
-# Commits in the upstream charm repositories.
-MICROCEPH_REF = "9e8e20aadd5cf8434cd24bb1b6770f3b1f7a2205"
-MICROOVN_REF = "eeb85d826a3602e3fb6bddeead9d2788d83d914e"
+MICROCEPH_REF = "12fc92d24d9caa971b3ab03c1cd529906038370d"
+MICROOVN_REF = "950a4126d4e7286b6909242fb7c2267f5dffb34e"
 
-# ---------------------------------------------------------------------------
-# Alert rule catalogue
-# ---------------------------------------------------------------------------
-
-# Each entry: (destination_filename, url)
-ALERT_RULES: dict[str, list[tuple[str, str]]] = {
-    "microceph": [
-        (
-            "prometheus_alerts.yaml",
-            f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}/files/prometheus_alert_rules/prometheus_alerts.yaml",
+# Each file: its source, the groups to drop with why, and the expressions to
+# rewrite as {alert: (upstream expression, replacement)}.
+RULES = {
+    "microceph.rules": {
+        "url": (
+            f"https://raw.githubusercontent.com/canonical/charm-microceph/{MICROCEPH_REF}"
+            "/files/prometheus_alert_rules/prometheus_alerts.yaml"
         ),
-    ],
-    "microovn": [
-        (
-            "alerts.yaml",
-            f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}/src/prometheus_alert_rules/alerts.yaml",
+        "drop_groups": {
+            "cephadm": "MicroCeph does not use cephadm.",
+            "PrometheusServer": "COS ships its own scrape-target alerts.",
+            "rgwmultisite": "MicroCloud does not deploy RADOS Gateway.",
+        },
+        "exprs": {
+            # Upstream matches every target, which here includes the LXD and
+            # OVN jobs. cos_agent renames jobs to <app>_<job>_<hash>.
+            "CephMgrPrometheusModuleInactive": (
+                "up{} == 0",
+                'up{job=~".*_microcloud-microceph_.*"} == 0',
+            ),
+        },
+    },
+    "microovn.rules": {
+        "url": (
+            f"https://raw.githubusercontent.com/canonical/microovn-operator/{MICROOVN_REF}"
+            "/src/prometheus_alert_rules/alerts.yaml"
         ),
-    ],
+        "drop_groups": {},
+        "exprs": {},
+    },
 }
+
+# A bare up{} fires for every scrape job of the application, not just one service.
+_BARE_UP = re.compile(r"\bup\{\s*\}")
+
+
+class RulesError(Exception):
+    """Raised when the upstream rules are not what the changes expect."""
+
+
+def transform(data: dict, drop_groups: dict[str, str], exprs: dict[str, tuple[str, str]]) -> dict:
+    """Return ``data`` with ``drop_groups`` removed and ``exprs`` rewritten."""
+    groups = data.get("groups") if isinstance(data, dict) else None
+    if not groups:
+        raise RulesError("no rule groups")
+
+    missing = set(drop_groups) - {group.get("name") for group in groups}
+    if missing:
+        raise RulesError(f"groups to drop not found upstream: {', '.join(sorted(missing))}")
+    groups = [group for group in groups if group.get("name") not in drop_groups]
+
+    pending = dict(exprs)
+    for group in groups:
+        for rule in group.get("rules", []):
+            alert = rule.get("alert")
+            if alert in pending:
+                old, new = pending.pop(alert)
+                if rule.get("expr") != old:
+                    raise RulesError(
+                        f"{alert}: upstream expression is now {rule.get('expr')!r}, not {old!r}"
+                    )
+                rule["expr"] = new
+            if _BARE_UP.search(str(rule.get("expr", ""))):
+                raise RulesError(f"{alert}: up{{}} matches every scrape job")
+    if pending:
+        raise RulesError(f"rules to rewrite not found upstream: {', '.join(sorted(pending))}")
+
+    return {"groups": groups}
+
+
+def render(url: str, data: dict, drop_groups: dict[str, str], exprs: dict) -> str:
+    """Return the rules file: a header naming the source and changes, then the rules."""
+    lines = [
+        "# Generated by tools/fetch-alert-rules.py at pack time. Do not edit or commit.",
+        f"# Source: {url}",
+    ]
+    for name, reason in drop_groups.items():
+        lines.append(f"# Dropped group {name}: {reason}")
+    for alert in exprs:
+        lines.append(f"# Rewritten expression: {alert}")
+    body = yaml.safe_dump(data, sort_keys=False, width=1000, allow_unicode=True)
+    return "\n".join(lines) + "\n\n" + body
 
 
 def fetch(url: str) -> bytes:
-    req = urllib.request.Request(url)
-    with urllib.request.urlopen(req, timeout=30) as resp:
-        return resp.read()
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "charmcraft-fetch-alert-rules/1.0"}
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return response.read()
 
 
 def main() -> None:
-    # The script is called from the charmcraft source directory.
-    src_dir = pathlib.Path(__file__).parent.parent / "src" / "prometheus_alert_rules"
+    dest_dir = pathlib.Path(__file__).resolve().parent.parent / "src" / "prometheus_alert_rules"
+    dest_dir.mkdir(parents=True, exist_ok=True)
 
-    errors: list[str] = []
-    total = 0
-
-    for service, entries in ALERT_RULES.items():
-        dest_dir = src_dir / service
-        dest_dir.mkdir(parents=True, exist_ok=True)
-
-        # Remove any stale files (e.g. .gitkeep placeholders) that would
-        # confuse cos_agent's AlertRules.add_path() at runtime.
-        for stale in dest_dir.iterdir():
-            if not stale.name.endswith((".yaml", ".yml")):
-                stale.unlink()
-                print(f"  removed {stale}")
-
-        for filename, url in entries:
-            dest = dest_dir / filename
-            print(f"  fetching {url}", flush=True)
-            try:
-                raw = fetch(url)
-            except urllib.error.URLError as exc:
-                errors.append(f"{service}/{filename}: {exc}")
-                continue
-
-            dest.write_bytes(raw)
-            total += 1
+    errors = []
+    for filename, spec in RULES.items():
+        url = spec["url"]
+        print(f"  fetching {url}", flush=True)
+        try:
+            data = yaml.safe_load(fetch(url))
+            data = transform(data, spec["drop_groups"], spec["exprs"])
+        except (urllib.error.URLError, yaml.YAMLError, RulesError) as exc:
+            errors.append(f"{filename}: {exc}")
+            continue
+        (dest_dir / filename).write_text(render(url, data, spec["drop_groups"], spec["exprs"]))
 
     if errors:
         print("\nERROR: failed to fetch the following alert rules:", file=sys.stderr)
-        for e in errors:
-            print(f"  {e}", file=sys.stderr)
+        for error in errors:
+            print(f"  {error}", file=sys.stderr)
         sys.exit(1)
 
-    print(f"\nFetched {total} alert rule files into {src_dir}")
+    print(f"\nFetched {len(RULES)} alert rule files into {dest_dir}")
 
 
 if __name__ == "__main__":

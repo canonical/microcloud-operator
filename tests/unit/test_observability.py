@@ -4,13 +4,19 @@
 """Unit tests for metrics endpoints, scrape jobs and LXD log streaming."""
 
 import json
+import re
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock, call, patch
 
 import pytest
+from cosl import JujuTopology
+from cosl.rules import AlertRules
 
+from ceph_mgr import CephMgrPrometheus
 from observability import (
     _LXD_METRICS_ADDRESS,
+    ALERT_RULES_DIR,
     LXDConfigError,
     Observability,
     _lxc_config_set,
@@ -287,3 +293,85 @@ class TestScrapeConfigs:
 
     def test_cluster_label_falls_back_to_app_name(self):
         assert self._observability(_CONFIG)._cluster_label() == "microcloud"
+
+
+# ---------------------------------------------------------------------------
+# Alert rules
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_RULES_DIR = _REPO_ROOT / ALERT_RULES_DIR
+_JOB_MATCHER = re.compile(r'job=~"([^"]+)"')
+
+
+def _load_rules() -> list[dict]:
+    """Load the rule groups the way cos_agent does, with this charm's topology."""
+    topology = JujuTopology(
+        model="test",
+        model_uuid="00000000-0000-4000-8000-000000000000",
+        application="microcloud",
+        charm_name="microcloud",
+    )
+    rules = AlertRules(query_type="promql", topology=topology)
+    rules.add_path(_RULES_DIR)
+    return rules.as_dict()["groups"]
+
+
+def _all_rules() -> list[dict]:
+    return [rule for group in _load_rules() for rule in group["rules"]]
+
+
+class TestAlertRules:
+    def test_rule_files(self):
+        assert sorted(p.name for p in _RULES_DIR.iterdir()) == [
+            "microceph.rules",
+            "microovn.rules",
+        ]
+
+    def test_every_file_loads_groups(self):
+        groups = _load_rules()
+        assert groups
+        for group in groups:
+            assert group["rules"], f"group {group['name']} has no rules"
+
+    def test_rules_are_complete(self):
+        for rule in _all_rules():
+            name = rule.get("alert")
+            assert name, f"rule without an alert name: {rule}"
+            assert rule.get("expr"), f"{name} has no expr"
+            assert rule["labels"].get("severity") in {"critical", "warning", "info"}, name
+            assert rule.get("annotations", {}).get("summary"), f"{name} has no summary"
+
+    def test_alert_names_are_unique(self):
+        names = [rule["alert"] for rule in _all_rules()]
+        duplicates = {name for name in names if names.count(name) > 1}
+        assert not duplicates
+
+    def test_rules_carry_juju_topology(self):
+        for rule in _all_rules():
+            assert rule["labels"].get("juju_application") == "microcloud", rule["alert"]
+
+    def test_removed_ceph_groups_stay_out(self):
+        names = {rule["alert"] for rule in _all_rules()}
+        assert not {n for n in names if n.startswith(("Cephadm", "CephRGWMultisite"))}
+        assert "PrometheusJobMissing" not in names
+
+    def test_no_rule_matches_every_target(self):
+        # A bare up{} would fire for every scrape job of this application.
+        for rule in _all_rules():
+            assert not re.search(r"\bup\{\s*\}", rule["expr"]), rule["alert"]
+
+    def test_job_matchers_match_the_renamed_jobs(self):
+        # cos_agent renames each job to <app>_<job>_<hash>; the rules must still match it.
+        with (
+            patch("observability.snap.is_installed", return_value=True),
+            patch("observability.subprocess.run", return_value=MagicMock(returncode=1, stdout="")),
+            patch.object(CephMgrPrometheus, "is_mgr_active", return_value=True),
+        ):
+            jobs = [c["job_name"] for c in Observability(_CONFIG, "microcloud").scrape_configs()]
+        renamed = [f"microcloud_{job}_0123abcd" for job in jobs]
+
+        patterns = [p for rule in _all_rules() for p in _JOB_MATCHER.findall(rule["expr"])]
+        assert patterns
+        for pattern in patterns:
+            assert any(re.fullmatch(pattern, job) for job in renamed), pattern
