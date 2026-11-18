@@ -106,6 +106,20 @@ def server_version() -> tuple[str, set[str]]:
     return environment.get("server_version", ""), set(server.get("api_extensions") or [])
 
 
+def server_config() -> dict[str, str]:
+    """Return the server configuration this member sees, cluster-wide keys included."""
+    server = _query("/1.0")
+    config = server.get("config") if isinstance(server, dict) else None
+    if not isinstance(config, dict):
+        raise LXDClusterError("Unexpected response for /1.0: no config")
+    return {str(key): str(value) for key, value in config.items()}
+
+
+def update_server_config(changes: dict[str, str]) -> None:
+    """Set server configuration keys, leaving the others alone. An empty value unsets one."""
+    _query("/1.0", "PATCH", {"config": changes})
+
+
 def storage_pools() -> dict[str, set[str]]:
     """Return every storage pool's name and the members it is created on."""
     pools = _query("/1.0/storage-pools?recursion=1")
