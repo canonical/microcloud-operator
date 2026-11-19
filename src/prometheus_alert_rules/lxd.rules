@@ -1,0 +1,113 @@
+# LXD and MicroCloud cluster alert rules.
+#
+# Written for this charm. The metrics come from LXD's /1.0/metrics endpoint, scraped
+# by the microcloud-lxd job, which labels every series with microcloud_cluster and
+# microcloud_member (see Observability.scrape_configs).
+#
+# cos_agent renames scrape jobs to <app>_<job>_<hash>, so rules that select on job
+# use a regex. It also adds Juju topology matchers to every expression when it loads
+# this file. Every member reports the replicator series, which come from the cluster
+# database, so those rules aggregate across members to fire once per replicator.
+
+groups:
+  - name: "microcloud-cluster"
+    rules:
+      - alert: "MicroCloudLXDMetricsDown"
+        expr: 'up{job=~".*_microcloud-lxd_.*"} == 0'
+        for: "5m"
+        labels:
+          severity: "critical"
+        annotations:
+          summary: "LXD metrics are unreachable on {{ $labels.microcloud_member }}"
+          description: >-
+            The LXD metrics endpoint on cluster member {{ $labels.microcloud_member }} of
+            {{ $labels.microcloud_cluster }} has not answered for 5 minutes. The LXD daemon may
+            be down or core.metrics_address may have been changed. Check
+            'snap services lxd' and 'lxc config get core.metrics_address' on the member.
+
+      - alert: "MicroCloudMemberMetricsMissing"
+        expr: >-
+          count by (juju_model, juju_model_uuid, juju_application, microcloud_cluster) (lxd_uptime_seconds offset 1h)
+          >
+          (
+            count by (juju_model, juju_model_uuid, juju_application, microcloud_cluster) (lxd_uptime_seconds)
+            or
+            count by (juju_model, juju_model_uuid, juju_application, microcloud_cluster) (lxd_uptime_seconds offset 1h) * 0
+          )
+        for: "10m"
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "Fewer MicroCloud members are reporting than an hour ago"
+          description: >-
+            {{ $labels.microcloud_cluster }} has fewer members reporting LXD metrics than it had an
+            hour ago. A member may be down, or its telemetry agent may have stopped. This also fires
+            for up to an hour after a member is removed on purpose.
+
+  - name: "microcloud-lxd"
+    rules:
+      - alert: "MicroCloudLXDRestarted"
+        expr: "resets(lxd_uptime_seconds[15m]) > 0"
+        labels:
+          severity: "info"
+        annotations:
+          summary: "LXD restarted on {{ $labels.microcloud_member }}"
+          description: >-
+            The LXD daemon on {{ $labels.microcloud_member }} restarted in the last 15 minutes.
+            This is expected during a snap refresh or a host reboot. If it keeps happening, check
+            'snap logs lxd' on the member.
+
+      - alert: "MicroCloudLXDWarnings"
+        expr: "lxd_warnings_total > 0"
+        for: "30m"
+        labels:
+          severity: "info"
+        annotations:
+          summary: "LXD has {{ $value }} active warnings on {{ $labels.microcloud_member }}"
+          description: >-
+            Cluster member {{ $labels.microcloud_member }} has had active LXD warnings for 30
+            minutes. List them with 'lxc warning list'.
+
+      - alert: "MicroCloudLXDOngoingRequestsHigh"
+        expr: >-
+          sum by (juju_model, juju_model_uuid, juju_application, microcloud_cluster, microcloud_member) (lxd_api_requests_ongoing)
+          > 100
+        for: "10m"
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "LXD API requests are piling up on {{ $labels.microcloud_member }}"
+          description: >-
+            More than 100 LXD API requests have been in flight on {{ $labels.microcloud_member }}
+            for 10 minutes. The daemon may be stuck on storage, the network or the cluster
+            database. Check 'lxc operation list' and 'snap logs lxd'.
+
+  - name: "microcloud-replicators"
+    rules:
+      - alert: "MicroCloudReplicatorFailed"
+        expr: >-
+          max by (juju_model, juju_model_uuid, juju_application, microcloud_cluster, project, name) (lxd_replicator_last_run_status{status="failed"})
+          == 1
+        for: "5m"
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "Replicator {{ $labels.project }}/{{ $labels.name }} failed its last run"
+          description: >-
+            The last run of replicator {{ $labels.name }} in project {{ $labels.project }} on
+            {{ $labels.microcloud_cluster }} failed. Check 'lxc replicator show {{ $labels.name }}
+            --project {{ $labels.project }}'.
+
+      - alert: "MicroCloudReplicatorStale"
+        expr: >-
+          time() - max by (juju_model, juju_model_uuid, juju_application, microcloud_cluster, project, name) (lxd_replicator_last_success_timestamp > 0)
+          > 86400
+        for: "30m"
+        labels:
+          severity: "warning"
+        annotations:
+          summary: "Replicator {{ $labels.project }}/{{ $labels.name }} has not succeeded for a day"
+          description: >-
+            Replicator {{ $labels.name }} in project {{ $labels.project }} on
+            {{ $labels.microcloud_cluster }} last completed successfully
+            {{ $value | humanizeDuration }} ago, so the recovery point is more than a day old.

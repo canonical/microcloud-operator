@@ -17,6 +17,11 @@ src/dashboards/lxd/
 src/dashboards/microceph/
 src/dashboards/microovn/
 
+# Created at charmcraft pack time, and by tox -e unit, by tools/fetch-alert-rules.py.
+# lxd.rules is written for this charm and committed.
+src/prometheus_alert_rules/microceph.rules
+src/prometheus_alert_rules/microovn.rules
+
 # Terraform
 .terraform/
 .terraform.lock.hcl

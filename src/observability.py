@@ -21,11 +21,13 @@ from ovn_exporter import OVNExporter, OVNExporterError
 
 logger = logging.getLogger(__name__)
 
-# Dashboard JSON directories — one per service.
+# Dashboard JSON directories. The per-service ones are fetched at pack time by
+# tools/fetch-dashboards.py; "microcloud" holds the committed cluster overview.
 DASHBOARD_DIRS = [
     "./src/dashboards/lxd",
     "./src/dashboards/microceph",
     "./src/dashboards/microovn",
+    "./src/dashboards/microcloud",
 ]
 ALERT_RULES_DIR = "./src/prometheus_alert_rules"
 

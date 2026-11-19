@@ -29,6 +29,26 @@ Build the charm in this git repository using:
 charmcraft pack
 ```
 
+## Dashboards and alert rules
+
+The charm sends its dashboards and Prometheus alert rules to COS over the `cos-agent` relation.
+
+- `tools/fetch-dashboards.py` downloads the LXD, MicroCeph and MicroOVN dashboards at pack time,
+  from the pinned revisions listed in the script. They are not committed.
+- `src/dashboards/microcloud/microcloud-overview.json` is the committed cluster overview. Its
+  queries use the `${prometheusds}` datasource variable and the `microcloud_cluster` label.
+- `tools/fetch-alert-rules.py` downloads the MicroCeph and MicroOVN alert rules at pack time, from
+  the pinned commits listed in the script, into `src/prometheus_alert_rules/`. It drops the groups
+  that cannot fire on a MicroCloud and rewrites one expression, as listed in the script. They are
+  not committed.
+- `src/prometheus_alert_rules/lxd.rules` is written for this charm and committed.
+
+To pick up upstream rule changes, bump the commit in `tools/fetch-alert-rules.py`. Each change
+names what it expects upstream, so the script fails if a bump removes a dropped group or changes a
+rewritten expression; review the upstream change and update the script. `tox -e unit` fetches the
+rules before the tests, which load them the way the `cos_agent` library does. Also check them with
+`promtool check rules src/prometheus_alert_rules/*.rules`.
+
 ## Integration tests
 
 The suite deploys a multi-unit, **LXD-only MicroCloud** (MicroCeph and MicroOVN are disabled by
