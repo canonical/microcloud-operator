@@ -262,6 +262,40 @@ config:
         receive the Ceph configuration and keyring and LXD can use the
         remote storage pool. An empty value allows no OSDs on any unit.
 
+    ceph-public-numa-networks:
+      type: string
+      default: ""
+      description: >
+        JSON or YAML map of NUMA node to the IPv6 /64 that holds each host's
+        Ceph public address for the OSDs on that node, for example
+        '{"0": "fd00:0:0:401::/64", "1": "fd00:0:0:402::/64"}'. Set it
+        together with ceph-internal-numa-networks, for the same NUMA nodes;
+        both empty turns NUMA steering off.
+
+
+        The machine's deployment puts one address per NUMA node and Ceph
+        network on "lo", inside these /64s, and routes it through the network
+        card on that node; the charm manages no addresses or routes for it.
+        On each unit, the address on "lo" inside a node's /64 is that node's
+        steered address. Each OSD whose disk is on a node with steered
+        addresses binds them as public_addr and cluster_addr and is pinned to
+        the node with osd_numa_node; any other OSD binds the unsteered
+        addresses of ceph-public-network and ceph-internal-network. A disk
+        with no NUMA information counts as node 0. Every OSD also gets
+        ms_bind_before_connect, so that outgoing connections leave from the
+        bound address. OSDs whose options change are restarted one at a time.
+        A unit whose host has no steered address at all reports "NUMA
+        steering disabled" in its status. No /64 may overlap another one or
+        ceph-public-network or ceph-internal-network.
+
+    ceph-internal-numa-networks:
+      type: string
+      default: ""
+      description: >
+        JSON or YAML map of NUMA node to the IPv6 /64 that holds each host's
+        Ceph cluster address for the OSDs on that node. The counterpart of
+        ceph-public-numa-networks for cluster_addr; see that option.
+
     storage-wipe:
       type: boolean
       default: true
