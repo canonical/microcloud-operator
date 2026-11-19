@@ -272,6 +272,104 @@ class TestChanges:
         }
 
 
+class TestOutsidePublicNetwork:
+    WANTED = [
+        Binding(1, "fd00:0:0:401::6", "fd00:0:0:301::6", 0),
+        Binding(2, "fd00:0:0:400::6", "fd00:0:0:300::6"),
+    ]
+
+    def test_the_unsteered_network_alone_leaves_the_steered_addresses_out(self):
+        networks = [ipaddress.IPv6Network("fd00:0:0:400::/64")]
+        assert steering.outside_public_network(self.WANTED, networks) == ["fd00:0:0:401::6"]
+
+    @pytest.mark.parametrize(
+        "networks",
+        [
+            ["fd00:0:0:400::/56"],
+            ["fd00:0:0:400::/64", "fd00:0:0:401::/64"],
+            [],
+        ],
+    )
+    def test_covered_or_unchecked(self, networks):
+        networks = [ipaddress.IPv6Network(n) for n in networks]
+        assert steering.outside_public_network(self.WANTED, networks) == []
+
+    def test_inside_keeps_the_cluster_address_and_numa_node(self):
+        networks = [ipaddress.IPv6Network("fd00:0:0:400::/64")]
+        wanted, outside = steering.inside_public_network(self.WANTED, networks, "fd00:0:0:400::6")
+        assert outside == ["fd00:0:0:401::6"]
+        assert wanted == [
+            Binding(1, "fd00:0:0:400::6", "fd00:0:0:301::6", 0),
+            Binding(2, "fd00:0:0:400::6", "fd00:0:0:300::6"),
+        ]
+
+    def test_inside_changes_nothing_when_covered(self):
+        networks = [ipaddress.IPv6Network("fd00:0:0:400::/56")]
+        wanted, outside = steering.inside_public_network(self.WANTED, networks, "fd00:0:0:400::6")
+        assert (wanted, outside) == (self.WANTED, [])
+
+
+class TestDaemonPins:
+    PUBLIC = "fd00:0:0:400::6"
+
+    def test_a_daemon_on_a_steered_address_is_pinned_and_restarted(self):
+        running = {"mgr": "-", "mds": "v2:[fd00:0:0:402::6]:0/0"}
+        assert steering.daemon_pins("node1", self.PUBLIC, {}, running) == (
+            ["mgr", "mds"],
+            ["mgr", "mds"],
+        )
+
+    def test_a_pinned_daemon_that_has_not_restarted_is_only_restarted(self):
+        dump = {"mgr.node1": {"public_addr": "v2:[fd00:0:0:400::6]:0/0"}}
+        assert steering.daemon_pins("node1", self.PUBLIC, dump, {"mgr": "-"}) == ([], ["mgr"])
+
+    def test_daemons_that_do_not_run_here_are_left_alone(self):
+        assert steering.daemon_pins("node1", self.PUBLIC, {}, {"mgr": None}) == ([], [])
+
+    def test_running_public_addr(self):
+        done = _completed("v2:[fd00:0:0:400::6]:0/0\n")
+        with patch("steering.subprocess.run", return_value=done) as run:
+            assert steering.running_public_addr("mgr.node1") == "v2:[fd00:0:0:400::6]:0/0"
+        assert list(run.call_args.args[0]) == [
+            "microceph.ceph",
+            "config",
+            "show",
+            "mgr.node1",
+            "public_addr",
+        ]
+
+    def test_running_public_addr_of_a_daemon_that_is_not_running(self):
+        done = subprocess.CompletedProcess([], 2, "", "no such daemon")
+        with patch("steering.subprocess.run", return_value=done):
+            assert steering.running_public_addr("mds.node1") is None
+
+
+class TestPublicNetworks:
+    def test_reads_a_list(self):
+        done = _completed("fd00:0:0:400::/64, fd00:0:0:401::/64\n")
+        with patch("steering.subprocess.run", return_value=done) as run:
+            assert steering.public_networks() == [
+                ipaddress.IPv6Network("fd00:0:0:400::/64"),
+                ipaddress.IPv6Network("fd00:0:0:401::/64"),
+            ]
+        assert list(run.call_args.args[0]) == [
+            "microceph.ceph",
+            "config",
+            "get",
+            "osd",
+            "public_network",
+        ]
+
+    def test_unset(self):
+        with patch("steering.subprocess.run", return_value=_completed("\n")):
+            assert steering.public_networks() == []
+
+    def test_ipv4_is_an_error(self):
+        with patch("steering.subprocess.run", return_value=_completed("10.0.0.0/24\n")):
+            with pytest.raises(SteeringError, match="is not IPv6"):
+                steering.public_networks()
+
+
 def _completed(stdout="", returncode=0):
     return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr="")
 
