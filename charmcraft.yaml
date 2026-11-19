@@ -288,6 +288,15 @@ config:
         steering disabled" in its status. No /64 may overlap another one or
         ceph-public-network or ceph-internal-network.
 
+
+        Ceph reports an OSD whose public address is outside its
+        public_network as unreachable, and public_network is fixed when the
+        cluster forms. While it does not cover these /64s, the OSDs keep the
+        unsteered public address, still bind their steered cluster address,
+        and the status says so. Once it covers them, the Ceph manager and
+        metadata server on each unit are pinned to the unsteered public
+        address.
+
     ceph-internal-numa-networks:
       type: string
       default: ""

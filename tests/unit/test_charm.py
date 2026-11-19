@@ -3963,6 +3963,8 @@ class TestOsdSteering:
         ok_to_stop=True,
         dump_error=None,
         bind_address="fd00:0:0:1::6",
+        public_networks=("fd00:0:0:400::/64", "fd00:0:0:401::/64", "fd00:0:0:402::/64"),
+        daemons=None,
     ):
         import ipaddress
         from unittest.mock import MagicMock
@@ -3986,6 +3988,7 @@ class TestOsdSteering:
         disks = {1: "/dev/a", 2: "/dev/b"} if disks is None else disks
         present = self.PRESENT if present is None else present
         dump = {f"osd.{osd}": options for osd, options in (current or {}).items()}
+        public_networks = [ipaddress.IPv6Network(n) for n in public_networks]
 
         with (
             patch("charm.microcloud.hostname", return_value="node1"),
@@ -4003,6 +4006,7 @@ class TestOsdSteering:
                 "charm.steering.config_dump",
                 **({"side_effect": dump_error} if dump_error else {"return_value": dump}),
             ),
+            patch("charm.steering.public_networks", return_value=public_networks),
             patch("charm.steering.ensure_bind_before_connect") as ensure_bind,
             patch("charm.steering.runs_bind_before_connect", return_value=running),
             patch("charm.steering.down_osds", return_value=list(down)),
@@ -4013,6 +4017,25 @@ class TestOsdSteering:
             problem = MicroCloudCharm._osd_steering_problem(stub)
         stub.ensure_bind = ensure_bind
         return stub, problem, apply, restart
+
+    def _pins(self, running, dump=None):
+        """Run _pin_public_daemons with ``running`` as each daemon's running public_addr."""
+        from unittest.mock import MagicMock
+
+        from charm import MicroCloudCharm
+
+        with (
+            patch(
+                "charm.steering.running_public_addr",
+                side_effect=lambda who: running.get(who.split(".")[0]),
+            ),
+            patch("charm.steering.pin_daemon") as pin,
+            patch("charm.steering.restart_daemon") as restart,
+        ):
+            MicroCloudCharm._pin_public_daemons(
+                MagicMock(spec=MicroCloudCharm), "node1", "fd00:0:0:400::6", dump or {}
+            )
+        return [c.args[0] for c in pin.call_args_list], [c.args[0] for c in restart.call_args_list]
 
     @pytest.mark.parametrize(
         "config",
@@ -4072,6 +4095,54 @@ class TestOsdSteering:
             {"public_addr": "fd00:0:0:400::6", "cluster_addr": "fd00:0:0:300::6"}
         ] * 2
         assert stub._steering_note == "NUMA steering disabled on node1"
+
+    def test_keeps_public_addresses_that_cephs_public_network_does_not_cover(self):
+        """Ceph raises OSD_UNREACHABLE, a HEALTH_ERR, for an OSD outside public_network."""
+        stub, problem, apply, restart = self._run(public_networks=("fd00:0:0:400::/64",))
+        assert problem is None
+        assert [c.args[1].set for c in apply.call_args_list] == [
+            {
+                "public_addr": "fd00:0:0:400::6",
+                "cluster_addr": "fd00:0:0:301::6",
+                "osd_numa_node": "0",
+            },
+            {
+                "public_addr": "fd00:0:0:400::6",
+                "cluster_addr": "fd00:0:0:302::6",
+                "osd_numa_node": "1",
+            },
+        ]
+        assert stub._steering_note == (
+            "Ceph's public_network does not cover the steered public addresses "
+            "fd00:0:0:401::6, fd00:0:0:402::6"
+        )
+        stub._pin_public_daemons.assert_not_called()
+
+    def test_pins_the_other_daemons_once_public_network_covers_the_numa_subnets(self):
+        stub, problem, _, _ = self._run()
+        assert problem is None
+        stub._pin_public_daemons.assert_called_once_with("node1", "fd00:0:0:400::6", {})
+
+    def test_pins_the_other_daemons_even_without_osds(self):
+        stub, problem, _, _ = self._run(disks={})
+        assert problem is None
+        stub._pin_public_daemons.assert_called_once()
+
+    def test_pinning_sets_and_restarts_the_daemons_on_a_steered_address(self):
+        pinned, restarted = self._pins({"mgr": "-", "mds": "v2:[fd00:0:0:402::6]:0/0"})
+        assert pinned == ["mgr", "mds"]
+        assert restarted == ["mgr", "mds"]
+
+    def test_pinning_leaves_daemons_alone_that_run_with_the_address(self):
+        dump = {"mgr.node1": {"public_addr": "v2:[fd00:0:0:400::6]:0/0"}}
+        pinned, restarted = self._pins({"mgr": "v2:[fd00:0:0:400::6]:0/0"}, dump)
+        assert pinned == []
+        assert restarted == []
+
+    def test_pinning_skips_daemons_that_do_not_run_here(self):
+        pinned, restarted = self._pins({"mds": "-"})
+        assert pinned == ["mds"]
+        assert restarted == ["mds"]
 
     def test_blocks_on_two_addresses_in_a_numa_subnet(self):
         _, problem, apply, restart = self._run(present=[*self.PRESENT, "fd00:0:0:401::7"])

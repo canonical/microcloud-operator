@@ -21,6 +21,14 @@ the unsteered addresses of "ceph-public-network" and "ceph-internal-network"
 without ``osd_numa_node``. It also sets ``ms_bind_before_connect`` for every
 OSD, so that outgoing connections leave from the bound addresses too.
 
+Ceph raises OSD_UNREACHABLE, a HEALTH_ERR, for an OSD whose public address
+is outside "public_network", which cannot change once the cluster is
+bootstrapped. An OSD whose steered public address it does not cover keeps
+the unsteered public address, and still binds its steered cluster address.
+Once "public_network" covers the NUMA subnets, the manager and metadata
+server on the host are pinned to the unsteered public address, since Ceph
+would otherwise bind them to the newest address in its networks.
+
 Ceph reads these options when an OSD starts, so an OSD whose options change
 is restarted, one at a time, and only while every other OSD is up.
 """
@@ -32,7 +40,7 @@ import re
 import subprocess
 import time
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -334,6 +342,120 @@ def local_disks(hostname: str) -> dict[int, str]:
         for disk in disks or []
         if isinstance(disk, dict) and disk.get("location") == hostname and "osd" in disk
     }
+
+
+def public_networks() -> list[ipaddress.IPv6Network]:
+    """Return the networks of Ceph's "public_network", which may be a comma-separated list.
+
+    Set when the cluster is bootstrapped; it cannot change after that.
+    """
+    raw = _run("microceph.ceph", "config", "get", "osd", "public_network").strip()
+    try:
+        return [ipaddress.IPv6Network(item.strip()) for item in raw.split(",") if item.strip()]
+    except ValueError as exc:
+        raise SteeringError(f"Ceph public_network {raw!r} is not IPv6: {exc}") from exc
+
+
+def outside_public_network(
+    wanted: list[Binding], networks: list[ipaddress.IPv6Network]
+) -> list[str]:
+    """Return the public addresses in ``wanted`` that ``networks`` does not cover.
+
+    Ceph raises OSD_UNREACHABLE, a HEALTH_ERR, for an up OSD whose public
+    address is outside "public_network", so such an address must not be
+    bound. Ceph skips the check when "public_network" is unset, and so does
+    this. "cluster_network" has no such check.
+    """
+    if not networks:
+        return []
+    return sorted(
+        {binding.public_addr for binding in wanted if not covers(networks, binding.public_addr)}
+    )
+
+
+def covers(networks: Iterable[ipaddress.IPv6Network], address: str) -> bool:
+    """Return True if ``address`` is in one of ``networks``."""
+    return any(ipaddress.IPv6Address(address) in network for network in networks)
+
+
+def inside_public_network(
+    wanted: list[Binding], networks: list[ipaddress.IPv6Network], unsteered_public: str
+) -> tuple[list[Binding], list[str]]:
+    """Keep each OSD's public address inside Ceph's "public_network".
+
+    Returns ``wanted`` with every public address that ``networks`` does not
+    cover replaced by ``unsteered_public``, and the addresses replaced. Such
+    an OSD still binds its steered cluster address and is still pinned to
+    its NUMA node.
+    """
+    outside = outside_public_network(wanted, networks)
+    if not outside:
+        return wanted, []
+    return [
+        replace(binding, public_addr=unsteered_public)
+        if binding.public_addr in outside
+        else binding
+        for binding in wanted
+    ], outside
+
+
+# The daemons other than OSDs that bind an address in "public_network". Ceph
+# picks the first address on the host that is in one of its networks, and
+# Linux lists the newest address first, so once "public_network" covers the
+# NUMA subnets these would bind a steered address. They are pinned to the
+# unsteered one. MicroCeph picks the monitor's address itself, from the
+# networks in the order "public_network" lists them.
+PUBLIC_DAEMONS = ("mgr", "mds")
+
+
+def running_public_addr(who: str) -> str | None:
+    """Return the ``public_addr`` daemon ``who`` runs with, "-" if none.
+
+    None if the daemon cannot be asked: it does not run on this host, or is
+    down.
+    """
+    result = subprocess.run(
+        ["microceph.ceph", "config", "show", who, "public_addr"],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=60,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def daemon_pins(
+    hostname: str,
+    public: str,
+    dump: Mapping[str, Mapping[str, str]],
+    running: Mapping[str, str | None],
+) -> tuple[list[str], list[str]]:
+    """Return the daemons whose ``public_addr`` to set, and those to restart.
+
+    ``running`` maps each of ``PUBLIC_DAEMONS`` to the address its daemon on
+    this host runs with, as ``running_public_addr`` gives it. A daemon that
+    is not running here is left alone.
+    """
+    here = [daemon for daemon in PUBLIC_DAEMONS if running.get(daemon) is not None]
+    to_set = [
+        daemon
+        for daemon in here
+        if not _same(
+            "public_addr", dump.get(f"{daemon}.{hostname}", {}).get("public_addr"), public
+        )
+    ]
+    to_restart = [daemon for daemon in here if not _same("public_addr", running[daemon], public)]
+    return to_set, to_restart
+
+
+def pin_daemon(daemon: str, hostname: str, public: str) -> None:
+    """Set ``public_addr`` for this host's ``daemon``."""
+    _run("microceph.ceph", "config", "set", f"{daemon}.{hostname}", "public_addr", public)
+
+
+def restart_daemon(daemon: str) -> None:
+    """Restart this host's ``daemon``; MicroCeph runs one of each per host."""
+    _run("snap", "restart", f"microceph.{daemon}", timeout=180)
 
 
 def config_dump() -> dict[str, dict[str, str]]:

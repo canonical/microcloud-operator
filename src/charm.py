@@ -1115,9 +1115,11 @@ class MicroCloudCharm(ops.CharmBase):
         """Bind this unit's OSDs to their NUMA node's addresses, if asked to.
 
         The NUMA network maps name each node's /64; this host's steered
-        address for a node is the one on "lo" inside it. Restarts each OSD
-        whose options change, one at a time, and only while every other OSD
-        is up. Returns a problem to block on, or None.
+        address for a node is the one on "lo" inside it. A steered public
+        address outside Ceph's public_network is not bound, and the status
+        says so. Restarts each OSD whose options change, one at a time, and
+        only while every other OSD is up. Returns a problem to block on, or
+        None.
         """
         maps, problem = steering.numa_networks(self.config)
         if problem or not maps or not self.config.get("snap-channel-microceph", ""):
@@ -1145,12 +1147,26 @@ class MicroCloudCharm(ops.CharmBase):
                 # The machine's deployment found no card per NUMA node.
                 self._steering_note = f"NUMA steering disabled on {hostname}"
 
+            networks = steering.public_networks()
+            dump = steering.config_dump()
+            if any(steering.covers(networks, a.public) for a in steered.values()):
+                self._pin_public_daemons(hostname, unsteered.public, dump)
+
             disks = steering.local_disks(hostname)
             if not disks:
                 return None
-            wanted = steering.bindings(steered, unsteered, disks)
+            # Ceph raises OSD_UNREACHABLE, a HEALTH_ERR, for an OSD whose public
+            # address is outside public_network, which cannot change once the
+            # cluster is bootstrapped.
+            wanted, outside = steering.inside_public_network(
+                steering.bindings(steered, unsteered, disks), networks, unsteered.public
+            )
+            if outside:
+                self._steering_note = (
+                    "Ceph's public_network does not cover the steered public addresses "
+                    + ", ".join(outside)
+                )
 
-            dump = steering.config_dump()
             steering.ensure_bind_before_connect(dump)
             pending = steering.changes(
                 wanted,
@@ -1183,6 +1199,22 @@ class MicroCloudCharm(ops.CharmBase):
         except (steering.SteeringError, loopback.LoopbackError) as exc:
             return f"Cannot steer the Ceph OSDs: {exc}"
         return None
+
+    def _pin_public_daemons(
+        self, hostname: str, public: str, dump: dict[str, dict[str, str]]
+    ) -> None:
+        """Keep this host's Ceph manager and metadata server on the unsteered address."""
+        running = {
+            d: steering.running_public_addr(f"{d}.{hostname}") for d in steering.PUBLIC_DAEMONS
+        }
+        to_set, to_restart = steering.daemon_pins(hostname, public, dump, running)
+        for daemon in to_set:
+            steering.pin_daemon(daemon, hostname, public)
+        for daemon in to_restart:
+            steering.restart_daemon(daemon)
+            logger.info(
+                "Restarted the Ceph %s on %s with public_addr %s", daemon, hostname, public
+            )
 
     def _storage_problem(self) -> str | None:
         """Return what storage attached to this unit is missing from the cluster, or None.
