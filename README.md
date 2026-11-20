@@ -41,3 +41,30 @@ Replacing a role holder:
 3. Run `add-control-plane-role` on the new unit.
 
 Replace a failure domain's last member before removing it. The leader only checks failure domains that still have members.
+
+## NUMA-steered Ceph OSDs
+
+On a host with a network card on each NUMA node, each Ceph OSD can keep its traffic on the card attached to its disk's NUMA node. The machine's deployment does the networking: for each NUMA node and Ceph network, it puts one address on `lo`, inside a /64 that belongs to that node, and routes it through that node's card. Those addresses have a preferred lifetime of 0, so the kernel never picks them as a source address on its own. The charm manages no addresses or routes for this. It only binds the OSDs.
+
+Give the charm each NUMA node's /64, one map per Ceph network:
+
+```sh
+juju config microcloud \
+  ceph-public-numa-networks='{"0": "fd00:0:0:401::/64", "1": "fd00:0:0:402::/64"}' \
+  ceph-internal-numa-networks='{"0": "fd00:0:0:301::/64", "1": "fd00:0:0:302::/64"}'
+```
+
+In MAAS, name each node's subnet after its space with a `-numa<N>` suffix, such as `ceph-access-numa0` or `ceph-internal-numa1`, so that the maps can be read from MAAS.
+
+On each unit, the address on `lo` inside a node's /64 is that node's steered address. For each OSD whose disk is on a node with steered addresses, the charm sets these Ceph options and restarts the OSD, one at a time and only while every other OSD is up:
+
+| Option | Value |
+|---|---|
+| `public_addr` | The steered address in `ceph-public-numa-networks` |
+| `cluster_addr` | The steered address in `ceph-internal-numa-networks` |
+| `osd_numa_node` | The disk's NUMA node (a disk with no NUMA information counts as node 0) |
+| `ms_bind_before_connect` | `true`, for every OSD, so that outgoing connections also leave from the bound address |
+
+Any other OSD binds the unsteered addresses of `ceph-public-network` and `ceph-internal-network`. A unit whose host has no steered address reports `NUMA steering disabled on <host>` in its status. The charm checks `lo` again on every `update-status`, so it binds an address that the machine's deployment adds later.
+
+Ceph reports an OSD whose public address is outside `public_network` as unreachable (`OSD_UNREACHABLE`, a `HEALTH_ERR`). `public_network` is fixed when the cluster forms, and today it is the unsteered /64 of `ceph-public-network`. While it doesn't cover the NUMA /64s, the OSDs keep the unsteered public address, still bind their steered cluster address and NUMA node, and the status says so. Once `public_network` covers them, the charm also pins the Ceph manager and metadata server on each unit to the unsteered public address. Without that pin, Ceph would bind them to the newest address on `lo` in its networks, which is a steered one.

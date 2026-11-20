@@ -51,6 +51,7 @@ sys.modules["charms.loki_k8s.v1.loki_push_api"] = _loki_push_api_stub
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
 
 import session
+import steering
 from ceph_mgr import CephMgrPrometheus
 from failure_domains import FailureDomains
 from network import UnitNetwork
@@ -1090,6 +1091,7 @@ class TestHeldStatus:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
+        stub._steering_note = ""
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
@@ -1156,6 +1158,7 @@ class TestHeldStatus:
 
         stub = MagicMock(spec=MicroCloudCharm)
         stub._status_held = False
+        stub._steering_note = ""
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
@@ -1542,6 +1545,7 @@ class TestGrowCharm:
         stub.charm_dir = Path("/charm")
         stub.config = {"session-timeout": 300}
         stub._status_held = False
+        stub._steering_note = ""
         stub._stored = SimpleNamespace(session_failures=0)
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.bind_address.return_value = "10.0.0.1"
@@ -2604,6 +2608,7 @@ class TestFailureDomains:
         from charm import MicroCloudCharm
 
         stub._status_held = False
+        stub._steering_note = ""
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
@@ -2665,6 +2670,7 @@ class TestFailureDomains:
 
         stub = self._stub()
         stub._status_held = False
+        stub._steering_note = ""
         stub.config = {"session-timeout": 300}
         stub._stored = SimpleNamespace(lxd_join_since=since)
         stub._coordinator = MagicMock()
@@ -2737,6 +2743,7 @@ class TestFailureDomains:
         stub = self._stub()
         stub.unit.is_leader.return_value = False
         stub._status_held = False
+        stub._steering_note = ""
         stub._network = MagicMock(spec=UnitNetwork)
         stub._network.ovn_uplink_interface.return_value = ("", None)
         stub._network.network_options_problem.return_value = None
@@ -2759,11 +2766,14 @@ class TestFailureDomains:
         assert stub.unit.status == ops.BlockedStatus("Cannot read the LXD cluster: boom")
         stub._failure_domains.reconcile.assert_not_called()
 
-    def _set_status(self, *, leader, warning="control-plane: rack2 has 1 online role holder"):
+    def _set_status(
+        self, *, leader, warning="control-plane: rack2 has 1 online role holder", note=""
+    ):
         from charm import MicroCloudCharm
         from control_plane import ControlPlane
 
         stub = MagicMock(spec=MicroCloudCharm)
+        stub._steering_note = note
         stub.unit.is_leader.return_value = leader
         stub._cos_related.return_value = False
         stub._control_plane = MagicMock(spec=ControlPlane)
@@ -2778,6 +2788,15 @@ class TestFailureDomains:
 
         assert stub.unit.status == ops.ActiveStatus(
             "Cluster ready; control-plane: rack2 has 1 online role holder"
+        )
+
+    def test_a_host_without_numa_steering_says_so(self):
+        import ops
+
+        stub = self._set_status(leader=False, note="NUMA steering disabled on node1")
+
+        assert stub.unit.status == ops.ActiveStatus(
+            "Cluster ready; NUMA steering disabled on node1"
         )
 
     def test_the_leader_without_a_warning_is_just_ready(self):
@@ -2831,3 +2850,257 @@ class TestFailureDomains:
         assert "members" in results
         assert "control-plane-mode" not in results
         assert results["control-plane-mode-error"] == "boom"
+
+
+class TestOsdSteering:
+    """How the charm binds this unit's OSDs to their NUMA node's addresses."""
+
+    PRESENT = [
+        "fd00:0:0:400::6",
+        "fd00:0:0:300::6",
+        "fd00:0:0:401::6",
+        "fd00:0:0:301::6",
+        "fd00:0:0:402::6",
+        "fd00:0:0:302::6",
+    ]
+
+    def _run(
+        self,
+        *,
+        config=None,
+        disks=None,
+        present=None,
+        current=None,
+        running=True,
+        down=(),
+        ok_to_stop=True,
+        dump_error=None,
+        bind_address="fd00:0:0:1::6",
+        public_networks=("fd00:0:0:400::/64", "fd00:0:0:401::/64", "fd00:0:0:402::/64"),
+        daemons=None,
+    ):
+        import ipaddress
+        from unittest.mock import MagicMock
+
+        from charm import MicroCloudCharm
+        from network import UnitNetwork
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._steering_note = ""
+        stub.config = {
+            "snap-channel-microceph": "squid",
+            "ceph-public-network": "fd00:0:0:400::/64",
+            "ceph-internal-network": "fd00:0:0:300::/64",
+            "ceph-public-numa-networks": '{"0": "fd00:0:0:401::/64", "1": "fd00:0:0:402::/64"}',
+            "ceph-internal-numa-networks": '{"0": "fd00:0:0:301::/64", "1": "fd00:0:0:302::/64"}',
+        }
+        stub.config.update(config or {})
+        # The real address derivation, with the cluster address the binding would give.
+        stub._network = UnitNetwork(MagicMock(), stub.config)
+        stub._network.bind_address = lambda: bind_address
+        disks = {1: "/dev/a", 2: "/dev/b"} if disks is None else disks
+        present = self.PRESENT if present is None else present
+        dump = {f"osd.{osd}": options for osd, options in (current or {}).items()}
+        public_networks = [ipaddress.IPv6Network(n) for n in public_networks]
+
+        with (
+            patch("charm.microcloud.hostname", return_value="node1"),
+            patch("charm.steering.local_disks", return_value=disks),
+            patch("charm.steering.numa_node", side_effect={"/dev/a": 0, "/dev/b": 1}.get),
+            patch(
+                "charm.loopback.host_addresses",
+                return_value={
+                    "lo": {ipaddress.IPv6Address(a) for a in present},
+                    # Only "lo" counts, even for an address in a NUMA /64.
+                    "eth0": {ipaddress.IPv6Address("fd00:0:0:402::99")},
+                },
+            ),
+            patch(
+                "charm.steering.config_dump",
+                **({"side_effect": dump_error} if dump_error else {"return_value": dump}),
+            ),
+            patch("charm.steering.public_networks", return_value=public_networks),
+            patch("charm.steering.ensure_bind_before_connect") as ensure_bind,
+            patch("charm.steering.runs_bind_before_connect", return_value=running),
+            patch("charm.steering.down_osds", return_value=list(down)),
+            patch("charm.steering.ok_to_stop", return_value=ok_to_stop),
+            patch("charm.steering.apply") as apply,
+            patch("charm.steering.restart") as restart,
+        ):
+            problem = MicroCloudCharm._osd_steering_problem(stub)
+        stub.ensure_bind = ensure_bind
+        return stub, problem, apply, restart
+
+    def _pins(self, running, dump=None):
+        """Run _pin_public_daemons with ``running`` as each daemon's running public_addr."""
+        from unittest.mock import MagicMock
+
+        from charm import MicroCloudCharm
+
+        with (
+            patch(
+                "charm.steering.running_public_addr",
+                side_effect=lambda who: running.get(who.split(".")[0]),
+            ),
+            patch("charm.steering.pin_daemon") as pin,
+            patch("charm.steering.restart_daemon") as restart,
+        ):
+            MicroCloudCharm._pin_public_daemons(
+                MagicMock(spec=MicroCloudCharm), "node1", "fd00:0:0:400::6", dump or {}
+            )
+        return [c.args[0] for c in pin.call_args_list], [c.args[0] for c in restart.call_args_list]
+
+    @pytest.mark.parametrize(
+        "config",
+        [
+            {"ceph-public-numa-networks": "", "ceph-internal-numa-networks": ""},
+            {"snap-channel-microceph": ""},
+        ],
+    )
+    def test_does_nothing_unless_asked(self, config):
+        _, problem, apply, restart = self._run(config=config)
+        assert problem is None
+        apply.assert_not_called()
+        restart.assert_not_called()
+
+    def test_restarts_each_osd_with_its_numa_node_options(self):
+        stub, problem, apply, restart = self._run()
+        assert problem is None
+        assert [c.args[0] for c in apply.call_args_list] == [1, 2]
+        assert apply.call_args_list[0].args[1] == steering.Change(
+            {
+                "public_addr": "fd00:0:0:401::6",
+                "cluster_addr": "fd00:0:0:301::6",
+                "osd_numa_node": "0",
+            }
+        )
+        assert apply.call_args_list[1].args[1].set["public_addr"] == "fd00:0:0:402::6"
+        assert [c.args for c in restart.call_args_list] == [(1,), (2,)]
+        stub.ensure_bind.assert_called_once()
+        assert stub._steering_note == ""
+
+    def test_an_osd_already_bound_is_left_alone(self):
+        current = {1: steering.Binding(1, "fd00:0:0:401::6", "fd00:0:0:301::6", 0).options()}
+        _, problem, apply, restart = self._run(current=current)
+        assert problem is None
+        assert [c.args for c in restart.call_args_list] == [(2,)]
+
+    def test_options_as_ceph_stores_them_are_not_set_again(self):
+        """Ceph keeps an address as an address vector, not as it was set."""
+        current = {
+            osd: {
+                "public_addr": f"v2:[fd00:0:0:40{osd}::6]:0/0",
+                "cluster_addr": f"v2:[fd00:0:0:30{osd}::6]:0/0",
+                "osd_numa_node": str(osd - 1),
+            }
+            for osd in (1, 2)
+        }
+        _, problem, apply, restart = self._run(current=current)
+        assert problem is None
+        apply.assert_not_called()
+        restart.assert_not_called()
+
+    def test_a_host_without_steered_addresses_binds_the_unsteered_ones(self):
+        """The machine's deployment found no network card per NUMA node."""
+        stub, problem, apply, restart = self._run(present=self.PRESENT[:2])
+        assert problem is None
+        assert [c.args[1].set for c in apply.call_args_list] == [
+            {"public_addr": "fd00:0:0:400::6", "cluster_addr": "fd00:0:0:300::6"}
+        ] * 2
+        assert stub._steering_note == "NUMA steering disabled on node1"
+
+    def test_keeps_public_addresses_that_cephs_public_network_does_not_cover(self):
+        """Ceph raises OSD_UNREACHABLE, a HEALTH_ERR, for an OSD outside public_network."""
+        stub, problem, apply, restart = self._run(public_networks=("fd00:0:0:400::/64",))
+        assert problem is None
+        assert [c.args[1].set for c in apply.call_args_list] == [
+            {
+                "public_addr": "fd00:0:0:400::6",
+                "cluster_addr": "fd00:0:0:301::6",
+                "osd_numa_node": "0",
+            },
+            {
+                "public_addr": "fd00:0:0:400::6",
+                "cluster_addr": "fd00:0:0:302::6",
+                "osd_numa_node": "1",
+            },
+        ]
+        assert stub._steering_note == (
+            "Ceph's public_network does not cover the steered public addresses "
+            "fd00:0:0:401::6, fd00:0:0:402::6"
+        )
+        stub._pin_public_daemons.assert_not_called()
+
+    def test_pins_the_other_daemons_once_public_network_covers_the_numa_subnets(self):
+        stub, problem, _, _ = self._run()
+        assert problem is None
+        stub._pin_public_daemons.assert_called_once_with("node1", "fd00:0:0:400::6", {})
+
+    def test_pins_the_other_daemons_even_without_osds(self):
+        stub, problem, _, _ = self._run(disks={})
+        assert problem is None
+        stub._pin_public_daemons.assert_called_once()
+
+    def test_pinning_sets_and_restarts_the_daemons_on_a_steered_address(self):
+        pinned, restarted = self._pins({"mgr": "-", "mds": "v2:[fd00:0:0:402::6]:0/0"})
+        assert pinned == ["mgr", "mds"]
+        assert restarted == ["mgr", "mds"]
+
+    def test_pinning_leaves_daemons_alone_that_run_with_the_address(self):
+        dump = {"mgr.node1": {"public_addr": "v2:[fd00:0:0:400::6]:0/0"}}
+        pinned, restarted = self._pins({"mgr": "v2:[fd00:0:0:400::6]:0/0"}, dump)
+        assert pinned == []
+        assert restarted == []
+
+    def test_pinning_skips_daemons_that_do_not_run_here(self):
+        pinned, restarted = self._pins({"mds": "-"})
+        assert pinned == ["mds"]
+        assert restarted == ["mds"]
+
+    def test_blocks_on_two_addresses_in_a_numa_subnet(self):
+        _, problem, apply, restart = self._run(present=[*self.PRESENT, "fd00:0:0:401::7"])
+        assert problem == "2 addresses on lo in fd00:0:0:401::/64"
+        apply.assert_not_called()
+
+    def test_waits_while_another_osd_is_down(self):
+        import ops
+
+        stub, problem, apply, restart = self._run(down=[7])
+        assert problem is None
+        stub._hold_status.assert_called_once_with(
+            ops.WaitingStatus("Waiting for osd.7 to be up to restart osd.1")
+        )
+        apply.assert_not_called()
+        restart.assert_not_called()
+
+    def test_waits_while_ceph_refuses_to_stop_the_osd(self):
+        import ops
+
+        stub, problem, apply, restart = self._run(ok_to_stop=False)
+        assert problem is None
+        stub._hold_status.assert_called_once_with(
+            ops.WaitingStatus("Waiting for Ceph to allow restarting osd.1")
+        )
+        apply.assert_not_called()
+        restart.assert_not_called()
+
+    def test_no_osds_on_the_unit(self):
+        stub, problem, _, restart = self._run(disks={})
+        assert problem is None
+        restart.assert_not_called()
+
+    def test_reports_a_steering_error(self):
+        _, problem, _, restart = self._run(dump_error=steering.SteeringError("boom"))
+        assert problem == "Cannot steer the Ceph OSDs: boom"
+        restart.assert_not_called()
+
+    def test_blocks_on_a_bad_map(self):
+        _, problem, _, restart = self._run(config={"ceph-internal-numa-networks": ""})
+        assert problem == "NUMA steering needs ceph-internal-numa-networks too"
+        restart.assert_not_called()
+
+    def test_blocks_without_the_unsteered_addresses(self):
+        _, problem, apply, restart = self._run(bind_address="")
+        assert problem.startswith("NUMA steering needs the unsteered Ceph addresses")
+        apply.assert_not_called()
+        restart.assert_not_called()
