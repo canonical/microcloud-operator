@@ -5,8 +5,10 @@ The charm is deployed as a multi-unit, LXD-only MicroCloud (see
 the shared session passphrase, and the peer-relation coordination that a
 single-node deployment skips entirely.
 
-Tests share one model for the whole module, so they run in file order: the
-first deploys, the rest assert against what it built.
+Tests share one model for the whole module, so they run in file order. The
+first deploys with an invalid option, which blocks before bootstrap, and then
+corrects it; the rest assert against the cluster that formed. The last breaks
+the option again and checks the cluster recovers unchanged.
 """
 
 from __future__ import annotations
@@ -19,7 +21,10 @@ import jubilant
 import pytest
 
 from tests.integration.helpers import (
+    DEPLOY_TIMEOUT_IN_SECONDS,
     MICROCLOUD_CHARM,
+    agent_lost,
+    as_bool,
     assert_membership,
     assert_no_session_state,
     cluster_members,
@@ -28,6 +33,7 @@ from tests.integration.helpers import (
     machine_zones,
     member_addresses,
     run_action,
+    run_update_status,
     snap_installed,
     ssh,
     unit_hostnames,
@@ -37,6 +43,37 @@ from tests.integration.helpers import (
 
 logger = logging.getLogger(__name__)
 
+# An empty mapping cannot contain any host, regardless of substrate naming.
+INVALID_UPLINK = "{}"
+
+
+def wait_missing_uplink(juju: jubilant.Juju, num_units: int) -> None:
+    """Wait for each unit to report the expected, actionable validation error."""
+
+    def blocked(status: jubilant.Status) -> bool:
+        app = status.apps.get(MICROCLOUD_CHARM)
+        if app is None or len(app.units) != num_units:
+            return False
+        return all(
+            unit.workload_status.current == "blocked"
+            and "ovn-uplink-interface is missing an entry for hostname"
+            in unit.workload_status.message
+            for unit in app.units.values()
+        )
+
+    juju.wait(
+        blocked,
+        error=lambda status: (
+            jubilant.any_error(status, MICROCLOUD_CHARM) or agent_lost(status, MICROCLOUD_CHARM)
+        ),
+        timeout=DEPLOY_TIMEOUT_IN_SECONDS,
+        delay=5,
+    )
+    hostnames = unit_hostnames(juju)
+    status = juju.status()
+    for unit, hostname in hostnames.items():
+        assert repr(hostname) in status.apps[MICROCLOUD_CHARM].units[unit].workload_status.message
+
 
 @pytest.mark.juju_setup
 def test_deploy_microcloud(
@@ -45,9 +82,22 @@ def test_deploy_microcloud(
     constraints: dict[str, str],
     num_units: int,
 ) -> None:
-    """The charm installs the snaps and forms a cluster across every unit."""
-    deploy_microcloud(juju, charm_path, num_units=num_units, constraints=constraints)
-    wait_active(juju)
+    """Invalid config blocks before bootstrap; correcting it forms the cluster."""
+    deploy_microcloud(
+        juju,
+        charm_path,
+        num_units=num_units,
+        constraints=constraints,
+        config={"ovn-uplink-interface": INVALID_UPLINK},
+    )
+    wait_missing_uplink(juju, num_units)
+    for unit in unit_names(juju):
+        results = run_action(juju, "status", unit)
+        assert not as_bool(results["initialized"]), (unit, results)
+        assert "members" not in results, (unit, results)
+
+    juju.cli("config", MICROCLOUD_CHARM, "ovn-uplink-interface=")
+    wait_active(juju, recovering=True)
 
     status = juju.status()
     assert status.apps[MICROCLOUD_CHARM].app_status.current == "active"
@@ -156,14 +206,7 @@ def test_failure_domain_is_restored(juju: jubilant.Juju) -> None:
     ssh(juju, unit, f"sudo lxc cluster failure-domain set {hostname} not-{zone}")
     assert lxd_members(juju)[hostname]["failure_domain"] == f"not-{zone}"
 
-    charm_dir = f"/var/lib/juju/agents/unit-{unit.replace('/', '-')}/charm"
-    juju.cli(
-        "exec",
-        "--unit",
-        unit,
-        "--",
-        f"JUJU_DISPATCH_PATH=hooks/update-status {charm_dir}/dispatch",
-    )
+    run_update_status(juju, unit)
 
     assert lxd_members(juju)[hostname]["failure_domain"] == zone
 
@@ -181,3 +224,21 @@ def test_status_action_renders_the_member_table(juju: jubilant.Juju, num_units: 
         assert roles == (",".join(members[name]["roles"]) or "-")
         assert failure_domain == members[name]["failure_domain"]
         assert architecture == members[name]["architecture"]
+
+
+def test_config_recovery_preserves_cluster(juju: jubilant.Juju, num_units: int) -> None:
+    """Config reconciliation after bootstrap recovers without replacing cluster members."""
+    assert_membership(juju, num_units)
+    before = member_addresses(juju)
+    juju.cli("config", MICROCLOUD_CHARM, f"ovn-uplink-interface={INVALID_UPLINK}")
+    try:
+        wait_missing_uplink(juju, num_units)
+        assert_membership(juju, num_units)
+        assert member_addresses(juju) == before
+    finally:
+        juju.cli("config", MICROCLOUD_CHARM, "ovn-uplink-interface=")
+    # Observing blocked first avoids accepting stale active status before
+    # config-changed has actually run on every unit.
+    wait_active(juju, recovering=True)
+    assert_membership(juju, num_units)
+    assert member_addresses(juju) == before

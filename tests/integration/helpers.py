@@ -5,10 +5,12 @@ from __future__ import annotations
 import json
 import shlex
 import time
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 import jubilant
+import yaml
 
 MICROCLOUD_CHARM = "microcloud"
 
@@ -29,6 +31,26 @@ LXD_ONLY_CONFIG: dict[str, str] = {
 # under ten minutes; anything much longer is stuck, and waiting for the full
 # job timeout only hides why.
 DEPLOY_TIMEOUT_IN_SECONDS = 20 * 60
+
+ROLE = "control-plane"
+DATABASE_ROLES = {"database-leader", "database-voter", "database-standby"}
+
+# LXD applies role changes on its heartbeat and marks a member offline after
+# its offline threshold, both well under a minute by default.
+ROLE_TIMEOUT_IN_SECONDS = 5 * 60
+
+
+def microceph_config() -> dict[str, str]:
+    """Enable MicroCeph at the charm's default channel, without CephFS.
+
+    MicroCloud can only add systems to a cluster that runs MicroCeph. CephFS
+    needs OSDs, and these units have no disks to give it.
+    """
+    options = yaml.safe_load(Path("charmcraft.yaml").read_text())["config"]["options"]
+    return {
+        "snap-channel-microceph": options["snap-channel-microceph"]["default"],
+        "ceph-cephfs": "false",
+    }
 
 
 def deploy_microcloud(
@@ -75,6 +97,20 @@ def machine_error(status: jubilant.Status) -> bool:
     )
 
 
+def agent_lost(status: jubilant.Status, *apps: str) -> bool:
+    """Return True if a unit of ``apps`` has lost its Juju agent.
+
+    Such a unit never settles, so without this a wait runs its full timeout
+    before failing.
+    """
+    return any(
+        unit.juju_status.current == "lost"
+        for app in apps
+        if app in status.apps
+        for unit in status.apps[app].units.values()
+    )
+
+
 def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
     """Wait for convergence, allowing an old blocked status during recovery."""
     juju.wait(
@@ -84,10 +120,11 @@ def wait_active(juju: jubilant.Juju, *, recovering: bool = False) -> None:
         error=lambda status: (
             jubilant.any_error(status, MICROCLOUD_CHARM)
             or machine_error(status)
+            or agent_lost(status, MICROCLOUD_CHARM)
             or (not recovering and jubilant.any_blocked(status, MICROCLOUD_CHARM))
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
 
 
@@ -212,10 +249,11 @@ def wait_units_active(juju: jubilant.Juju, count: int) -> None:
         error=lambda status: (
             jubilant.any_error(status, MICROCLOUD_CHARM)
             or machine_error(status)
+            or agent_lost(status, MICROCLOUD_CHARM)
             or jubilant.any_blocked(status, MICROCLOUD_CHARM)
         ),
         timeout=DEPLOY_TIMEOUT_IN_SECONDS,
-        delay=10,
+        delay=5,
     )
 
 
@@ -314,3 +352,41 @@ def lxd_members(juju: jubilant.Juju) -> dict[str, dict[str, Any]]:
     """Map each LXD cluster member's name to its details, as LXD reports them."""
     output = ssh(juju, leader_unit(juju), "sudo lxc query /1.0/cluster/members?recursion=1")
     return {member["server_name"]: member for member in json.loads(output)}
+
+
+def run_update_status(juju: jubilant.Juju, unit: str) -> None:
+    """Run the update-status hook on ``unit`` now, instead of waiting for Juju."""
+    charm_dir = f"/var/lib/juju/agents/unit-{unit.replace('/', '-')}/charm"
+    juju.cli(
+        "exec",
+        "--unit",
+        unit,
+        "--",
+        f"JUJU_DISPATCH_PATH=hooks/update-status {charm_dir}/dispatch",
+    )
+
+
+def roles(juju: jubilant.Juju) -> dict[str, set[str]]:
+    """Map each LXD member to its roles."""
+    return {name: set(member["roles"]) for name, member in lxd_members(juju).items()}
+
+
+def database_members(current: dict[str, set[str]]) -> set[str]:
+    return {name for name, member_roles in current.items() if member_roles & DATABASE_ROLES}
+
+
+def role_holders(current: dict[str, set[str]]) -> set[str]:
+    return {name for name, member_roles in current.items() if ROLE in member_roles}
+
+
+def wait_for_roles(
+    juju: jubilant.Juju, check: Callable[[dict[str, set[str]]], bool], what: str
+) -> dict[str, set[str]]:
+    """Poll LXD until ``check`` holds for the members' roles."""
+    deadline = time.monotonic() + ROLE_TIMEOUT_IN_SECONDS
+    while True:
+        current = roles(juju)
+        if check(current):
+            return current
+        assert time.monotonic() < deadline, f"timed out waiting for {what}: {current}"
+        time.sleep(5)
