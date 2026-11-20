@@ -565,16 +565,16 @@ wheels = [
 
 [[package]]
 name = "ops"
-version = "3.7.1"
+version = "3.9.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "opentelemetry-api" },
     { name = "pyyaml" },
     { name = "websocket-client" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/42/60/ad398d889fd03b1b4f950fad54ad4d0cf7a81fde21f9866a8139c8f03684/ops-3.7.1.tar.gz", hash = "sha256:1765bf6d1cff376ea27608542e183b055c89f2c5f54bca602072bcc817195abc", size = 582424, upload-time = "2026-05-28T04:13:43.906Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/0f/03/d87306f7e704a0f75f461d40d6141bfbd1ea38ba329ca0e88f6c3a20cfd5/ops-3.9.0.tar.gz", hash = "sha256:f8fd7fa05359e9fc057663b1a652602f5803db0b37e1bbfe9b63971c54e4b3b3", size = 420379, upload-time = "2026-10-08T05:36:18.184Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/ca/20/742e720af65f9ad23ae0cfe140502a10b2e74da6c63773f3999dad793661/ops-3.7.1-py3-none-any.whl", hash = "sha256:559dc6770e551da5f4b9686a5605ed927c140182eb38bcc31c1c531c2f98923a", size = 212723, upload-time = "2026-05-28T04:13:39.845Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/2f/faf83b14fd88c0e5ae26a4f5eb66f06f708fe322223823acfd45f8d32594/ops-3.9.0-py3-none-any.whl", hash = "sha256:2dc7a77edae408886ccd348be590df0e03589dfe5e3e115e238d5746850eed0c", size = 219271, upload-time = "2026-10-08T05:36:14.03Z" },
 ]
 
 [[package]]
