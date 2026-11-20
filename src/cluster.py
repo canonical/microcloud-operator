@@ -34,15 +34,26 @@ _KEY_OVN_UPLINK_INTERFACE = "microcloud-ovn-uplink-interface"
 _KEY_OVN_UNDERLAY_IP = "microcloud-ovn-underlay-ip"
 _KEY_STORAGE_LOCAL_PATH = "microcloud-storage-local-path"
 _KEY_STORAGE_CEPH_PATHS = "microcloud-storage-ceph-paths"
+_KEY_STORAGE_WIPE = "microcloud-storage-wipe"
+_KEY_STORAGE_ENCRYPT = "microcloud-storage-encrypt"
 _KEY_LOOPBACK_ADDRESSES = "microcloud-loopback-addresses"
 _KEY_READY = "microcloud-ready"
 _KEY_INITIALIZED = "microcloud-initialized"
 
-# App databag keys / secret label (leader-owned).
-_APP_KEY_SECRET_ID = "session-passphrase-secret-id"
+# App databag keys / secret label (leader-owned). The "microcloud_cluster"
+# relation publishes the secret ID and the session under the same keys.
+APP_KEY_SECRET_ID = "session-passphrase-secret-id"
 _SECRET_LABEL = "microcloud-session-passphrase"
 _SECRET_FIELD = "passphrase"
-_APP_KEY_SESSION = "join-session"
+APP_KEY_SESSION = "join-session"
+_APP_KEY_CLUSTER_MODE = "cluster-mode"
+_APP_KEY_JOINED_UNITS = "joined-units"
+_APP_KEY_SNAP_CHANNELS = "snap-channels"
+
+# Values of "cluster-mode": which side of the "microcloud_cluster" relation
+# this application formed or joined its cluster as.
+MODE_ORCHESTRATOR = "orchestrator"
+MODE_MEMBER = "member"
 
 
 @dataclass
@@ -55,6 +66,8 @@ class PeerSystem:
     ovn_underlay_ip: str = ""
     storage_local_path: str = ""
     storage_ceph_paths: list[str] = field(default_factory=list)
+    storage_wipe: bool = False
+    storage_encrypt: bool = False
     # Network CIDR to this unit's address in it, for networks whose addresses sit on "lo".
     loopback_addresses: dict[str, str] = field(default_factory=dict)
     initialized: bool = False
@@ -74,6 +87,140 @@ class JoinSession:
     address: str
     systems: list[str]
     deadline: float
+    # The "members" relation whose units the session lists, or None for a
+    # session of this application's own units.
+    relation_id: int | None = None
+
+    def to_json(self) -> str:
+        data: dict = {
+            "id": self.id,
+            "address": self.address,
+            "systems": self.systems,
+            "deadline": self.deadline,
+        }
+        if self.relation_id is not None:
+            data["relation-id"] = self.relation_id
+        return json.dumps(data, sort_keys=True)
+
+    @classmethod
+    def from_json(cls, raw: str | None) -> "JoinSession | None":
+        """Parse a published session, or return None if absent or malformed."""
+        if not raw:
+            return None
+        try:
+            data = json.loads(raw)
+            relation_id = data.get("relation-id")
+            return cls(
+                id=str(data["id"]),
+                address=str(data["address"]),
+                systems=[str(name) for name in data["systems"]],
+                deadline=float(data["deadline"]),
+                relation_id=None if relation_id is None else int(relation_id),
+            )
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError, AttributeError):
+            logger.warning("Ignoring malformed join session data: %r", raw)
+            return None
+
+
+def identity_fields(
+    name: str,
+    address: str,
+    ovn_uplink_interface: str = "",
+    ovn_underlay_ip: str = "",
+    storage_local_path: str = "",
+    storage_ceph_paths: list[str] | None = None,
+    storage_wipe: bool = False,
+    storage_encrypt: bool = False,
+    loopback_addresses: dict[str, str] | None = None,
+    initialized: bool = False,
+) -> dict[str, str]:
+    """Return the databag fields that publish a unit's MicroCloud identity."""
+    return {
+        _KEY_NAME: name,
+        _KEY_ADDRESS: address,
+        _KEY_OVN_UPLINK_INTERFACE: ovn_uplink_interface,
+        _KEY_OVN_UNDERLAY_IP: ovn_underlay_ip,
+        _KEY_STORAGE_LOCAL_PATH: storage_local_path,
+        _KEY_STORAGE_CEPH_PATHS: json.dumps(storage_ceph_paths or []),
+        _KEY_STORAGE_WIPE: "true" if storage_wipe else "false",
+        _KEY_STORAGE_ENCRYPT: "true" if storage_encrypt else "false",
+        _KEY_LOOPBACK_ADDRESSES: json.dumps(loopback_addresses or {}, sort_keys=True),
+        # Whether this unit's own MicroCloud daemon is already clustered. The
+        # leader reads this to tell a first bootstrap from growing an existing
+        # cluster, and to decide which systems belong in the preseed.
+        _KEY_INITIALIZED: "true" if initialized else "false",
+    }
+
+
+def system_from_data(data: "ops.RelationDataContent | dict[str, str]") -> PeerSystem | None:
+    """Parse a unit's published identity, or return None without name and address."""
+    name = data.get(_KEY_NAME, "")
+    address = data.get(_KEY_ADDRESS, "")
+    if not name or not address:
+        return None
+    try:
+        storage_ceph_paths = json.loads(data.get(_KEY_STORAGE_CEPH_PATHS) or "[]")
+    except (json.JSONDecodeError, TypeError):
+        storage_ceph_paths = []
+    try:
+        loopback_addresses = json.loads(data.get(_KEY_LOOPBACK_ADDRESSES) or "{}")
+    except (json.JSONDecodeError, TypeError):
+        loopback_addresses = {}
+    if not isinstance(loopback_addresses, dict):
+        loopback_addresses = {}
+    return PeerSystem(
+        name=name,
+        address=address,
+        ovn_uplink_interface=data.get(_KEY_OVN_UPLINK_INTERFACE, ""),
+        ovn_underlay_ip=data.get(_KEY_OVN_UNDERLAY_IP, ""),
+        storage_local_path=data.get(_KEY_STORAGE_LOCAL_PATH, ""),
+        storage_ceph_paths=storage_ceph_paths,
+        storage_wipe=data.get(_KEY_STORAGE_WIPE) == "true",
+        storage_encrypt=data.get(_KEY_STORAGE_ENCRYPT) == "true",
+        loopback_addresses=loopback_addresses,
+        initialized=data.get(_KEY_INITIALIZED) == "true",
+    )
+
+
+def read_passphrase(model: ops.Model, secret_id: str) -> str | None:
+    """Read the session passphrase from the secret ``secret_id``.
+
+    Returns None while it cannot be read, such as before this unit has been
+    granted the secret.
+    """
+    if not secret_id:
+        return None
+    try:
+        return model.get_secret(id=secret_id).get_content(refresh=True)[_SECRET_FIELD]
+    except (ops.ModelError, KeyError) as exc:
+        logger.info("Cannot read the session passphrase yet: %s", exc)
+        return None
+
+
+def is_ready(data: "ops.RelationDataContent | dict[str, str]") -> bool:
+    """Return True if a unit's databag says it is ready to be listed in a session."""
+    return data.get(_KEY_READY) == "true"
+
+
+def ready_fields() -> dict[str, str]:
+    """Return the databag fields that mark a unit ready."""
+    return {_KEY_READY: "true"}
+
+
+def readable(relation: ops.Relation, unit: ops.Unit) -> bool:
+    """Return False for a relation ``unit`` can no longer read.
+
+    A relation that is being removed stays in the model until its last
+    hook, but Juju 4 refuses relation-get on it from the hooks of other
+    relations. That includes the peer relation of an application being
+    removed. Reading the unit's own databag tells, and ops caches it.
+    """
+    try:
+        relation.data[unit].get(_KEY_NAME)
+    except ops.ModelError as exc:
+        logger.debug("Skipping %s relation %d: %s", relation.name, relation.id, exc)
+        return False
+    return True
 
 
 class ClusterCoordinator:
@@ -88,7 +235,11 @@ class ClusterCoordinator:
 
     @property
     def relation(self) -> ops.Relation | None:
-        return self._charm.model.get_relation(PEER_RELATION)
+        """Return the peer relation, or None if it is missing or no longer readable."""
+        relation = self._charm.model.get_relation(PEER_RELATION)
+        if relation is None or not readable(relation, self._charm.unit):
+            return None
+        return relation
 
     def is_ready(self) -> bool:
         """Return True if the peer relation exists."""
@@ -106,6 +257,8 @@ class ClusterCoordinator:
         ovn_underlay_ip: str = "",
         storage_local_path: str = "",
         storage_ceph_paths: list[str] | None = None,
+        storage_wipe: bool = False,
+        storage_encrypt: bool = False,
         loopback_addresses: dict[str, str] | None = None,
         initialized: bool = False,
     ) -> None:
@@ -115,83 +268,53 @@ class ClusterCoordinator:
         device paths are naturally per-unit (derived from this unit's own
         space bindings / attached Juju storage volumes), so they are
         published and collected the same way as name/address, rather than
-        being a single value shared application-wide.
+        being a single value shared application-wide. ``storage_wipe`` and
+        ``storage_encrypt`` travel with them because the initiator renders
+        them for this unit's disks, and it may be of another application.
         """
         relation = self.relation
         if relation is None:
             return
-        relation.data[self._charm.unit][_KEY_NAME] = name
-        relation.data[self._charm.unit][_KEY_ADDRESS] = address
-        relation.data[self._charm.unit][_KEY_OVN_UPLINK_INTERFACE] = ovn_uplink_interface
-        relation.data[self._charm.unit][_KEY_OVN_UNDERLAY_IP] = ovn_underlay_ip
-        relation.data[self._charm.unit][_KEY_STORAGE_LOCAL_PATH] = storage_local_path
-        relation.data[self._charm.unit][_KEY_STORAGE_CEPH_PATHS] = json.dumps(
-            storage_ceph_paths or []
+        relation.data[self._charm.unit].update(
+            identity_fields(
+                name,
+                address,
+                ovn_uplink_interface=ovn_uplink_interface,
+                ovn_underlay_ip=ovn_underlay_ip,
+                storage_local_path=storage_local_path,
+                storage_ceph_paths=storage_ceph_paths,
+                storage_wipe=storage_wipe,
+                storage_encrypt=storage_encrypt,
+                loopback_addresses=loopback_addresses,
+                initialized=initialized,
+            )
         )
-        relation.data[self._charm.unit][_KEY_LOOPBACK_ADDRESSES] = json.dumps(
-            loopback_addresses or {}, sort_keys=True
-        )
-        # Whether this unit's own MicroCloud daemon is already clustered. The
-        # leader reads this to tell a first bootstrap from growing an existing
-        # cluster, and to decide which systems belong in the preseed.
-        relation.data[self._charm.unit][_KEY_INITIALIZED] = "true" if initialized else "false"
 
     def all_members(self) -> list[tuple[str, str]]:
         """Return (name, address) for every peer unit that has published, plus self.
 
         Only entries with both a name and an address are returned.
         """
-        return [(system.name, system.address) for system in self.all_systems()]
+        return [(system.name, system.address) for system in self.peer_systems()]
 
-    def all_systems(self) -> list[PeerSystem]:
+    def peer_systems(self) -> list[PeerSystem]:
         """Return the published identity of every peer unit, plus self.
 
         Covers every peer unit that has published a name and address, plus
         self. Only entries with both a name and an address are returned; the
-        OVN and storage fields may be empty if unset or not applicable.
+        OVN and storage fields may be empty if unset or not applicable. Units
+        of other applications on the "members" relation are not included.
         """
         relation = self.relation
         if relation is None:
             return []
 
-        members: list[PeerSystem] = []
-        units = list(relation.units) + [self._charm.unit]
-        for unit in units:
-            data = relation.data.get(unit, {})
-            name = data.get(_KEY_NAME, "")
-            address = data.get(_KEY_ADDRESS, "")
-            ovn_uplink_interface = data.get(_KEY_OVN_UPLINK_INTERFACE, "")
-            ovn_underlay_ip = data.get(_KEY_OVN_UNDERLAY_IP, "")
-            storage_local_path = data.get(_KEY_STORAGE_LOCAL_PATH, "")
-            initialized = data.get(_KEY_INITIALIZED) == "true"
-            try:
-                storage_ceph_paths = json.loads(data.get(_KEY_STORAGE_CEPH_PATHS) or "[]")
-            except (json.JSONDecodeError, TypeError):
-                storage_ceph_paths = []
-            try:
-                loopback_addresses = json.loads(data.get(_KEY_LOOPBACK_ADDRESSES) or "{}")
-            except (json.JSONDecodeError, TypeError):
-                loopback_addresses = {}
-            if not isinstance(loopback_addresses, dict):
-                loopback_addresses = {}
-            if name and address:
-                members.append(
-                    PeerSystem(
-                        name=name,
-                        address=address,
-                        ovn_uplink_interface=ovn_uplink_interface,
-                        ovn_underlay_ip=ovn_underlay_ip,
-                        storage_local_path=storage_local_path,
-                        storage_ceph_paths=storage_ceph_paths,
-                        loopback_addresses=loopback_addresses,
-                        initialized=initialized,
-                    )
-                )
-        # De-duplicate while preserving order.
-        seen: set[str] = set()
         unique: list[PeerSystem] = []
-        for system in members:
-            if system.name not in seen:
+        seen: set[str] = set()
+        for unit in list(relation.units) + [self._charm.unit]:
+            system = system_from_data(relation.data.get(unit, {}))
+            # De-duplicate while preserving order.
+            if system is not None and system.name not in seen:
                 seen.add(system.name)
                 unique.append(system)
         return unique
@@ -224,7 +347,7 @@ class ClusterCoordinator:
         relation = self.relation
         if relation is None:
             return
-        relation.data[self._charm.unit][_KEY_READY] = "true"
+        relation.data[self._charm.unit].update(ready_fields())
 
     def published_ready(self) -> bool:
         """Return True if this unit has already marked itself ready."""
@@ -265,8 +388,8 @@ class ClusterCoordinator:
         session for units that will never dial in.
         """
         if members is not None:
-            return [system for system in self.all_systems() if system.name not in members]
-        return [system for system in self.all_systems() if not system.initialized]
+            return [system for system in self.peer_systems() if system.name not in members]
+        return [system for system in self.peer_systems() if not system.initialized]
 
     def any_initialized(self) -> bool:
         """Return True if any unit has published that it is clustered.
@@ -274,7 +397,7 @@ class ClusterCoordinator:
         The flag can lag behind (see ``pending_systems``) but never leads,
         so True reliably means a cluster already exists.
         """
-        return any(system.initialized for system in self.all_systems())
+        return any(system.initialized for system in self.peer_systems())
 
     # ------------------------------------------------------------------
     # Join session (leader-owned, app databag)
@@ -293,36 +416,81 @@ class ClusterCoordinator:
             return
         app_data = relation.data[self._charm.app]
         if session is None:
-            app_data.pop(_APP_KEY_SESSION, None)
+            app_data.pop(APP_KEY_SESSION, None)
             return
-        app_data[_APP_KEY_SESSION] = json.dumps(
-            {
-                "id": session.id,
-                "address": session.address,
-                "systems": session.systems,
-                "deadline": session.deadline,
-            }
-        )
+        app_data[APP_KEY_SESSION] = session.to_json()
 
     def session(self) -> JoinSession | None:
         """Return the published join session, or None if there is none."""
         relation = self.relation
         if relation is None:
             return None
-        raw = relation.data[self._charm.app].get(_APP_KEY_SESSION)
-        if not raw:
+        return JoinSession.from_json(relation.data[self._charm.app].get(APP_KEY_SESSION))
+
+    # ------------------------------------------------------------------
+    # Cluster mode and member units (leader-owned, app databag)
+    # ------------------------------------------------------------------
+
+    def cluster_mode(self) -> str:
+        """Return the recorded cluster mode, or "" if none is recorded yet."""
+        relation = self.relation
+        if relation is None:
+            return ""
+        return relation.data[self._charm.app].get(_APP_KEY_CLUSTER_MODE, "")
+
+    def record_cluster_mode(self, mode: str) -> None:
+        """Leader records which side of "microcloud_cluster" this application is on."""
+        relation = self.relation
+        if relation is None or not self._charm.unit.is_leader():
+            return
+        relation.data[self._charm.app][_APP_KEY_CLUSTER_MODE] = mode
+
+    def joined_units(self) -> dict[str, str]:
+        """Return {MicroCloud member name: unit name} for joined member units.
+
+        Kept by the orchestrator leader, so that member units stay known after
+        their whole "members" relation is removed.
+        """
+        relation = self.relation
+        if relation is None:
+            return {}
+        try:
+            data = json.loads(relation.data[self._charm.app].get(_APP_KEY_JOINED_UNITS) or "{}")
+        except json.JSONDecodeError:
+            return {}
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else {}
+
+    def record_joined_units(self, units: dict[str, str]) -> None:
+        """Leader records the joined member units."""
+        relation = self.relation
+        if relation is None or not self._charm.unit.is_leader():
+            return
+        app_data = relation.data[self._charm.app]
+        if units:
+            app_data[_APP_KEY_JOINED_UNITS] = json.dumps(units, sort_keys=True)
+        else:
+            app_data.pop(_APP_KEY_JOINED_UNITS, None)
+
+    def snap_channels(self) -> dict[str, str] | None:
+        """Return the snap channels the cluster runs, as its leader recorded them, or None."""
+        relation = self.relation
+        if relation is None:
             return None
         try:
-            data = json.loads(raw)
-            return JoinSession(
-                id=str(data["id"]),
-                address=str(data["address"]),
-                systems=[str(name) for name in data["systems"]],
-                deadline=float(data["deadline"]),
-            )
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError):
-            logger.warning("Ignoring malformed join session data: %r", raw)
+            data = json.loads(relation.data[self._charm.app].get(_APP_KEY_SNAP_CHANNELS) or "null")
+        except json.JSONDecodeError:
             return None
+        return {str(k): str(v) for k, v in data.items()} if isinstance(data, dict) else None
+
+    def record_snap_channels(self, channels: dict[str, str]) -> None:
+        """Leader records the snap channels the cluster runs."""
+        relation = self.relation
+        if relation is None or not self._charm.unit.is_leader():
+            return
+        value = json.dumps(channels, sort_keys=True)
+        app_data = relation.data[self._charm.app]
+        if app_data.get(_APP_KEY_SNAP_CHANNELS) != value:
+            app_data[_APP_KEY_SNAP_CHANNELS] = value
 
     # ------------------------------------------------------------------
     # Session passphrase (Juju secret, leader-owned)
@@ -341,13 +509,38 @@ class ClusterCoordinator:
             return None
 
         if self._charm.unit.is_leader():
-            return self._leader_ensure_secret(relation)
+            return self._leader_ensure_secret(relation).get_content(refresh=True)[_SECRET_FIELD]
 
         return self._read_secret(relation)
 
-    def _leader_ensure_secret(self, relation: ops.Relation) -> str:
+    def grant_passphrase(self, relations: list[ops.Relation]) -> dict[int, str]:
+        """Leader grants the passphrase secret to each relation's remote application.
+
+        Juju revokes a grant once its relation is removed. Returns the secret
+        ID by relation ID, for the relations it was granted to. It is left out
+        for any it could not be, and they are tried again on the next hook.
+        """
+        peer = self.relation
+        if peer is None or not relations or not self._charm.unit.is_leader():
+            return {}
+        try:
+            secret = self._leader_ensure_secret(peer)
+        except ops.ModelError as exc:
+            logger.warning("Cannot read the session passphrase secret: %s", exc)
+            return {}
+        granted: dict[int, str] = {}
+        for relation in relations:
+            try:
+                secret.grant(relation)
+            except ops.ModelError as exc:
+                logger.warning("Cannot grant the passphrase to %s: %s", relation, exc)
+            else:
+                granted[relation.id] = secret.id or ""
+        return granted
+
+    def _leader_ensure_secret(self, relation: ops.Relation) -> ops.Secret:
         app_data = relation.data[self._charm.app]
-        secret_id = app_data.get(_APP_KEY_SECRET_ID)
+        secret_id = app_data.get(APP_KEY_SECRET_ID)
         if secret_id:
             secret = self._charm.model.get_secret(id=secret_id)
         else:
@@ -364,7 +557,7 @@ class ClusterCoordinator:
                     {_SECRET_FIELD: passphrase},
                     label=_SECRET_LABEL,
                 )
-            app_data[_APP_KEY_SECRET_ID] = secret.id or ""
+            app_data[APP_KEY_SECRET_ID] = secret.id or ""
 
         # Grant read access per peer unit, not at application/relation
         # scope: for a peer relation the "remote application" is the same
@@ -382,24 +575,23 @@ class ClusterCoordinator:
                     "Cannot grant session-passphrase secret to %s: %s", peer_unit.name, exc
                 )
 
-        return secret.get_content(refresh=True)[_SECRET_FIELD]
+        return secret
 
     def _read_secret(self, relation: ops.Relation) -> str | None:
-        secret_id = relation.data[self._charm.app].get(_APP_KEY_SECRET_ID)
-        if not secret_id:
-            return None
-        try:
-            secret = self._charm.model.get_secret(id=secret_id)
-            return secret.get_content(refresh=True)[_SECRET_FIELD]
-        except ops.SecretNotFoundError:
-            return None
+        secret_id = relation.data[self._charm.app].get(APP_KEY_SECRET_ID, "")
+        return read_passphrase(self._charm.model, secret_id)
 
 
 def validate_membership(
     juju_hostnames: set[str],
     member_names: set[str],
+    known: set[str] | None = None,
 ) -> list[str]:
     """Validate Juju units against MicroCloud members, matched on hostname.
+
+    ``juju_hostnames`` are the units expected to be MicroCloud members.
+    ``known`` adds units allowed to be members without being expected to,
+    such as member units still joining or of a removed "members" relation.
 
     Returns a list of human-readable problems (empty if consistent):
 
@@ -408,7 +600,7 @@ def validate_membership(
     """
     problems: list[str] = []
 
-    missing_units = sorted(member_names - juju_hostnames)
+    missing_units = sorted(member_names - juju_hostnames - (known or set()))
     for name in missing_units:
         problems.append(f"MicroCloud member {name!r} is not deployed as a Juju unit")
 

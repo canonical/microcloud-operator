@@ -254,4 +254,13 @@ run "endpoints_use_the_cc008_shape" {
     }
     error_message = "requires.logging should be a CC008 endpoint object naming the application"
   }
+
+  assert {
+    condition = (
+      output.provides.members.endpoint == "members" &&
+      output.requires.orchestrator.endpoint == "orchestrator" &&
+      output.requires.orchestrator.name == "cloud"
+    )
+    error_message = "members and orchestrator should be exposed for relating member applications"
+  }
 }

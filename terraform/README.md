@@ -30,6 +30,7 @@ module "microcloud" {
   units      = 3
 
   config = {
+    "orchestrator"           = "true"
     "snap-channel-microceph" = ""
     "snap-channel-microovn"  = ""
   }
@@ -71,6 +72,7 @@ module "microcloud" {
   ]
 
   config = {
+    "orchestrator"         = "true"
     "storage-wipe"         = "true"
     "ovn-uplink-interface" = "enp9s0"
     "ovn-ipv4-gateway"     = "10.0.5.1/24"
@@ -79,6 +81,57 @@ module "microcloud" {
   }
 }
 ```
+
+### Orchestrator and member applications
+
+Each architecture or hardware profile is a module instance of its own. The
+orchestrator instance sets `orchestrator = "true"` and starts the cluster;
+member instances keep the default `"false"` and join it through a
+`members`–`orchestrator` integration. Multi-application clusters need
+MicroCeph.
+
+```hcl
+module "microcloud" {
+  source = "github.com/canonical/charm-microcloud//terraform"
+
+  model_uuid  = juju_model.prod.uuid
+  channel     = "3/edge"
+  units       = 3
+  constraints = "arch=amd64"
+
+  config = {
+    "orchestrator"           = "true"
+    "snap-channel-microceph" = "tentacle/stable"
+  }
+}
+
+module "microcloud_arm64" {
+  source = "github.com/canonical/charm-microcloud//terraform"
+
+  model_uuid  = juju_model.prod.uuid
+  app_name    = "microcloud-arm64"
+  channel     = "3/edge"
+  units       = 2
+  constraints = "arch=arm64"
+}
+
+resource "juju_integration" "members" {
+  model_uuid = juju_model.prod.uuid
+
+  application {
+    name     = module.microcloud.provides.members.name
+    endpoint = module.microcloud.provides.members.endpoint
+  }
+
+  application {
+    name     = module.microcloud_arm64.requires.orchestrator.name
+    endpoint = module.microcloud_arm64.requires.orchestrator.endpoint
+  }
+}
+```
+
+Member units install the orchestrator's snap channels, so their own
+`snap-channel-*` options are ignored.
 
 ### Wiring up observability
 
@@ -103,6 +156,11 @@ resource "juju_integration" "cos_agent" {
 ```
 
 ## Things that are easy to get wrong
+
+**Set `orchestrator = "true"` on the application that starts the cluster.**
+It defaults to `"false"`, and an application without it waits for an
+`orchestrator` integration instead of forming a cluster. The product module
+sets it for you.
 
 **Every config value is a string.** Booleans are `"true"` and `"false"`,
 integers are `"300"`.

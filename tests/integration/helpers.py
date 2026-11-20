@@ -37,16 +37,28 @@ def deploy_microcloud(
     num_units: int,
     constraints: dict[str, str] | None = None,
     config: dict[str, str] | None = None,
+    app: str = MICROCLOUD_CHARM,
+    orchestrator: bool = True,
+    storage: dict[str, str] | None = None,
 ) -> None:
-    """Deploy MicroCloud without waiting, so callers can test blocked states."""
+    """Deploy MicroCloud without waiting, so callers can test blocked states.
+
+    The application forms its own cluster unless ``orchestrator`` is False,
+    which deploys a member application to relate to an orchestrator.
+    """
     if constraints:
         juju.cli("set-model-constraints", *[f"{k}={v}" for k, v in constraints.items()])
 
     juju.deploy(
         charm_path,
-        app=MICROCLOUD_CHARM,
+        app=app,
         num_units=num_units,
-        config={**LXD_ONLY_CONFIG, **(config or {})},
+        config={
+            **LXD_ONLY_CONFIG,
+            "orchestrator": "true" if orchestrator else "false",
+            **(config or {}),
+        },
+        storage=storage,
     )
 
 
@@ -130,13 +142,13 @@ def cluster_members(juju: jubilant.Juju, unit: str | None = None) -> list[dict[s
     return json.loads(results["microcloud-members"])
 
 
-def unit_hostnames(juju: jubilant.Juju) -> dict[str, str]:
+def unit_hostnames(juju: jubilant.Juju, app: str = MICROCLOUD_CHARM) -> dict[str, str]:
     """Map each unit name to the hostname its machine reports.
 
     The charm matches Juju units to MicroCloud members on hostname, so the
     tests verify that same mapping rather than trusting unit ordering.
     """
-    return {unit: ssh(juju, unit, "hostname").strip() for unit in unit_names(juju)}
+    return {unit: ssh(juju, unit, "hostname").strip() for unit in unit_names(juju, app)}
 
 
 def snap_installed(juju: jubilant.Juju, unit: str, snap: str) -> bool:
@@ -221,14 +233,20 @@ def microceph_members(juju: jubilant.Juju) -> set[str]:
     return {line.split()[1] for line in output.splitlines() if line.startswith("- ")}
 
 
-def cluster_app_data(juju: jubilant.Juju) -> dict[str, str]:
-    """Return the application data the units share on their peer relation."""
-    unit = leader_unit(juju)
+def leader_relations(juju: jubilant.Juju, app: str = MICROCLOUD_CHARM) -> list[dict]:
+    """Return the relations of ``app``'s leader, as ``juju show-unit`` reports them."""
+    unit = leader_unit(juju, app)
     info = json.loads(juju.cli("show-unit", unit, "--format", "json"))[unit]
-    for relation in info.get("relation-info", []):
+    return info.get("relation-info", [])
+
+
+def cluster_app_data(juju: jubilant.Juju) -> dict[str, str]:
+    """Return the application data the charm shares on its peer relation."""
+    relations = leader_relations(juju)
+    for relation in relations:
         if relation["endpoint"] == "cluster":
             return relation.get("application-data", {})
-    raise AssertionError(f"{unit} has no cluster relation: {info}")
+    raise AssertionError(f"The leader has no cluster relation: {relations}")
 
 
 def session_passphrase(juju: jubilant.Juju) -> str:
