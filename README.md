@@ -14,7 +14,7 @@ it exposes cluster metrics and logs so you can monitor the health of your MicroC
 already be deployed out-of-band. The charm is installed alongside an
 existing MicroCloud cluster, one unit per cluster member, and verifies on
 every unit that the machine is in fact a MicroCloud member. If it is not,
-the unit goes into an error state, since the charm is only supported on
+the unit goes into a blocked state, since the charm is only supported on
 machines that are already part of a MicroCloud cluster.
 
 ## Requirements
@@ -51,15 +51,13 @@ metrics and logs from your MicroCloud cluster:
 
 ```shell
 juju deploy opentelemetry-collector
-juju relate opentelemetry-collector <microcloud charm>:cos_agent
-juju relate opentelemetry-collector <microcloud charm>:logging
-juju relate opentelemetry-collector loki
-juju relate opentelemetry-collector prometheus
-juju relate opentelemetry-collector grafana
+juju relate opentelemetry-collector microcloud:cos-agent
+juju relate opentelemetry-collector microcloud:logging
 ```
 
-This requires the COS stack to already be deployed, with the `loki`,
-`prometheus`, and `grafana` SAAS offers available to consume.
+To connect the collector to your COS stack (the `loki`, `prometheus` and
+`grafana` offers), follow the
+[how-to guide](https://canonical.com/microcloud/docs/latest/how-to/charm_metrics/).
 
 ## Add a cluster member
 
@@ -80,7 +78,7 @@ on GitHub. For more information, see the [Security policy](SECURITY.md).
 
 ## Contributing
 
-* For best practices on how to write and contribute to charms, see the [Juju SDK docs](https://juju.is/docs/sdk/how-to)
+* For best practices on how to write and contribute to charms, see the [Juju SDK docs](https://canonical.com/juju/docs/ops/latest/)
 * For developer guidance specific to this charm, see [CONTRIBUTING.md](CONTRIBUTING.md)
 * Report bugs and feature requests through the [GitHub Issues tab](https://github.com/canonical/microcloud-operator/issues)
 

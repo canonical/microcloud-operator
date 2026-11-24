@@ -116,7 +116,7 @@ class CephMgrPrometheus:
             logger.info("ceph-mgr is not active on this node; skipping prometheus module setup")
             return
 
-        logger.info("Enabling Ceph mgr Prometheus module on %s:%d", LOCALHOST_ADDR, self._port)
+        logger.debug("Enabling Ceph mgr Prometheus module on %s:%d", LOCALHOST_ADDR, self._port)
 
         self._ceph("mgr", "module", "enable", "prometheus")
         self._ceph(
@@ -163,7 +163,7 @@ class CephMgrPrometheus:
 
     def _ceph(self, *args: str) -> str:
         """Run a ceph command and return stdout."""
-        cmd = ["ceph", *args]
+        cmd = ["/snap/bin/ceph", *args]
         try:
             result = subprocess.run(
                 cmd,
