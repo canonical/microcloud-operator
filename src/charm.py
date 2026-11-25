@@ -916,7 +916,7 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _reconcile_dpus(self) -> str | None:
         """Pair the DPUs in this unit's host, once its LXD is a cluster member."""
-        if self._dpus.relation() is None:
+        if self._dpus.relation() is None and not self._dpus.pending_cleanup():
             return None
         try:
             member = lxd_cluster.own_name()

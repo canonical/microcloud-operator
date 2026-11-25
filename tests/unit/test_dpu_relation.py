@@ -37,12 +37,17 @@ class FakeLXD:
     def __init__(self):
         self.constituents: list[lxd_cluster.Constituent] = []
         self.issued: list[str] = []
+        self.removed: list[str] = []
         self.conflicts: set[str] = set()
 
     def trust(self, name, member="node-1", reachable=True):
         self.constituents.append(
             lxd_cluster.Constituent(name, member, "[fd2b::15]:8443", True, reachable)
         )
+
+    def remove_constituent(self, name):
+        self.removed.append(name)
+        self.constituents = [c for c in self.constituents if c.name != name]
 
     def add_constituent(self, name):
         if name in self.conflicts:
@@ -57,6 +62,7 @@ def lxd():
     with (
         patch.object(lxd_cluster, "constituents", side_effect=lambda: list(fake.constituents)),
         patch.object(lxd_cluster, "add_constituent", side_effect=fake.add_constituent),
+        patch.object(lxd_cluster, "remove_constituent", side_effect=fake.remove_constituent),
     ):
         yield fake
 
@@ -186,6 +192,123 @@ def test_a_trusted_dpu_keeps_its_secret_until_it_reports_joined(harness, lxd):
     dpus.reconcile("node-1", _OAM)
 
     assert list(_tokens(harness, rel_id)) == ["microcloud-dpu/0"]
+
+
+def _joined(harness, lxd, *dpus):
+    """Relate DPUs and take each through a successful join."""
+    rel_id = _relate(harness, *dpus)
+    relation = DPURelation(harness.charm)
+    relation.reconcile("node-1", _OAM)
+    for index, data in enumerate(dpus):
+        lxd.trust(data["name"])
+        harness.update_relation_data(rel_id, f"microcloud-dpu/{index}", {"joined": "true"})
+    relation.reconcile("node-1", _OAM)
+    return rel_id, relation
+
+
+def test_a_departed_dpu_has_its_constituent_removed(harness, lxd):
+    rel_id, dpus = _joined(harness, lxd, _dpu(), _dpu("node-1-dpu-1"))
+
+    harness.remove_relation_unit(rel_id, "microcloud-dpu/1")
+    dpus.reconcile("node-1", _OAM)
+
+    assert lxd.removed == ["node-1-dpu-1"]
+    assert [c.name for c in lxd.constituents] == ["node-1-dpu-0"]
+
+
+def test_a_dpu_departing_with_a_pending_token_has_it_removed(harness, lxd):
+    rel_id = _relate(harness, _dpu())
+    dpus = DPURelation(harness.charm)
+    dpus.reconcile("node-1", _OAM)
+
+    harness.remove_relation_unit(rel_id, "microcloud-dpu/0")
+    dpus.reconcile("node-1", _OAM)
+
+    assert "tokens" not in _local(harness, rel_id)
+    with pytest.raises(ops.SecretNotFoundError):
+        harness.model.get_secret(label="lxd-dpu-token-node-1-dpu-0")
+
+
+def test_removing_the_relation_removes_every_constituent(harness, lxd):
+    rel_id, dpus = _joined(harness, lxd, _dpu(), _dpu("node-1-dpu-1"))
+
+    harness.remove_relation(rel_id)
+    assert dpus.pending_cleanup()
+    dpus.reconcile("node-1", _OAM)
+
+    assert sorted(lxd.removed) == ["node-1-dpu-0", "node-1-dpu-1"]
+    assert not dpus.pending_cleanup()
+
+
+def test_a_dpu_that_forgot_its_pairing_is_paired_again(harness, lxd):
+    rel_id, dpus = _joined(harness, lxd, _dpu())
+
+    # refresh-pairing on the DPU clears joined.
+    harness.update_relation_data(rel_id, "microcloud-dpu/0", {"joined": ""})
+    dpus.reconcile("node-1", _OAM)
+
+    assert lxd.removed == ["node-1-dpu-0"]
+    assert lxd.issued == ["node-1-dpu-0", "node-1-dpu-0"]
+    assert list(_tokens(harness, rel_id)) == ["microcloud-dpu/0"]
+
+
+def test_a_dpu_removed_in_lxd_is_not_paired_again(harness, lxd):
+    rel_id, dpus = _joined(harness, lxd, _dpu())
+
+    lxd.constituents.clear()
+    dpus.reconcile("node-1", _OAM)
+
+    assert lxd.issued == ["node-1-dpu-0"]
+    assert "tokens" not in _local(harness, rel_id)
+
+
+def test_a_renamed_dpu_has_its_old_constituent_removed(harness, lxd):
+    rel_id, dpus = _joined(harness, lxd, _dpu())
+
+    harness.update_relation_data(
+        rel_id, "microcloud-dpu/0", {"name": "node-1-dpu-9", "joined": ""}
+    )
+    dpus.reconcile("node-1", _OAM)
+
+    assert lxd.removed == ["node-1-dpu-0"]
+    assert lxd.issued[-1] == "node-1-dpu-9"
+
+
+def test_a_lost_token_is_recovered_from_its_secret(harness, lxd):
+    rel_id = _relate(harness, _dpu())
+    dpus = DPURelation(harness.charm)
+    dpus.reconcile("node-1", _OAM)
+    secret_id = _tokens(harness, rel_id)["microcloud-dpu/0"]
+    # A hook issued the token, then failed before it recorded the secret.
+    harness.update_relation_data(rel_id, harness.charm.unit.name, {"tokens": ""})
+    lxd.conflicts.add("node-1-dpu-0")
+
+    dpus.reconcile("node-1", _OAM)
+
+    assert _tokens(harness, rel_id) == {"microcloud-dpu/0": secret_id}
+
+
+def test_an_lxd_error_on_one_dpu_does_not_stop_the_others(harness, lxd):
+    rel_id, dpus = _joined(harness, lxd, _dpu(), _dpu("node-1-dpu-1"))
+    for index in (0, 1):
+        harness.update_relation_data(rel_id, f"microcloud-dpu/{index}", {"joined": ""})
+
+    def remove(name):
+        if name == "node-1-dpu-0":
+            raise lxd_cluster.LXDClusterError("boom")
+        lxd.remove_constituent(name)
+
+    with patch.object(lxd_cluster, "remove_constituent", side_effect=remove):
+        dpus.reconcile("node-1", _OAM)
+
+    assert list(_tokens(harness, rel_id)) == ["microcloud-dpu/1"]
+
+
+def test_remove_constituent_ignores_a_missing_one():
+    error = lxd_cluster.LXDClusterError("lxc query DELETE ... failed: Error: Not Found")
+
+    with patch.object(lxd_cluster, "_query", side_effect=error):
+        lxd_cluster.remove_constituent("node-1-dpu-0")
 
 
 def test_a_taken_name_is_skipped(harness, lxd):

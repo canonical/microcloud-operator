@@ -83,20 +83,39 @@ def _set(data: ops.RelationDataContent, key: str, value: str) -> None:
         data.pop(key, None)
 
 
-class DPURelation:
+class DPURelation(ops.Object):
     """This unit's side of the "dpus" relation."""
 
+    _stored = ops.StoredState()
+
     def __init__(self, charm: ops.CharmBase) -> None:
+        super().__init__(charm, DPUS)
         self._charm = charm
+        # DPU unit -> constituent name, for every DPU this unit has paired or
+        # issued a token to. A departed unit's databag cannot be read, so this
+        # is how the unit finds what to remove.
+        self._stored.set_default(owned={})
 
     def relation(self) -> ops.Relation | None:
         """Return the "dpus" relation, or None if no DPU application is related."""
         return self._charm.model.get_relation(DPUS)
 
+    def pending_cleanup(self) -> bool:
+        """Return True while DPUs of a removed relation still need removing."""
+        return self.relation() is None and bool(self._stored.owned)
+
     def reconcile(self, member: str, oam_address: str) -> None:
-        """Publish this unit's member and OAM address, and pair the DPUs it owns."""
+        """Publish this unit's member and OAM address, and pair the DPUs it owns.
+
+        Removes the constituent of each DPU that has left, or of every DPU once
+        the relation is removed.
+        """
         relation = self.relation()
+        owned = dict(self._stored.owned)
         if relation is None:
+            for name in owned.values():
+                self._unpair(name)
+            self._stored.owned = {}
             return
 
         data = relation.data[self._charm.unit]
@@ -104,10 +123,10 @@ class DPURelation:
         _set(data, _KEY_OAM_ADDRESS, oam_address)
 
         tokens = self._tokens(data)
-        trusted = {
-            constituent.name
+        existing = {
+            constituent.name: constituent
             for constituent in lxd_cluster.constituents()
-            if constituent.member == member and constituent.trusted
+            if constituent.member == member
         }
 
         # Constituent name -> DPU unit, to spot two DPUs with one name.
@@ -125,21 +144,62 @@ class DPURelation:
                 continue
             names[dpu.name] = unit.name
 
-            pending = tokens.get(unit.name)
-            if dpu.name in trusted:
-                if pending and dpu.joined:
-                    self._remove_secret(pending)
-                    del tokens[unit.name]
+            try:
+                self._pair(relation, dpu, owned, tokens, existing.get(dpu.name))
+            except lxd_cluster.LXDClusterError as exc:
+                logger.error("Cannot pair %s: %s", dpu.name, exc)
+
+        for unit_name in set(owned) - set(names.values()):
+            logger.info("DPU %s left", unit_name)
+            try:
+                self._unpair(owned[unit_name])
+            except lxd_cluster.LXDClusterError as exc:
+                logger.error("Cannot remove %s: %s", owned[unit_name], exc)
                 continue
+            del owned[unit_name]
+            tokens.pop(unit_name, None)
 
-            if pending:
-                continue
-
-            secret_id = self._issue(relation, dpu)
-            if secret_id:
-                tokens[unit.name] = secret_id
-
+        self._stored.owned = owned
         _set(data, _KEY_TOKENS, json.dumps(tokens, sort_keys=True) if tokens else "")
+
+    def _pair(
+        self,
+        relation: ops.Relation,
+        dpu: DPU,
+        owned: dict[str, str],
+        tokens: dict[str, str],
+        constituent: lxd_cluster.Constituent | None,
+    ) -> None:
+        """Move one DPU on towards trusted, updating ``owned`` and ``tokens`` in place."""
+        unit = dpu.unit.name
+        previous = owned.get(unit)
+        if previous and previous != dpu.name:
+            # The DPU was renamed: its old constituent is stale.
+            self._unpair(previous)
+            tokens.pop(unit, None)
+        owned[unit] = dpu.name
+
+        pending = tokens.get(unit)
+        if pending:
+            if constituent is not None and constituent.trusted and dpu.joined:
+                self._remove_secret(pending)
+                del tokens[unit]
+            return
+
+        if constituent is not None:
+            if dpu.joined:
+                return
+            # The DPU forgot its pairing (refresh-pairing, or a new address),
+            # so LXD's record of it is stale.
+            logger.info("Re-pairing %s", dpu.name)
+            self._remove_constituent(dpu.name)
+        elif dpu.joined:
+            # Removed in LXD on purpose; the DPU re-pairs with refresh-pairing.
+            return
+
+        secret_id = self._issue(relation, dpu)
+        if secret_id:
+            tokens[unit] = secret_id
 
     def expired(self, secret: ops.Secret) -> bool:
         """Drop a join token that expired unused. Returns False if it is not one.
@@ -174,6 +234,13 @@ class DPURelation:
         try:
             token = lxd_cluster.add_constituent(dpu.name)
         except lxd_cluster.ConstituentConflictError as exc:
+            # A token this unit issued in a hook that then lost track of it.
+            try:
+                secret = self._charm.model.get_secret(label=_TOKEN_LABEL_PREFIX + dpu.name)
+                secret.grant(relation, unit=dpu.unit)
+                return secret.get_info().id
+            except ops.SecretNotFoundError:
+                pass
             # Another DPU holds the name, or a token issued outside the charm is
             # pending: LXD keeps it until it expires.
             logger.warning("Cannot issue a join token for %s: %s", dpu.name, exc)
@@ -200,6 +267,17 @@ class DPURelation:
 
         logger.info("Issued a join token for %s to %s", dpu.name, dpu.unit.name)
         return secret.id
+
+    def _unpair(self, name: str) -> None:
+        """Remove DPU ``name``'s constituent and any join token it holds."""
+        self._remove_constituent(name)
+        with contextlib.suppress(ops.SecretNotFoundError):
+            self._charm.model.get_secret(label=_TOKEN_LABEL_PREFIX + name).remove_all_revisions()
+
+    @staticmethod
+    def _remove_constituent(name: str) -> None:
+        logger.info("Removing constituent %s", name)
+        lxd_cluster.remove_constituent(name)
 
     def _remove_secret(self, secret_id: str) -> None:
         with contextlib.suppress(ops.SecretNotFoundError):

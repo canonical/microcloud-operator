@@ -269,6 +269,15 @@ def constituents() -> list[Constituent]:
     return result
 
 
+def remove_constituent(name: str) -> None:
+    """Remove constituent ``name``, if it exists. LXD forgets its identity with it."""
+    try:
+        _query(f"/1.0/cluster/constituents/{name}", "DELETE")
+    except LXDClusterError as exc:
+        if "not found" not in str(exc).lower():
+            raise
+
+
 def add_constituent(name: str) -> str:
     """Issue a join token for DPU ``name`` on this member, and return it.
 
