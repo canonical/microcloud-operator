@@ -167,6 +167,8 @@ class MicroCloudCharm(ops.CharmBase):
         # so the generic status at the end of reconciliation does not
         # overwrite it.
         self._status_held = False
+        # Problems with this unit's DPUs, reported in its status.
+        self._dpu_notes: list[str] = []
 
         self._cos_agent = COSAgentProvider(
             self,
@@ -923,10 +925,11 @@ class MicroCloudCharm(ops.CharmBase):
         except lxd_cluster.LXDClusterError as exc:
             return f"Cannot read the LXD member name: {exc}"
         try:
-            self._dpus.reconcile(member, self._network.space_bind_address(DPUS))
+            self._dpu_notes = self._dpus.reconcile(member, self._network.space_bind_address(DPUS))
         except lxd_cluster.LXDClusterError as exc:
             # The cluster runs without its DPUs; this must not block the unit.
             logger.error("Cannot pair DPUs: %s", exc)
+            self._dpu_notes = ["cannot pair DPUs; see juju debug-log"]
         return None
 
     def _await_lxd_join(self) -> str | None:
@@ -1235,6 +1238,9 @@ class MicroCloudCharm(ops.CharmBase):
                 self.unit.status = ops.BlockedStatus("; ".join(problems))
                 return
             message += "; observability active"
+
+        for note in self._dpu_notes:
+            message += f"; {note}"
 
         # The leader alone reports control-plane coverage, so it shows once.
         if self.unit.is_leader():

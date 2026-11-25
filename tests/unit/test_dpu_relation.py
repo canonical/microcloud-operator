@@ -256,8 +256,9 @@ def test_a_dpu_removed_in_lxd_is_not_paired_again(harness, lxd):
     rel_id, dpus = _joined(harness, lxd, _dpu())
 
     lxd.constituents.clear()
-    dpus.reconcile("node-1", _OAM)
+    notes = dpus.reconcile("node-1", _OAM)
 
+    assert notes == ["DPU node-1-dpu-0 not in LXD; run refresh-pairing on microcloud-dpu/0"]
     assert lxd.issued == ["node-1-dpu-0"]
     assert "tokens" not in _local(harness, rel_id)
 
@@ -299,9 +300,10 @@ def test_an_lxd_error_on_one_dpu_does_not_stop_the_others(harness, lxd):
         lxd.remove_constituent(name)
 
     with patch.object(lxd_cluster, "remove_constituent", side_effect=remove):
-        dpus.reconcile("node-1", _OAM)
+        notes = dpus.reconcile("node-1", _OAM)
 
     assert list(_tokens(harness, rel_id)) == ["microcloud-dpu/1"]
+    assert notes == ["cannot pair DPU node-1-dpu-0"]
 
 
 def test_remove_constituent_ignores_a_missing_one():
@@ -315,16 +317,31 @@ def test_a_taken_name_is_skipped(harness, lxd):
     lxd.conflicts.add("node-1-dpu-0")
     rel_id = _relate(harness, _dpu())
 
-    DPURelation(harness.charm).reconcile("node-1", _OAM)
+    notes = DPURelation(harness.charm).reconcile("node-1", _OAM)
 
     assert "tokens" not in _local(harness, rel_id)
+    assert notes == ["DPU name node-1-dpu-0 is taken"]
+
+
+def test_an_unreachable_dpu_is_reported(harness, lxd):
+    _, dpus = _joined(harness, lxd, _dpu(), _dpu("node-1-dpu-1"))
+    lxd.constituents[1].reachable = False
+
+    assert dpus.reconcile("node-1", _OAM) == ["DPU node-1-dpu-1 unreachable"]
+
+
+def test_paired_dpus_report_nothing(harness, lxd):
+    _, dpus = _joined(harness, lxd, _dpu())
+
+    assert dpus.reconcile("node-1", _OAM) == []
 
 
 def test_two_dpus_with_one_name_get_one_token(harness, lxd):
     rel_id = _relate(harness, _dpu(), _dpu())
 
-    DPURelation(harness.charm).reconcile("node-1", _OAM)
+    notes = DPURelation(harness.charm).reconcile("node-1", _OAM)
 
+    assert notes == ["DPUs microcloud-dpu/0 and microcloud-dpu/1 share a name"]
     assert lxd.issued == ["node-1-dpu-0"]
     assert list(_tokens(harness, rel_id)) == ["microcloud-dpu/0"]
 

@@ -95,6 +95,8 @@ class DPURelation(ops.Object):
         # issued a token to. A departed unit's databag cannot be read, so this
         # is how the unit finds what to remove.
         self._stored.set_default(owned={})
+        # Problems found by the last reconcile, for the unit's status.
+        self._notes: list[str] = []
 
     def relation(self) -> ops.Relation | None:
         """Return the "dpus" relation, or None if no DPU application is related."""
@@ -104,19 +106,21 @@ class DPURelation(ops.Object):
         """Return True while DPUs of a removed relation still need removing."""
         return self.relation() is None and bool(self._stored.owned)
 
-    def reconcile(self, member: str, oam_address: str) -> None:
+    def reconcile(self, member: str, oam_address: str) -> list[str]:
         """Publish this unit's member and OAM address, and pair the DPUs it owns.
 
         Removes the constituent of each DPU that has left, or of every DPU once
-        the relation is removed.
+        the relation is removed. Returns the problems to report in the unit's
+        status; none of them blocks the unit.
         """
+        self._notes = []
         relation = self.relation()
         owned = dict(self._stored.owned)
         if relation is None:
             for name in owned.values():
                 self._unpair(name)
             self._stored.owned = {}
-            return
+            return []
 
         data = relation.data[self._charm.unit]
         _set(data, _KEY_MEMBER, member)
@@ -141,6 +145,7 @@ class DPURelation(ops.Object):
                 logger.warning(
                     "DPUs %s and %s are both named %s", names[dpu.name], unit.name, dpu.name
                 )
+                self._notes.append(f"DPUs {names[dpu.name]} and {unit.name} share a name")
                 continue
             names[dpu.name] = unit.name
 
@@ -148,6 +153,7 @@ class DPURelation(ops.Object):
                 self._pair(relation, dpu, owned, tokens, existing.get(dpu.name))
             except lxd_cluster.LXDClusterError as exc:
                 logger.error("Cannot pair %s: %s", dpu.name, exc)
+                self._notes.append(f"cannot pair DPU {dpu.name}")
 
         for unit_name in set(owned) - set(names.values()):
             logger.info("DPU %s left", unit_name)
@@ -161,6 +167,7 @@ class DPURelation(ops.Object):
 
         self._stored.owned = owned
         _set(data, _KEY_TOKENS, json.dumps(tokens, sort_keys=True) if tokens else "")
+        return list(self._notes)
 
     def _pair(
         self,
@@ -188,6 +195,9 @@ class DPURelation(ops.Object):
 
         if constituent is not None:
             if dpu.joined:
+                # LXD probes each agent; this unit reports, and does not act.
+                if constituent.trusted and not constituent.reachable:
+                    self._notes.append(f"DPU {dpu.name} unreachable")
                 return
             # The DPU forgot its pairing (refresh-pairing, or a new address),
             # so LXD's record of it is stale.
@@ -195,6 +205,7 @@ class DPURelation(ops.Object):
             self._remove_constituent(dpu.name)
         elif dpu.joined:
             # Removed in LXD on purpose; the DPU re-pairs with refresh-pairing.
+            self._notes.append(f"DPU {dpu.name} not in LXD; run refresh-pairing on {unit}")
             return
 
         secret_id = self._issue(relation, dpu)
@@ -244,9 +255,11 @@ class DPURelation(ops.Object):
             # Another DPU holds the name, or a token issued outside the charm is
             # pending: LXD keeps it until it expires.
             logger.warning("Cannot issue a join token for %s: %s", dpu.name, exc)
+            self._notes.append(f"DPU name {dpu.name} is taken")
             return None
         except lxd_cluster.LXDClusterError as exc:
             logger.error("Cannot issue a join token for %s: %s", dpu.name, exc)
+            self._notes.append(f"cannot pair DPU {dpu.name}")
             return None
 
         content = {_TOKEN_FIELD: token}
@@ -263,6 +276,7 @@ class DPURelation(ops.Object):
             secret.grant(relation, unit=dpu.unit)
         except (lxd_cluster.LXDClusterError, ops.ModelError) as exc:
             logger.error("Cannot share the join token for %s: %s", dpu.name, exc)
+            self._notes.append(f"cannot pair DPU {dpu.name}")
             return None
 
         logger.info("Issued a join token for %s to %s", dpu.name, dpu.unit.name)

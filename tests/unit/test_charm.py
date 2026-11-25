@@ -2989,6 +2989,7 @@ class TestFailureDomains:
         stub._control_plane = MagicMock(spec=ControlPlane)
         stub._control_plane.coverage_warning.return_value = warning
         stub._is_orchestrator.return_value = True
+        stub._dpu_notes = []
         MicroCloudCharm._set_status(stub, initialized=True)
         return stub
 
@@ -3461,6 +3462,7 @@ class TestMemberReconcile:
         stub._is_orchestrator.return_value = False
         stub._cos_related.return_value = False
         stub.unit.is_leader.return_value = False
+        stub._dpu_notes = []
 
         MicroCloudCharm._set_status(stub, initialized=True)
 
@@ -3473,6 +3475,7 @@ class TestMemberReconcile:
         stub._is_orchestrator.return_value = False
         stub._cos_related.return_value = False
         stub.unit.is_leader.return_value = False
+        stub._dpu_notes = []
 
         MicroCloudCharm._set_status(stub, initialized=True)
 
@@ -3969,3 +3972,21 @@ class TestDPUs:
         stub._dpus.reconcile.side_effect = lxd_cluster.LXDClusterError("Not Found")
         with patch.object(lxd_cluster, "own_name", return_value="node-1"):
             assert MicroCloudCharm._reconcile_dpus(stub) is None
+        assert stub._dpu_notes == ["cannot pair DPUs; see juju debug-log"]
+
+    def test_dpu_problems_show_in_an_active_status(self):
+        import ops
+
+        from charm import MicroCloudCharm
+        from control_plane import ControlPlane
+
+        stub = self._stub()
+        stub.unit.is_leader.return_value = False
+        stub._cos_related.return_value = False
+        stub._is_orchestrator.return_value = True
+        stub._control_plane = MagicMock(spec=ControlPlane)
+        stub._dpu_notes = ["DPU node-1-dpu-1 unreachable"]
+
+        MicroCloudCharm._set_status(stub, initialized=True)
+
+        assert stub.unit.status == ops.ActiveStatus("Cluster ready; DPU node-1-dpu-1 unreachable")
