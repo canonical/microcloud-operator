@@ -14,6 +14,11 @@ output "provides" {
       name     = juju_application.microcloud.name
       endpoint = "cos-agent"
     }
+    dpus = {
+      kind     = "endpoint"
+      name     = juju_application.microcloud.name
+      endpoint = "dpus"
+    }
     members = {
       kind     = "endpoint"
       name     = juju_application.microcloud.name

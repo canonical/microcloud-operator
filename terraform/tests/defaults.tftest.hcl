@@ -263,4 +263,9 @@ run "endpoints_use_the_cc008_shape" {
     )
     error_message = "members and orchestrator should be exposed for relating member applications"
   }
+
+  assert {
+    condition     = output.provides.dpus.endpoint == "dpus"
+    error_message = "dpus should be exposed for relating microcloud-dpu"
+  }
 }
