@@ -1,0 +1,89 @@
+groups:
+  - name: MicroCloud LXD Alert Rules
+    rules:
+      - alert: LXDInstanceAPIRequestsFailing
+        expr: |
+          sum by (microcloud_cluster, microcloud_member) (
+            increase(lxd_api_requests_completed_total{
+              microcloud_service="lxd", entity_type="instance", result="error_server",
+              microcloud_cluster!="", microcloud_member!=""
+            }[10m])
+          ) >= 5
+          and on (microcloud_cluster, microcloud_member)
+          (
+            sum by (microcloud_cluster, microcloud_member) (
+              rate(lxd_api_requests_completed_total{
+                microcloud_service="lxd", entity_type="instance", result="error_server",
+                microcloud_cluster!="", microcloud_member!=""
+              }[2m])
+            ) > 0
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LXD instance management requests are repeatedly failing"
+          description: >-
+            LXD member {{ $labels.microcloud_member }} in cluster {{ $labels.microcloud_cluster }} has
+            an estimated {{ printf "%.0f" $value }} server-side instance request failures over 10
+            minutes, with the threshold breached continuously for 5 minutes. Inspect failed requests
+            and operations.
+
+      - alert: LXDMetricsMissing
+        expr: |
+          up{microcloud_service="lxd"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Expected LXD member metrics are missing"
+          description: >-
+            Prometheus cannot scrape the LXD metrics endpoint for member {{ $labels.microcloud_member }}
+            in cluster {{ $labels.microcloud_cluster }} (up==0) for 5 minutes. Check discovery, scrape
+            errors, TLS credentials and connectivity.
+
+      - alert: ReplicatorRPOBreached
+        expr: |
+          (lxd_replicator_last_success_oldest_snapshot_timestamp{microcloud_service="lxd"} > 0)
+          and
+          (
+            time() - lxd_replicator_last_success_oldest_snapshot_timestamp{microcloud_service="lxd"}
+            > 24 * 60 * 60
+          )
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          summary: "LXD replicator recovery point is older than the agreed RPO"
+          description: >-
+            LXD replicator for cluster {{ $labels.microcloud_cluster }} has an oldest successful
+            recovery-point snapshot older than the agreed RPO (default 24h in this rule). Investigate
+            replication health and restore successful runs to reduce potential data loss.
+
+      - alert: ReplicatorRunFailed
+        expr: |
+          lxd_replicator_last_run_status{microcloud_service="lxd", status="Failed"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "The latest required LXD replicator run failed"
+          description: >-
+            LXD replicator for cluster {{ $labels.microcloud_cluster }} reports its last run as Failed.
+            No automatic retry is currently available for the failed run.
+            Investigate the failure and restore replication before the recovery point becomes too old.
+
+      - alert: LXDRequiredDRProtectionMissing
+        expr: |
+          (microcloud_lxd_dr_required_project == 1)
+          and on (microcloud_cluster, project)
+          (lxd_replicators{microcloud_service="lxd"} == 0)
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "A required project is missing LXD disaster-recovery protection"
+          description: >-
+            Project {{ $labels.project }} in cluster {{ $labels.microcloud_cluster }} is marked as
+            requiring DR protection but has no configured LXD replicator. Restore replication
+            configuration or clear the DR requirement.
