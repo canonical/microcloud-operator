@@ -210,6 +210,7 @@ class MicroCloudCharm(ops.CharmBase):
             dpu_events.relation_broken,
         ):
             self.framework.observe(event, self._on_cluster_relation_changed)
+        self.framework.observe(self.on.secret_expired, self._on_secret_expired)
         self.framework.observe(self.on.stop, self._on_stop)
         self.framework.observe(self.on.remove, self._on_remove)
 
@@ -286,6 +287,10 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _on_join_session_ended(self, event: JoinSessionEndedEvent) -> None:
         self._reconcile()
+
+    def _on_secret_expired(self, event: ops.SecretExpiredEvent) -> None:
+        if self._dpus.expired(event.secret):
+            self._reconcile()
 
     def _on_stop(self, event: ops.StopEvent) -> None:
         if self._cos_related():
@@ -917,7 +922,11 @@ class MicroCloudCharm(ops.CharmBase):
             member = lxd_cluster.own_name()
         except lxd_cluster.LXDClusterError as exc:
             return f"Cannot read the LXD member name: {exc}"
-        self._dpus.reconcile(member, self._network.space_bind_address(DPUS))
+        try:
+            self._dpus.reconcile(member, self._network.space_bind_address(DPUS))
+        except lxd_cluster.LXDClusterError as exc:
+            # The cluster runs without its DPUs; this must not block the unit.
+            logger.error("Cannot pair DPUs: %s", exc)
         return None
 
     def _await_lxd_join(self) -> str | None:

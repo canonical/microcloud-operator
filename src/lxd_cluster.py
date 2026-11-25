@@ -7,9 +7,13 @@ MicroCloud cannot set a member's failure domain when it forms or grows the
 cluster, so the charm sets it afterwards through the local LXD API.
 """
 
+import base64
+import binascii
 import json
+import re
 import subprocess
 from dataclasses import dataclass, field
+from datetime import datetime
 
 # Roles LXD assigns and preserves itself on current releases, and refuses to
 # have added back once a member has lost them. Older releases skip them too,
@@ -25,6 +29,21 @@ CONTROL_PLANE_MIN_HOLDERS = 3
 
 class LXDClusterError(Exception):
     """Raised when an LXD cluster API call fails."""
+
+
+class ConstituentConflictError(LXDClusterError):
+    """Raised when a constituent name is taken or already has a pending token."""
+
+
+@dataclass
+class Constituent:
+    """Something an LXD member manages outside the cluster, such as a DPU."""
+
+    name: str
+    member: str
+    address: str
+    trusted: bool
+    reachable: bool
 
 
 @dataclass
@@ -226,3 +245,61 @@ def render_table(cluster: list[Member]) -> str:
         + row[3]
         for row in rows
     )
+
+
+def constituents() -> list[Constituent]:
+    """Return every constituent of the cluster, with its trust and reachability."""
+    raw = _query("/1.0/cluster/constituents?recursion=1")
+    if not isinstance(raw, list):
+        raise LXDClusterError("Unexpected response for /1.0/cluster/constituents: not a list")
+    result = []
+    for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("name"):
+            continue
+        state = entry.get("state") or {}
+        result.append(
+            Constituent(
+                name=entry["name"],
+                member=entry.get("member", ""),
+                address=entry.get("address", ""),
+                trusted=bool(state.get("trusted")),
+                reachable=bool(state.get("reachable")),
+            )
+        )
+    return result
+
+
+def add_constituent(name: str) -> str:
+    """Issue a join token for DPU ``name`` on this member, and return it.
+
+    Only this member accepts the join. The token is a credential: it is never
+    put in an error or a log.
+    """
+    command = ["lxc", "cluster", "constituent", "add", name, "--type", "dpu", "--quiet"]
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=True, timeout=30)
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or "").strip()
+        if "already exists" in detail or "already pending" in detail:
+            raise ConstituentConflictError(detail) from exc
+        raise LXDClusterError(f"{' '.join(command)} failed: {detail}") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise LXDClusterError(f"{' '.join(command)} failed: {exc}") from exc
+    token = result.stdout.strip()
+    if not token:
+        raise LXDClusterError(f"{' '.join(command)} printed no token")
+    return token
+
+
+def token_expiry(token: str) -> datetime:
+    """Return when a join token expires. LXD always sets an expiry on constituent tokens."""
+    try:
+        expires_at = json.loads(base64.b64decode(token, validate=True))["expires_at"]
+    except (binascii.Error, ValueError, KeyError, TypeError) as exc:
+        raise LXDClusterError("Cannot read the join token's expiry") from exc
+    # Go writes nanoseconds; datetime takes at most microseconds.
+    expires_at = re.sub(r"(\.\d{6})\d+", r"\1", str(expires_at)).replace("Z", "+00:00")
+    try:
+        return datetime.fromisoformat(expires_at)
+    except ValueError as exc:
+        raise LXDClusterError("Cannot read the join token's expiry") from exc
