@@ -83,3 +83,26 @@ Replacing a role holder:
 3. Run `add-control-plane-role` on the new unit.
 
 Replace a failure domain's last member before removing it. The leader only checks failure domains that still have members.
+
+## DPUs
+
+The [`microcloud-dpu`](https://github.com/canonical/microcloud-dpu-operator) charm runs the LXD DPU agent on each BlueField DPU of a host. Relate it on the `dpus` endpoint, and bind that endpoint to the OAM space the DPUs serve on:
+
+```sh
+juju deploy <charm> microcloud ... --bind dpus=oam
+juju integrate microcloud-dpu:host microcloud:dpus
+```
+
+Each unit pairs the DPUs of its own LXD member. For each one, it adds an LXD constituent of type `dpu` and shares the join token in a Juju secret granted to that DPU unit only. The secret expires with the token, and the unit removes it once LXD trusts the DPU. Removing a DPU unit or the relation removes its constituent.
+
+This needs an LXD with the `cluster_constituents` API extension; set `snap-channel-lxd` to a build that has it. A unit only pairs DPUs once its LXD is a cluster member.
+
+DPU problems never block the unit. It adds them to its status instead, for example `Cluster ready; DPU node-1-dpu-0 unreachable`:
+
+* `DPU <name> unreachable`: LXD trusts the DPU but its health probe fails.
+* `DPU <name> not in LXD; run refresh-pairing on <unit>`: the constituent was removed in LXD. The unit doesn't pair it again by itself; run the `refresh-pairing` action on the DPU unit it names.
+* `DPUs <unit> and <unit> share a name`: two DPUs have the same hostname. Rename one.
+* `DPU name <name> is taken`: LXD already has a constituent or a pending token with that name that this unit didn't issue. Remove it, or wait for the token to expire.
+* `cannot pair DPU <name>` or `cannot pair DPUs; see juju debug-log`: the LXD call failed.
+
+The `lxd_dpu` interface has no application data. Each unit publishes `member` (its LXD member name), `oam-address` (its `dpus` binding address, the only source the DPU agents accept) and `tokens` (the secret ID per DPU unit waiting to join). Each DPU unit publishes `name`, `host`, `address` and, once joined, `joined`. The `microcloud-dpu` README describes both sides.
