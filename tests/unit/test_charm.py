@@ -2989,6 +2989,7 @@ class TestFailureDomains:
         stub._control_plane = MagicMock(spec=ControlPlane)
         stub._control_plane.coverage_warning.return_value = warning
         stub._is_orchestrator.return_value = True
+        stub._dpu_notes = []
         MicroCloudCharm._set_status(stub, initialized=True)
         return stub
 
@@ -3461,6 +3462,7 @@ class TestMemberReconcile:
         stub._is_orchestrator.return_value = False
         stub._cos_related.return_value = False
         stub.unit.is_leader.return_value = False
+        stub._dpu_notes = []
 
         MicroCloudCharm._set_status(stub, initialized=True)
 
@@ -3473,6 +3475,7 @@ class TestMemberReconcile:
         stub._is_orchestrator.return_value = False
         stub._cos_related.return_value = False
         stub.unit.is_leader.return_value = False
+        stub._dpu_notes = []
 
         MicroCloudCharm._set_status(stub, initialized=True)
 
@@ -3917,3 +3920,73 @@ peers:
         stub._reconcile_deploy.return_value = None
         MicroCloudCharm._reconcile_orchestrator(stub, initialized)
         assert stub._record_cluster_channels.called is records
+
+
+# ---------------------------------------------------------------------------
+# dpus relation
+# ---------------------------------------------------------------------------
+
+
+class TestDPUs:
+    def _stub(self):
+        from charm import MicroCloudCharm
+        from dpu_relation import DPURelation
+
+        stub = MagicMock(spec=MicroCloudCharm)
+        stub._dpus = MagicMock(spec=DPURelation)
+        stub._network = MagicMock(spec=UnitNetwork)
+        stub._network.space_bind_address.return_value = "fd2b:5d1a:7c93::10"
+        return stub
+
+    def test_an_expired_join_token_reconciles(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub._dpus.expired.return_value = True
+        MicroCloudCharm._on_secret_expired(stub, MagicMock())
+        stub._reconcile.assert_called_once()
+
+    def test_another_expired_secret_is_left_alone(self):
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub._dpus.expired.return_value = False
+        MicroCloudCharm._on_secret_expired(stub, MagicMock())
+        stub._reconcile.assert_not_called()
+
+    def test_pairs_dpus_with_the_member_name_and_dpus_address(self):
+        import lxd_cluster
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        with patch.object(lxd_cluster, "own_name", return_value="node-1"):
+            assert MicroCloudCharm._reconcile_dpus(stub) is None
+        stub._network.space_bind_address.assert_called_once_with("dpus")
+        stub._dpus.reconcile.assert_called_once_with("node-1", "fd2b:5d1a:7c93::10")
+
+    def test_an_lxd_error_does_not_block_the_unit(self):
+        import lxd_cluster
+        from charm import MicroCloudCharm
+
+        stub = self._stub()
+        stub._dpus.reconcile.side_effect = lxd_cluster.LXDClusterError("Not Found")
+        with patch.object(lxd_cluster, "own_name", return_value="node-1"):
+            assert MicroCloudCharm._reconcile_dpus(stub) is None
+        assert stub._dpu_notes == ["cannot pair DPUs; see juju debug-log"]
+
+    def test_dpu_problems_show_in_an_active_status(self):
+        import ops
+
+        from charm import MicroCloudCharm
+        from control_plane import ControlPlane
+
+        stub = self._stub()
+        stub.unit.is_leader.return_value = False
+        stub._cos_related.return_value = False
+        stub._is_orchestrator.return_value = True
+        stub._control_plane = MagicMock(spec=ControlPlane)
+        stub._dpu_notes = ["DPU node-1-dpu-1 unreachable"]
+
+        MicroCloudCharm._set_status(stub, initialized=True)
+
+        assert stub.unit.status == ops.ActiveStatus("Cluster ready; DPU node-1-dpu-1 unreachable")

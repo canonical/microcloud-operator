@@ -104,6 +104,11 @@ provides:
   members:
     interface: microcloud_cluster
     optional: true
+  # The DPUs in this unit's host, each a microcloud-dpu unit. Bind it to the
+  # OAM space: the DPU agents accept LXD from this endpoint's address only.
+  dpus:
+    interface: lxd_dpu
+    optional: true
 
 requires:
   orchestrator:

@@ -35,6 +35,11 @@ Orchestrator and member applications
       cluster to exist, and is joined to it in a grow session the
       orchestrator leader opens for its application's units.
 
+DPUs
+----
+    • A unit whose LXD is a cluster member pairs the DPUs in its host over
+      the "dpus" endpoint (see ``dpu_relation``).
+
 Observe-only mode (MicroCloud already initialized out-of-band)
 --------------------------------------------------------------
     • This exists to integrate an existing cluster with COS. It is not a way
@@ -96,6 +101,7 @@ from cluster import (
 )
 from cluster_relation import ClusterRelation, OrchestratorFacts
 from control_plane import ControlPlane
+from dpu_relation import DPUS, DPURelation
 from failure_domains import FailureDomains
 from network import UnitNetwork
 from observability import ALERT_RULES_DIR, DASHBOARD_DIRS, Observability
@@ -141,6 +147,7 @@ class MicroCloudCharm(ops.CharmBase):
 
         self._coordinator = ClusterCoordinator(self)
         self._relations = ClusterRelation(self)
+        self._dpus = DPURelation(self)
         self._control_plane = ControlPlane()
         self._failure_domains = FailureDomains()
         self._network = UnitNetwork(self.model, self.config)
@@ -160,6 +167,8 @@ class MicroCloudCharm(ops.CharmBase):
         # so the generic status at the end of reconciliation does not
         # overwrite it.
         self._status_held = False
+        # Problems with this unit's DPUs, reported in its status.
+        self._dpu_notes: list[str] = []
 
         self._cos_agent = COSAgentProvider(
             self,
@@ -195,6 +204,15 @@ class MicroCloudCharm(ops.CharmBase):
                 relation_events.relation_broken,
             ):
                 self.framework.observe(event, self._on_cluster_relation_changed)
+        dpu_events = self.on[DPUS]
+        for event in (
+            dpu_events.relation_joined,
+            dpu_events.relation_changed,
+            dpu_events.relation_departed,
+            dpu_events.relation_broken,
+        ):
+            self.framework.observe(event, self._on_cluster_relation_changed)
+        self.framework.observe(self.on.secret_expired, self._on_secret_expired)
         self.framework.observe(self.on.stop, self._on_stop)
         self.framework.observe(self.on.remove, self._on_remove)
 
@@ -271,6 +289,10 @@ class MicroCloudCharm(ops.CharmBase):
 
     def _on_join_session_ended(self, event: JoinSessionEndedEvent) -> None:
         self._reconcile()
+
+    def _on_secret_expired(self, event: ops.SecretExpiredEvent) -> None:
+        if self._dpus.expired(event.secret):
+            self._reconcile()
 
     def _on_stop(self, event: ops.StopEvent) -> None:
         if self._cos_related():
@@ -875,6 +897,8 @@ class MicroCloudCharm(ops.CharmBase):
                     # and creates the pools after the systems have joined.
                     if not problem and not self._join_pending and current is None:
                         problem = self._storage_problem()
+                    if not problem:
+                        problem = self._reconcile_dpus()
                 else:
                     problem = self._await_lxd_join()
 
@@ -891,6 +915,22 @@ class MicroCloudCharm(ops.CharmBase):
 
         if not self._status_held:
             self._set_status(initialized=microcloud.is_initialized())
+
+    def _reconcile_dpus(self) -> str | None:
+        """Pair the DPUs in this unit's host, once its LXD is a cluster member."""
+        if self._dpus.relation() is None and not self._dpus.pending_cleanup():
+            return None
+        try:
+            member = lxd_cluster.own_name()
+        except lxd_cluster.LXDClusterError as exc:
+            return f"Cannot read the LXD member name: {exc}"
+        try:
+            self._dpu_notes = self._dpus.reconcile(member, self._network.space_bind_address(DPUS))
+        except lxd_cluster.LXDClusterError as exc:
+            # The cluster runs without its DPUs; this must not block the unit.
+            logger.error("Cannot pair DPUs: %s", exc)
+            self._dpu_notes = ["cannot pair DPUs; see juju debug-log"]
+        return None
 
     def _await_lxd_join(self) -> str | None:
         """Wait for this unit's LXD to join, or report a bootstrap that stopped half way.
@@ -1198,6 +1238,9 @@ class MicroCloudCharm(ops.CharmBase):
                 self.unit.status = ops.BlockedStatus("; ".join(problems))
                 return
             message += "; observability active"
+
+        for note in self._dpu_notes:
+            message += f"; {note}"
 
         # The leader alone reports control-plane coverage, so it shows once.
         if self.unit.is_leader():
