@@ -1,16 +1,31 @@
 # Copyright 2026 Canonical Ltd.
 # See LICENSE file for licensing details.
 
-"""Tests for read-only host topology collection."""
+"""Tests for read-only host topology collection and optimal CPU pool allocation."""
 
 import os
 import stat
+from dataclasses import replace
+from itertools import product
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 import pytest
 
-from cpu_planner import CPUPlannerError, collect_host_topology
+import cpu_planner
+from cpu_planner import (
+    CacheDomain,
+    CPUConstraints,
+    CPUPlannerError,
+    CPUProfile,
+    CPURequirement,
+    Device,
+    HostTopology,
+    PhysicalCore,
+    allocate_cpu_pools,
+    collect_host_topology,
+    plan_cpu_pools,
+)
 
 
 def _write(path: Path, value: str) -> None:
@@ -389,3 +404,448 @@ def test_requires_effective_constraints(host):
     (host[2] / "cpuset.mems.effective").unlink()
     with pytest.raises(CPUPlannerError, match="cpuset.mems.effective"):
         _collect(host)
+
+
+def _planner_topology(node_sizes=(4, 4), *, siblings=2, cache_size=2):
+    count = sum(node_sizes)
+    cache_domains = tuple(
+        CacheDomain(
+            3,
+            tuple(
+                cpu
+                for thread in range(siblings)
+                for cpu in range(
+                    start + count * thread, min(start + cache_size, count) + count * thread
+                )
+            ),
+        )
+        for start in range(0, count, cache_size)
+    )
+    cores = []
+    for node, size in enumerate(node_sizes):
+        for core_id in range(size):
+            index = len(cores)
+            cores.append(
+                PhysicalCore(
+                    socket=node,
+                    die=0,
+                    core=core_id,
+                    numa_node=node,
+                    cpu_ids=tuple(index + count * thread for thread in range(siblings)),
+                    cache=cache_domains[index // cache_size],
+                    exclusions=(),
+                )
+            )
+    cpus = frozenset(range(count * siblings))
+    nodes = frozenset(range(len(node_sizes)))
+    return HostTopology(
+        architecture="x86_64",
+        cpu_models=(("model name", "Test CPU"),),
+        boot_id="test-boot",
+        cores=tuple(cores),
+        cache_domains=cache_domains,
+        constraints=CPUConstraints(
+            present_cpus=cpus,
+            online_cpus=cpus,
+            parent_effective_cpus=cpus,
+            allowed_cpus=cpus,
+            isolated_cpus=frozenset(),
+            reserved_cpus=frozenset(),
+            online_nodes=nodes,
+            online_memory_nodes=nodes,
+            allowed_memory_nodes=nodes,
+        ),
+        osd_devices=(),
+        ovn_devices=(),
+    )
+
+
+def _planner_profile(topology, percentages=(25, 25, 25)):
+    return CPUProfile(
+        name="test",
+        version=1,
+        architecture="amd64",
+        cpu_model="Test CPU",
+        sockets=len(topology.constraints.online_nodes),
+        cores_per_socket=len(topology.cores) // len(topology.constraints.online_nodes),
+        threads_per_core=len(topology.cores[0].cpu_ids),
+        numa_nodes=len(topology.constraints.online_nodes),
+        groups=(
+            CPURequirement("housekeeping", 1),
+            *(
+                CPURequirement(name, 1, percent)
+                for name, percent in zip(
+                    ("lxd", "microceph", "microovn"), percentages, strict=True
+                )
+            ),
+        ),
+    )
+
+
+def test_selects_profile_and_returns_complete_pool_snapshot(monkeypatch):
+    topology = _planner_topology()
+    profile = _planner_profile(topology)
+    monkeypatch.setattr(cpu_planner, "_CPU_PROFILES", (profile,))
+
+    plan = plan_cpu_pools(topology, components=frozenset({"lxd", "microceph", "microovn"}))
+
+    assert plan.profile_name == "test"
+    assert plan.profile_version == 1
+    assert plan.topology is topology
+    assert [pool.name for pool in plan.pools] == ["housekeeping", "lxd", "microceph", "microovn"]
+    assert [len(pool.cores) for pool in plan.pools] == [2, 2, 2, 2]
+    cpus = [cpu for pool in plan.pools for _, ids in pool.cpu_ids_by_numa for cpu in ids]
+    assert len(cpus) == len(set(cpus)) == 16
+    assert plan.pools[0].memory_nodes == ()
+    assert all(
+        pool.memory_nodes == tuple(node for node, _ in pool.cpu_ids_by_numa)
+        for pool in plan.pools[1:]
+    )
+
+
+def test_unknown_and_ambiguous_profiles_fail(monkeypatch):
+    topology = _planner_topology()
+    with pytest.raises(CPUPlannerError, match="Unsupported host.*Test CPU"):
+        plan_cpu_pools(topology, components=frozenset({"lxd"}))
+    profile = _planner_profile(topology)
+    monkeypatch.setattr(cpu_planner, "_CPU_PROFILES", (profile, profile))
+    with pytest.raises(CPUPlannerError, match="Ambiguous host profile"):
+        plan_cpu_pools(topology, components=frozenset({"lxd"}))
+
+
+@pytest.mark.parametrize(
+    "percentages",
+    [
+        (-1, 25, 25),
+        (101, 0, 0),
+        (60, 30, 20),
+        (float("nan"), 25, 25),
+        (True, 25, 25),
+    ],
+)
+def test_rejects_invalid_profile_percentages(percentages):
+    topology = _planner_topology()
+    with pytest.raises(CPUPlannerError, match="percent"):
+        allocate_cpu_pools(
+            topology,
+            _planner_profile(topology, percentages),
+            components=frozenset({"lxd", "microceph", "microovn"}),
+        )
+
+
+@pytest.mark.parametrize("minimum", [0, -1, 1.5, True])
+def test_validates_minima_even_for_absent_components(minimum):
+    topology = _planner_topology()
+    profile = _planner_profile(topology)
+    profile = replace(
+        profile,
+        groups=tuple(
+            replace(group, min_cpus=minimum) if group.name == "microceph" else group
+            for group in profile.groups
+        ),
+    )
+    with pytest.raises(CPUPlannerError, match="Invalid minimum CPUs for microceph"):
+        allocate_cpu_pools(topology, profile, components=frozenset({"lxd"}))
+
+
+@pytest.mark.parametrize("components", [frozenset(), frozenset({"lxd", "unknown"})])
+def test_rejects_invalid_component_inventory(components):
+    topology = _planner_topology()
+    with pytest.raises(CPUPlannerError, match="Components must include LXD"):
+        allocate_cpu_pools(topology, _planner_profile(topology), components=components)
+
+
+@pytest.mark.parametrize("cpus", [(), (0, 0)])
+def test_rejects_invalid_eligible_siblings(cpus):
+    topology = _planner_topology()
+    topology = replace(
+        topology, cores=(replace(topology.cores[0], cpu_ids=cpus), *topology.cores[1:])
+    )
+    with pytest.raises(CPUPlannerError, match="Invalid eligible core topology"):
+        allocate_cpu_pools(topology, _planner_profile(topology), components=frozenset({"lxd"}))
+
+
+def test_rounds_percentage_targets_up_to_whole_cores():
+    topology = _planner_topology((9,))
+    plan = allocate_cpu_pools(
+        topology,
+        _planner_profile(topology, (30, 20, 10)),
+        components=frozenset({"lxd", "microceph", "microovn"}),
+    )
+    assert [len(pool.cores) for pool in plan.pools] == [3, 3, 2, 1]
+
+
+def test_does_not_increase_percentage_target_to_meet_minimum():
+    topology = _planner_topology()
+    profile = _planner_profile(topology)
+    profile = replace(
+        profile,
+        groups=tuple(
+            replace(group, min_cpus=5) if group.name == "lxd" else group
+            for group in profile.groups
+        ),
+    )
+    with pytest.raises(CPUPlannerError, match="lxd requires at least 5"):
+        allocate_cpu_pools(
+            topology, profile, components=frozenset({"lxd", "microceph", "microovn"})
+        )
+
+
+def test_housekeeping_requires_a_core_on_every_eligible_node():
+    topology = _planner_topology((3, 3))
+    with pytest.raises(CPUPlannerError, match="Housekeeping requires"):
+        allocate_cpu_pools(
+            topology,
+            _planner_profile(topology, (30, 30, 15)),
+            components=frozenset({"lxd", "microceph", "microovn"}),
+        )
+
+
+def test_absent_components_leave_their_share_for_housekeeping():
+    topology = _planner_topology()
+    plan = allocate_cpu_pools(topology, _planner_profile(topology), components=frozenset({"lxd"}))
+    assert [(pool.name, len(pool.cores)) for pool in plan.pools] == [
+        ("housekeeping", 6),
+        ("lxd", 2),
+    ]
+
+
+def test_excluded_cores_are_not_allocated():
+    topology = _planner_topology((6,))
+    excluded = replace(topology.cores[-1], exclusions=("reserved",))
+    topology = replace(
+        topology,
+        cores=(*topology.cores[:-1], excluded),
+        constraints=replace(topology.constraints, reserved_cpus=frozenset(excluded.cpu_ids)),
+    )
+    plan = allocate_cpu_pools(topology, _planner_profile(topology), components=frozenset({"lxd"}))
+    assert plan.excluded_cores == (excluded,)
+    assert excluded not in tuple(core for pool in plan.pools for core in pool.cores)
+
+
+def test_rejects_nonuniform_eligible_sibling_counts():
+    topology = _planner_topology()
+    topology = replace(
+        topology, cores=(replace(topology.cores[0], cpu_ids=(0,)), *topology.cores[1:])
+    )
+    with pytest.raises(CPUPlannerError, match="non-uniform"):
+        allocate_cpu_pools(topology, _planner_profile(topology), components=frozenset({"lxd"}))
+
+
+def _exhaustive_allocation(topology, totals, preferred):
+    nodes = sorted(topology.constraints.online_nodes)
+    cores = sorted(
+        topology.cores, key=lambda core: (core.socket, core.die, core.core, min(core.cpu_ids))
+    )
+    best = None
+    for assignment in product(range(len(totals)), repeat=len(cores)):
+        if tuple(assignment.count(group) for group in range(len(totals))) != totals:
+            continue
+        counts = tuple(
+            tuple(
+                sum(
+                    group == assigned and core.numa_node == node
+                    for core, assigned in zip(cores, assignment, strict=True)
+                )
+                for node in nodes
+            )
+            for group in range(len(totals))
+        )
+        if any(count == 0 for count in counts[0]):
+            continue
+        numa_score = sum(
+            abs(count - target)
+            for row, targets in zip(counts, preferred, strict=True)
+            for count, target in zip(row, targets, strict=True)
+        )
+        cache_score = 0
+        for domain in topology.cache_domains:
+            groups = {
+                group
+                for core, group in zip(cores, assignment, strict=True)
+                if core.cache == domain
+            }
+            cache_score += len(groups) * (len(groups) - 1) // 2
+        sequence = tuple(
+            tuple(
+                (core.socket, core.die, core.core, min(core.cpu_ids))
+                for core, assigned in zip(cores, assignment, strict=True)
+                if assigned == group
+            )
+            for group in range(len(totals))
+        )
+        score = (numa_score, cache_score, counts, sequence)
+        if best is None or score < best:
+            best = score
+    assert best is not None
+    return best
+
+
+@pytest.mark.parametrize(
+    ("sizes", "cache_size"), [((4, 4), 2), ((4, 4), 4), ((3, 3), 4), ((3, 3, 3), 3)]
+)
+def test_matches_exhaustive_optimum_and_both_tie_breaks(sizes, cache_size):
+    topology = _planner_topology(sizes, cache_size=cache_size)
+    percentages = (15, 15, 15)
+    profile = _planner_profile(topology, percentages)
+    plan = allocate_cpu_pools(
+        topology, profile, components=frozenset({"lxd", "microceph", "microovn"})
+    )
+    totals = tuple(len(pool.cores) for pool in plan.pools)
+    weights = tuple(sizes)
+    preferred = tuple(cpu_planner._largest_remainder(total, weights) for total in totals)
+    optimum = _exhaustive_allocation(topology, totals, preferred)
+    counts = tuple(
+        tuple(sum(core.numa_node == node for core in pool.cores) for node in range(len(sizes)))
+        for pool in plan.pools
+    )
+    sequence = tuple(
+        tuple((core.socket, core.die, core.core, min(core.cpu_ids)) for core in pool.cores)
+        for pool in plan.pools
+    )
+    assert (plan.numa_score, plan.cache_score, counts, sequence) == optimum
+    reordered = allocate_cpu_pools(
+        replace(topology, cores=tuple(reversed(topology.cores))),
+        profile,
+        components=frozenset({"lxd", "microceph", "microovn"}),
+    )
+    assert reordered.pools == plan.pools
+    assert (reordered.numa_score, reordered.cache_score) == (plan.numa_score, plan.cache_score)
+
+
+def test_device_locality_follows_osd_and_network_device_counts():
+    topology = _planner_topology()
+    topology = replace(
+        topology, osd_devices=(Device("osd0", 1),), ovn_devices=(Device("nic0", 0),)
+    )
+    plan = allocate_cpu_pools(
+        topology,
+        _planner_profile(topology),
+        components=frozenset({"lxd", "microceph", "microovn"}),
+    )
+    assert plan.pools[2].memory_nodes == (1,)
+    assert plan.pools[3].memory_nodes == (0,)
+    assert plan.numa_score == 0
+
+
+@pytest.mark.parametrize(
+    "cache_members",
+    [
+        ((0, 2), (1, 3), (4, 6), (5, 7)),
+        ((0, 4), (1, 5), (2, 6), (3, 7)),
+        ((0, 1, 4), (2, 3), (5, 6, 7)),
+    ],
+)
+def test_skewed_device_preferences_and_irregular_caches_match_exhaustive_optimum(cache_members):
+    topology = _planner_topology()
+    domains = tuple(
+        CacheDomain(
+            3, tuple(sorted(cpu for index in members for cpu in topology.cores[index].cpu_ids))
+        )
+        for members in cache_members
+    )
+    topology = replace(
+        topology,
+        cores=tuple(
+            replace(
+                core,
+                cache=next(
+                    domain
+                    for domain, members in zip(domains, cache_members, strict=True)
+                    if index in members
+                ),
+            )
+            for index, core in enumerate(topology.cores)
+        ),
+        cache_domains=domains,
+        osd_devices=(Device("osd0", 0),),
+        ovn_devices=(Device("nic0", 0),),
+    )
+    plan = allocate_cpu_pools(
+        topology,
+        _planner_profile(topology),
+        components=frozenset({"lxd", "microceph", "microovn"}),
+    )
+    optimum = _exhaustive_allocation(topology, (2, 2, 2, 2), ((1, 1), (1, 1), (2, 0), (2, 0)))
+    counts = tuple(
+        tuple(sum(core.numa_node == node for core in pool.cores) for node in (0, 1))
+        for pool in plan.pools
+    )
+    sequence = tuple(
+        tuple((core.socket, core.die, core.core, min(core.cpu_ids)) for core in pool.cores)
+        for pool in plan.pools
+    )
+    assert (plan.numa_score, plan.cache_score, counts, sequence) == optimum
+
+
+def test_unavailable_memory_node_is_excluded_even_with_local_osds():
+    topology = _planner_topology()
+    topology = replace(
+        topology,
+        cores=tuple(
+            replace(core, exclusions=("memory",)) if core.numa_node == 1 else core
+            for core in topology.cores
+        ),
+        constraints=replace(topology.constraints, allowed_memory_nodes=frozenset({0})),
+        osd_devices=(Device("osd0", 1),),
+    )
+    plan = allocate_cpu_pools(
+        topology, _planner_profile(topology), components=frozenset({"lxd", "microceph"})
+    )
+    assert [len(pool.cores) for pool in plan.pools] == [2, 1, 1]
+    assert all(pool.memory_nodes == (0,) for pool in plan.pools[1:])
+    assert plan.numa_score == 2
+
+
+def test_largest_remainder_uses_actual_numa_ids_for_ties():
+    topology = _planner_topology((3, 3, 3), cache_size=3)
+    ids = (7, 2, 11)
+    nodes = frozenset(ids)
+    topology = replace(
+        topology,
+        cores=tuple(replace(core, numa_node=ids[core.numa_node]) for core in topology.cores),
+        constraints=replace(
+            topology.constraints,
+            online_nodes=nodes,
+            online_memory_nodes=nodes,
+            allowed_memory_nodes=nodes,
+        ),
+    )
+    plan = allocate_cpu_pools(
+        topology, _planner_profile(topology, (55, 0, 0)), components=frozenset({"lxd"})
+    )
+    assert [(node, len(cpus) // 2) for node, cpus in plan.pools[1].cpu_ids_by_numa] == [
+        (2, 2),
+        (7, 2),
+        (11, 1),
+    ]
+    assert plan.numa_score == 2
+
+
+def test_spec_worked_example():
+    topology = _planner_topology((144, 144), cache_size=8)
+    topology = replace(
+        topology,
+        cpu_models=(("model name", "AMD EPYC 9825"),),
+        osd_devices=tuple(
+            Device(f"osd{node}-{index}", node) for node in (0, 1) for index in range(32)
+        ),
+        ovn_devices=(Device("nic0", 0), Device("nic1", 1)),
+    )
+
+    plan = plan_cpu_pools(topology, components=frozenset({"lxd", "microceph", "microovn"}))
+
+    assert [sum(len(ids) for _, ids in pool.cpu_ids_by_numa) for pool in plan.pools] == [
+        28,
+        346,
+        144,
+        58,
+    ]
+    assert [tuple(len(ids) // 2 for _, ids in pool.cpu_ids_by_numa) for pool in plan.pools] == [
+        (6, 8),
+        (87, 86),
+        (36, 36),
+        (15, 14),
+    ]
+    assert plan.numa_score == 2
+    assert plan.cache_score == 5
