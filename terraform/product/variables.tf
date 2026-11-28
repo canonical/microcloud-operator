@@ -154,8 +154,9 @@ variable "proxy" {
   description = <<-EOT
     Proxies for a model this module creates. They are set as the model's
     juju-, apt- and snap- proxy config, which is what the charm's snap
-    installs go through. snapd has no no-proxy setting, so no-proxy only
-    reaches Juju and apt.
+    installs go through, and the charm passes the juju- ones on to LXD.
+    snapd has no no-proxy setting, so no-proxy only reaches Juju, apt and
+    LXD.
   EOT
   type = object({
     http     = optional(string)
